@@ -70,9 +70,12 @@ Deno.serve(async () => {
     let status = "success";
     let output = "";
     try {
+      const fireHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      const fireSecret = Deno.env.get("ROUTINER_FIRE_SECRET");
+      if (fireSecret) fireHeaders.Authorization = `Bearer ${fireSecret}`;
       const f = await fetch(TRIGGER_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: fireHeaders,
         body: JSON.stringify({
           text: r.prompt,
           source: "routiner-scheduler",

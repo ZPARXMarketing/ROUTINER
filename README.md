@@ -63,6 +63,26 @@ Set these in **Netlify → Site settings → Environment variables**:
 
 The token stays server-side — it's never exposed to the browser.
 
+### Locking the trigger to your login (recommended)
+
+By default the trigger function is open. To require a sign-in (so randoms can't
+fire your routine and burn tokens), set:
+
+| Where | Var | Value |
+|---|---|---|
+| Netlify env | `ROUTINER_FIRE_SECRET` | any long random string |
+| Supabase → Edge Functions → `routiner-scheduler` secrets | `ROUTINER_FIRE_SECRET` | **the same** string |
+| Netlify env | `ALLOWED_EMAILS` | *(optional)* comma-separated emails allowed to fire |
+
+Once `ROUTINER_FIRE_SECRET` is set on **both** sides:
+- The web app must send a valid Supabase access token (it does automatically
+  when you're signed in).
+- The scheduler authenticates with the shared secret.
+- If `ALLOWED_EMAILS` is set, only those accounts can fire — so even with open
+  sign-ups, only you can trigger runs.
+
+Leaving `ROUTINER_FIRE_SECRET` unset keeps the function open (no gating).
+
 ## Scheduling (hands-off)
 
 Timed and recurring routines fire on their own — no tab open, no manual step:

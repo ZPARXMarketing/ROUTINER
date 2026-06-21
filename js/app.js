@@ -129,8 +129,12 @@ async function fireTrigger(routine) {
   const direct = settings.triggerUrl.trim();
   const url = direct || TRIGGER_FN;
   const payload = JSON.stringify({ text: routine?.prompt || '', source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
+  // Send the signed-in user's access token so the gated function authorizes us.
+  const headers = { 'content-type': 'application/json' };
+  const { data: { session: s } } = await sb.auth.getSession();
+  if (s?.access_token && !direct) headers.Authorization = `Bearer ${s.access_token}`;
   try {
-    const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: payload });
+    const r = await fetch(url, { method: 'POST', headers, body: payload });
     if (!r.ok) { const m = (await r.text().catch(() => '')).slice(0, 180); toast(`Trigger responded ${r.status}. ${m}`, 'error'); return; }
     toast('Trigger sent — your Claude routine is starting.');
   } catch (e) {
