@@ -1,0 +1,13 @@
+# Netlify config for the Claude Routine Planner
+# Hosts the static UI and a server-side function that fires the
+# Claude routine trigger using the CLAUDE_TRIGGER environment variable.
+
+[build]
+  publish = "."
+  functions = "netlify/functions"
+
+# Friendly alias → the trigger function
+[[redirects]]
+  from = "/api/claude-trigger"
+  to = "/.netlify/functions/claude-trigger"
+  status = 200

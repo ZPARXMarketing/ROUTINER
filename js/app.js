@@ -230,34 +230,37 @@
   }
 
   /* ---------- Trigger webhook ---------- */
+  // Default: a same-origin Netlify function that reads CLAUDE_TRIGGER
+  // server-side. Override with an explicit URL in Settings to POST a
+  // webhook directly from the browser instead.
+  const TRIGGER_FN = '/.netlify/functions/claude-trigger';
+
   async function fireTrigger(routine) {
-    const url = state.settings.triggerUrl.trim();
-    if (!url) {
-      toast('Queued in the repo. Add a Routine trigger URL in Settings to also start a run automatically.', 'info');
-      return;
-    }
+    const direct = state.settings.triggerUrl.trim();
+    const url = direct || TRIGGER_FN;
+    const payload = JSON.stringify({
+      source: 'claude-routine-planner',
+      action: 'process-routines',
+      routineId: routine?.id,
+      routinePath: routine?.repoPath,
+      title: routine?.title,
+      prompt: 'Process due routines per routines/README.md.',
+      at: new Date().toISOString(),
+    });
     try {
-      await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          source: 'claude-routine-planner',
-          action: 'process-routines',
-          routineId: routine?.id,
-          routinePath: routine?.repoPath,
-          prompt: 'Process due routines per routines/README.md.',
-          at: new Date().toISOString(),
-        }),
-      });
+      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: payload });
+      if (!r.ok) {
+        const msg = (await r.text().catch(() => '')).slice(0, 180);
+        toast(`Committed, but the trigger responded ${r.status}. ${msg}`, 'error');
+        return;
+      }
       toast('Trigger sent — a Claude session is starting to run it.');
     } catch (e) {
-      // no-cors fallback: many webhooks accept the request even if we can't read the response
-      try {
-        await fetch(url, { method: 'POST', mode: 'no-cors', body: JSON.stringify({ action: 'process-routines' }) });
-        toast('Trigger sent (no-cors).');
-      } catch (e2) {
-        toast(`Committed, but the trigger POST failed: ${e.message}`, 'error');
+      if (direct) {
+        // no-cors fallback for direct external webhooks
+        try { await fetch(direct, { method: 'POST', mode: 'no-cors', body: payload }); toast('Trigger sent (no-cors).'); return; } catch { /* fall through */ }
       }
+      toast(`Committed, but the trigger failed: ${e.message}. (Deploy on Netlify with CLAUDE_TRIGGER set, or add a direct URL in Settings.)`, 'error');
     }
   }
 
@@ -606,8 +609,8 @@
 
       <div class="field">
         <label class="label" for="s-trigger">Routine trigger URL (POST)</label>
-        <input class="input" id="s-trigger" placeholder="https://… your Claude routine webhook" value="${esc(state.settings.triggerUrl)}" />
-        <span class="hint">When set, <b>Run now</b> POSTs here after committing, to start a Claude session immediately.</span>
+        <input class="input" id="s-trigger" placeholder="leave blank to use the Netlify CLAUDE_TRIGGER function" value="${esc(state.settings.triggerUrl)}" />
+        <span class="hint">Leave blank when hosted on Netlify — <b>Run now</b> calls <code>/.netlify/functions/claude-trigger</code>, which fires your <code>CLAUDE_TRIGGER</code> webhook server-side. Set a URL here to POST a webhook directly instead.</span>
       </div>
 
       <div class="field">
