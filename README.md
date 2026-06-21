@@ -1,69 +1,74 @@
 # Claude Routine Planner
 
-A Notion-to-Claude style command center for your prompts — built on the
+A Notion-to-Claude command center, built on the
 [ZPARX design system](https://github.com/zparxmarketing/zparxbrand-design).
 
-Write a prompt, then choose what happens to it:
+Write a prompt, and it becomes a **routine note** committed to this repo. A
+scheduled or webhook-triggered **Claude Code session** then reads the due notes
+and *actually carries out the directions* — reading/writing files, running
+commands, researching, committing — not just replying with text.
 
-- **▶ Fire now** — send it to Claude immediately as a one-off routine.
-- **⏰ Schedule** — queue it for a specific date & time. Optionally repeat it
-  every day, on weekdays, or weekly.
-- **▣ Save to library** — park it without firing, to iterate on later.
+```
+ Planner UI  ──commit .md──►  routines/  ──read & execute──►  Claude Code session
+   (browser)                  (this repo)                     (full tools)
+        └────────────── POST trigger webhook (optional) ──────────┘
+```
 
-Every prompt can move freely between **Scheduled → Library → Archived**, and
-every run (manual or scheduled) is logged in **History** with Claude's response.
+## What you can do
 
-## Views
+- **▶ Run now** — commits the note (scheduled = now) and POSTs your trigger
+  webhook to start a Claude session immediately.
+- **⏰ Schedule** — queues the note for a date & time, optionally repeating
+  daily / weekdays / weekly. A scheduled trigger fires it.
+- **▣ Save to library** — parks the prompt in `routines/library/` to iterate on.
+- **⧉ Copy / Archive / Restore / Delete** — manage prompts across the
+  Scheduled → Library → Archived folders.
+- **⚡ Test live** — optional instant preview via the Messages API (needs an
+  Anthropic key); handy while writing a prompt.
 
-| Tab | What's in it |
-|---|---|
-| **Scheduled** | Routines queued to fire, each showing its time and a live countdown. |
-| **Library** | A rich folder of saved prompts to iterate on, duplicate, or schedule (incl. recurring). |
-| **Archived** | Parked routines, out of the way. Restore to the Library anytime. |
-| **History** | Every fire, with status (success / error / dry run) and the model's output. Re-run with one click. |
+## How execution works
 
-## How it works
+The repo *is* the source of truth. See
+[`routines/README.md`](routines/README.md) for the full executor protocol. In
+short, a Claude session asked to "process routines":
 
-It's a single-page app — no build step, no server. Open `index.html` in a
-browser (or host it on GitHub Pages / Netlify).
+1. reads due notes in `routines/scheduled/`,
+2. carries out each one's directions with its tools,
+3. logs the result to `routines/logs/`,
+4. reschedules recurring routines / moves one-offs to `routines/done/`,
+5. commits and pushes.
 
-- **State** lives in your browser's `localStorage`.
-- **Scheduling** is driven by an in-page heartbeat that checks for due routines
-  every 20 seconds, so routines fire automatically *while the tab is open*. Pin
-  the tab for hands-off routines, or fire anything manually whenever you like.
-- **Firing** calls the [Claude Messages API](https://docs.anthropic.com/en/api/messages)
-  directly from the browser using the
-  `anthropic-dangerous-direct-browser-access` header.
+[`CLAUDE.md`](CLAUDE.md) points every session at that protocol.
 
 ## Setup
 
-1. Open the app and click **⚙ Settings**.
-2. Paste your [Anthropic API key](https://console.anthropic.com/) and pick a
-   default model. The key is stored only in your browser and is sent only to
-   `api.anthropic.com` when a routine fires.
+Open the app and click **⚙ Settings**:
 
-Without a key, routines still schedule and fire — as **dry runs** — so you can
-try the full flow before wiring up the API.
+1. **GitHub** — a fine-grained personal access token with **Contents: Read &
+   write** on this repo, plus owner / repo / branch. This lets the UI commit
+   routine notes. (Stored only in your browser.)
+2. **Routine trigger URL** *(optional)* — your Claude routine webhook. When set,
+   **Run now** POSTs to it after committing, so a session starts right away.
+3. **Anthropic API key** *(optional)* — only for the **Test live** button.
 
-### Models
-
-- `claude-opus-4-8` — most capable
-- `claude-sonnet-4-6` — balanced (default)
-- `claude-haiku-4-5-20251001` — fast & cheap
+Then set up a **recurring Claude Code on the web trigger** on this repo with the
+prompt *"Process due routines per routines/README.md."* — that's what makes
+timed routines fire on their own.
 
 ## Project structure
 
 ```
-index.html        # markup + ZPARX brand fonts
+index.html        # planner UI + ZPARX brand fonts
 css/tokens.css    # vendored ZPARX design tokens
 css/app.css       # application styling
-js/app.js         # state, scheduler, Claude API, UI
+js/app.js         # state, GitHub commit, trigger, UI, live test
 assets/           # ZPARX lockup logo + favicon
+routines/         # the routine notes + executor protocol
+CLAUDE.md         # points sessions at the executor protocol
 ```
 
 ## Brand
 
-Styled with the ZPARX design system — dark-mode-first, electric lime and orange
-accents over deep navy, anchored by cobalt brand blue. The logo (top-left) is
-the ZPARX lockup; lime and yellow are used as dark-surface-only accents per the
-brand pairing rules.
+Dark-mode-first ZPARX styling: electric lime and orange accents over deep navy,
+anchored by cobalt blue. The ZPARX lockup sits top-left; lime and yellow are
+dark-surface-only accents per the brand pairing rules.
