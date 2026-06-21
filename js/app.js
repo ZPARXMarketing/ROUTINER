@@ -133,9 +133,16 @@ async function fireTrigger(routine) {
   const headers = { 'content-type': 'application/json' };
   const { data: { session: s } } = await sb.auth.getSession();
   if (s?.access_token && !direct) headers.Authorization = `Bearer ${s.access_token}`;
+  if (!s && !direct) { toast('You must be signed in to fire routines. Please sign in and try again.', 'error'); return; }
   try {
     const r = await fetch(url, { method: 'POST', headers, body: payload });
-    if (!r.ok) { const m = (await r.text().catch(() => '')).slice(0, 180); toast(`Trigger responded ${r.status}. ${m}`, 'error'); return; }
+    if (!r.ok) {
+      if (r.status === 401) { toast('You must be signed in to fire routines. Try signing out and back in.', 'error'); return; }
+      if (r.status === 403) { toast('This account isn’t allowed to fire routines.', 'error'); return; }
+      const m = (await r.text().catch(() => '')).slice(0, 180);
+      toast(`Trigger responded ${r.status}. ${m}`, 'error');
+      return;
+    }
     toast('Trigger sent — your Claude routine is starting.');
   } catch (e) {
     if (direct) { try { await fetch(direct, { method: 'POST', mode: 'no-cors', body: payload }); toast('Trigger sent (no-cors).'); return; } catch { /* */ } }
