@@ -47,13 +47,37 @@ Open the app and click **⚙ Settings**:
 1. **GitHub** — a fine-grained personal access token with **Contents: Read &
    write** on this repo, plus owner / repo / branch. This lets the UI commit
    routine notes. (Stored only in your browser.)
-2. **Routine trigger URL** *(optional)* — your Claude routine webhook. When set,
-   **Run now** POSTs to it after committing, so a session starts right away.
+2. **Routine trigger URL** *(optional)* — leave blank when hosted on Netlify.
+   **Run now** then calls the bundled function (see below). Set a URL only to
+   POST a different webhook directly.
 3. **Anthropic API key** *(optional)* — only for the **Test live** button.
 
-Then set up a **recurring Claude Code on the web trigger** on this repo with the
-prompt *"Process due routines per routines/README.md."* — that's what makes
-timed routines fire on their own.
+### Firing a Claude Code routine (Netlify)
+
+Hosted on Netlify, **Run now** calls `/.netlify/functions/claude-trigger`,
+which fires your Claude Code routine server-side and appends the prompt to the
+session as an extra turn:
+
+```
+POST https://api.anthropic.com/v1/claude_code/routines/<trigger-id>/fire
+  Authorization: Bearer <CLAUDE_TOKEN>
+  anthropic-version: 2023-06-01
+  anthropic-beta: experimental-cc-routine-2026-04-01
+  { "text": "<the routine's prompt>" }
+```
+
+Set these in **Netlify → Site settings → Environment variables**:
+
+| Var | Value |
+|---|---|
+| `CLAUDE_TRIGGER` | the routine trigger id (`trig_…`) or the full `/fire` URL |
+| `CLAUDE_TOKEN` | your Anthropic bearer token (`ANTHROPIC_API_KEY` also works) |
+| `CLAUDE_ROUTINE_BETA` | *(optional)* override the `anthropic-beta` header |
+
+The token stays server-side — it's never exposed to the browser.
+
+For timed routines, configure that Claude Code routine to *"Process due routines
+per routines/README.md."* so a scheduled fire works through the repo notes.
 
 ## Project structure
 

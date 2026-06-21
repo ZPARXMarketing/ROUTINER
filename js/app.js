@@ -238,13 +238,14 @@
   async function fireTrigger(routine) {
     const direct = state.settings.triggerUrl.trim();
     const url = direct || TRIGGER_FN;
+    // `text` is appended to the routine's Claude Code session as an extra
+    // turn — so we send the routine's actual directions to run them directly.
     const payload = JSON.stringify({
+      text: routine?.prompt || 'Process due routines per routines/README.md.',
       source: 'claude-routine-planner',
-      action: 'process-routines',
       routineId: routine?.id,
       routinePath: routine?.repoPath,
       title: routine?.title,
-      prompt: 'Process due routines per routines/README.md.',
       at: new Date().toISOString(),
     });
     try {
@@ -610,7 +611,7 @@
       <div class="field">
         <label class="label" for="s-trigger">Routine trigger URL (POST)</label>
         <input class="input" id="s-trigger" placeholder="leave blank to use the Netlify CLAUDE_TRIGGER function" value="${esc(state.settings.triggerUrl)}" />
-        <span class="hint">Leave blank when hosted on Netlify — <b>Run now</b> calls <code>/.netlify/functions/claude-trigger</code>, which fires your <code>CLAUDE_TRIGGER</code> webhook server-side. Set a URL here to POST a webhook directly instead.</span>
+        <span class="hint">Leave blank when hosted on Netlify — <b>Run now</b> calls <code>/.netlify/functions/claude-trigger</code>, which fires your Claude Code routine (<code>CLAUDE_TRIGGER</code> + <code>CLAUDE_TOKEN</code> env vars) and passes the prompt as a session turn. Set a URL here only to POST a different webhook directly.</span>
       </div>
 
       <div class="field">
