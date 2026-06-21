@@ -30,14 +30,15 @@
       <div class="topbar__spacer"></div>
       <div class="topbar__actions">
         <span class="clock" id="clock">—</span>
-        <span class="clock" id="repoState" title="Where routines are committed">○ local only</span>
-        <button class="btn btn--ghost btn--sm" id="settingsBtn" title="GitHub, trigger &amp; model">⚙ Settings</button>
-        <button class="btn btn--primary" id="newBtn"><span class="btn__icon">＋</span> New routine</button>
+        <span class="clock" id="userChip" title="Signed in" style="display:none"></span>
+        <button class="btn btn--ghost btn--sm" id="settingsBtn" title="Trigger &amp; model" style="display:none">⚙ Settings</button>
+        <button class="btn btn--ghost btn--sm" id="signOutBtn" style="display:none">Sign out</button>
+        <button class="btn btn--primary" id="newBtn" style="display:none"><span class="btn__icon">＋</span> New routine</button>
       </div>
     </header>
 
     <!-- ── Tabs ── -->
-    <nav class="tabs" id="tabs">
+    <nav class="tabs" id="tabs" style="display:none">
       <button class="tab is-active" data-view="scheduled">Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
       <button class="tab" data-view="library">Library <span class="tab__count" data-count="library">0</span></button>
       <button class="tab" data-view="archived">Archived <span class="tab__count" data-count="archived">0</span></button>
@@ -61,6 +62,6 @@
 
   <div class="toasts" id="toasts"></div>
 
-  <script src="js/app.js"></script>
+  <script type="module" src="js/app.js"></script>
 </body>
 </html>

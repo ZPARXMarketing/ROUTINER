@@ -385,6 +385,26 @@ a { color: var(--periwinkle); }
 .section-head h2 { font-family: var(--font-display); font-weight: 800; font-size: 18px; }
 .section-head .hint { margin-left: auto; }
 
+/* ── Auth screen ───────────────────────────────── */
+.auth {
+  max-width: 420px;
+  margin: var(--sp-16) auto 0;
+  background: linear-gradient(180deg, var(--bg-surface), #121829);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  padding: var(--sp-8);
+  box-shadow: var(--shadow-md);
+}
+.auth h2 { font-family: var(--font-display); font-weight: 800; font-size: 22px; margin-bottom: var(--sp-2); }
+.auth p.sub { color: var(--text-mid); font-size: 14px; margin-bottom: var(--sp-6); }
+.auth .field { margin-bottom: var(--sp-4); }
+.auth .btn { width: 100%; justify-content: center; }
+.auth__alt { text-align: center; margin-top: var(--sp-4); font-size: 13px; color: var(--text-mid); }
+.auth__alt a { cursor: pointer; font-weight: 600; }
+.auth__msg { font-size: 13px; margin-bottom: var(--sp-4); padding: var(--sp-3); border-radius: var(--r-sm); display: none; }
+.auth__msg.is-err { display: block; background: rgba(255,77,94,0.12); border: 1px solid rgba(255,77,94,0.4); color: var(--danger); }
+.auth__msg.is-ok { display: block; background: rgba(188,239,47,0.10); border: 1px solid rgba(188,239,47,0.35); color: var(--lime); }
+
 @media (max-width: 640px) {
   .app { padding: var(--sp-4) var(--sp-4) var(--sp-16); }
   .brand__title { font-size: 18px; }

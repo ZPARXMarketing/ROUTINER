@@ -14,8 +14,15 @@ results to `routines/logs/`, reschedule recurring ones / move one-offs to
 
 ## If you're working on the app itself
 
-- `index.html`, `css/`, `js/app.js` — the single-page planner UI.
-- The UI commits routine notes into `routines/` via the GitHub API (token set in
-  the app's Settings) and can POST to a trigger webhook to fire a run.
+- `index.html`, `css/`, `js/app.js` — the single-page planner UI (`app.js` is an
+  ES module).
+- **Storage + auth is Supabase** (project `zparx-dashboard`): tables
+  `routiner_routines` / `routiner_runs`, RLS per user, email+password login.
+- **Run now** POSTs `netlify/functions/claude-trigger.mjs`, which fires the
+  Claude Code routine `/fire` endpoint using the `CLAUDE_TRIGGER` + `CLAUDE_TOKEN`
+  Netlify env vars and passes the prompt as `{"text": …}`.
 - Styling follows the ZPARX design system (vendored in `css/tokens.css`):
   dark-mode-first; lime and yellow are dark-surface-only accents.
+
+> The `routines/` file-based executor below predates the Supabase backend. It's
+> retained for reference, but the app no longer commits notes to the repo.
