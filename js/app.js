@@ -420,7 +420,8 @@
           if (r.status !== 'scheduled') r.status = 'scheduled';
           upsertRoutine(r);
           render();
-          if (await commitRoutine(r, 'Queued to run now')) await fireTrigger(r);
+          commitRoutine(r, 'Queued to run now');
+          await fireTrigger(r);
           return;
         }
         if (act === 'duplicate') {
@@ -578,7 +579,8 @@
     if (action === 'now') {
       const r = upsertRoutine(Object.assign(base, { status: 'scheduled', scheduledAt: new Date().toISOString() }));
       closeDrawer(); currentView = 'scheduled'; syncTabs(); render();
-      if (await commitRoutine(r, 'Queued to run now')) await fireTrigger(r);
+      commitRoutine(r, 'Queued to run now');
+      await fireTrigger(r);
     }
   }
 
