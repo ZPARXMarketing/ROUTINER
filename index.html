@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Routine Planner — ZPARX</title>
+  <meta name="description" content="Plan, schedule, and fire Claude prompts on a routine. A Notion-to-Claude style command center by ZPARX." />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+
+  <!-- ZPARX brand fonts (Google Fonts CDN) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Hanken+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&family=Silkscreen:wght@400;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="css/tokens.css" />
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ── Top bar: logo top-left ── -->
+    <header class="topbar">
+      <div class="brand">
+        <img class="brand__logo" src="assets/zparx-lockup.svg" alt="ZPARX" />
+        <span class="brand__divider"></span>
+        <span>
+          <span class="brand__eyebrow">Routine Planner</span>
+          <span class="brand__title">Claude <b>Routine</b> Planner</span>
+        </span>
+      </div>
+      <div class="topbar__spacer"></div>
+      <div class="topbar__actions">
+        <span class="clock" id="clock">—</span>
+        <span class="clock" id="repoState" title="Where routines are committed">○ local only</span>
+        <button class="btn btn--ghost btn--sm" id="settingsBtn" title="GitHub, trigger &amp; model">⚙ Settings</button>
+        <button class="btn btn--primary" id="newBtn"><span class="btn__icon">＋</span> New routine</button>
+      </div>
+    </header>
+
+    <!-- ── Tabs ── -->
+    <nav class="tabs" id="tabs">
+      <button class="tab is-active" data-view="scheduled">Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
+      <button class="tab" data-view="library">Library <span class="tab__count" data-count="library">0</span></button>
+      <button class="tab" data-view="archived">Archived <span class="tab__count" data-count="archived">0</span></button>
+      <button class="tab" data-view="history">History <span class="tab__count" data-count="history">0</span></button>
+    </nav>
+
+    <main id="view"></main>
+  </div>
+
+  <!-- ── Drawer (new / edit routine) ── -->
+  <div class="overlay" id="overlay">
+    <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
+      <div class="drawer__head">
+        <h2 id="drawerTitle">New routine</h2>
+        <button class="drawer__close" id="drawerClose" aria-label="Close">×</button>
+      </div>
+      <div class="drawer__body" id="drawerBody"><!-- injected --></div>
+      <div class="drawer__foot" id="drawerFoot"><!-- injected --></div>
+    </aside>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

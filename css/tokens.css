@@ -1,0 +1,76 @@
+/**
+ * ZPARX Design Tokens — vendored for the Claude Routine Planner.
+ * Source of truth: zparxmarketing/zparxbrand-design → tokens/index.css
+ * Dark-mode-first. Lime & yellow are DARK-SURFACE-ONLY accents.
+ */
+
+:root {
+  /* ── Backgrounds ───────────────────────────── */
+  --bg-void:        #070A14;
+  --bg-base:        #0C111F;
+  --bg-surface:     #141B2E;
+  --bg-elevated:    #1C2540;
+  --hairline:       #2A3454;
+
+  /* ── Brand blue ────────────────────────────── */
+  --blue:           #3D5AF1;
+  --blue-bright:    #4D6BFF;
+  --periwinkle:     #97A6F5;
+
+  /* ── Accents (dark surfaces only for lime/yellow) ── */
+  --lime:           #BCEF2F;
+  --lime-glow:      #C8FF45;
+  --orange:         #FF6A1F;
+  --orange-bright:  #FF7A33;
+  --yellow:         #F5D33B;
+
+  /* ── Neutrals ──────────────────────────────── */
+  --white:          #FFFFFF;
+  --paper:          #F2F5FB;
+  --grey-300:       #C4CCDC;
+  --grey-500:       #7C879E;
+  --grey-700:       #424C66;
+
+  /* ── Text ──────────────────────────────────── */
+  --text-hi:        #F4F7FF;
+  --text-mid:       #A7B0C8;
+  --text-low:       #6B7593;
+  --ink:            #0C111F;
+
+  /* ── Semantic ──────────────────────────────── */
+  --success:        var(--lime);
+  --info:           var(--blue);
+  --warning:        var(--yellow);
+  --danger:         #FF4D5E;
+
+  /* ── Typography ────────────────────────────── */
+  --font-display:   'Bricolage Grotesque', sans-serif;
+  --font-body:      'Hanken Grotesk', sans-serif;
+  --font-pixel:     'Silkscreen', monospace;
+  --font-mono:      'JetBrains Mono', monospace;
+
+  /* ── Spacing (4px base) ────────────────────── */
+  --sp-1:    4px;
+  --sp-2:    8px;
+  --sp-3:    12px;
+  --sp-4:    16px;
+  --sp-6:    24px;
+  --sp-8:    32px;
+  --sp-12:   48px;
+  --sp-16:   64px;
+  --sp-24:   96px;
+
+  /* ── Radius ────────────────────────────────── */
+  --r-sharp:  0;
+  --r-sm:     6px;
+  --r-md:     12px;
+  --r-lg:     18px;
+  --r-pill:   999px;
+
+  /* ── Elevation ─────────────────────────────── */
+  --shadow-sm:   0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md:   0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-lg:   0 24px 60px rgba(0, 0, 0, 0.55);
+  --glow-lime:   0 0 24px rgba(188, 239, 47, 0.45);
+  --glow-blue:   0 0 28px rgba(61, 90, 241, 0.5);
+}
