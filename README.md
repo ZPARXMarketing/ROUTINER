@@ -63,12 +63,27 @@ Set these in **Netlify → Site settings → Environment variables**:
 
 The token stays server-side — it's never exposed to the browser.
 
-## Scheduling (next step)
+## Scheduling (hands-off)
 
-"Run now" works today. Timed/recurring routines are stored with their schedule,
-but firing them automatically needs a server-side runner — a Supabase
-`pg_cron` job + edge function that finds due routines and calls the same `/fire`
-endpoint. That piece isn't built yet.
+Timed and recurring routines fire on their own — no tab open, no manual step:
+
+- A Supabase **`pg_cron`** job runs every minute and calls the
+  **`routiner-scheduler`** edge function
+  (`supabase/functions/routiner-scheduler/index.ts`).
+- The function finds routines where `status = 'scheduled'` and
+  `scheduled_at <= now()`, fires each through the Netlify trigger (so the same
+  `CLAUDE_TRIGGER` / `CLAUDE_TOKEN` are reused), logs a row to `routiner_runs`,
+  then reschedules recurring ones (daily / weekdays / weekly) and retires
+  one-offs to the library.
+
+Manage it from SQL:
+
+```sql
+select * from cron.job where jobname = 'routiner-scheduler';
+select * from cron.job_run_details order by start_time desc limit 10;
+```
+
+See `supabase/migrations/` for the schema and the cron schedule.
 
 ## Project structure
 
