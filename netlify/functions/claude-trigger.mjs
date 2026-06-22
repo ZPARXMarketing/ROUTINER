@@ -38,7 +38,10 @@ function resolveFireUrl(trigger) {
   if (!trigger) return null;
   if (/^https?:\/\//i.test(trigger)) return trigger;
   if (/^trig_/.test(trigger)) return `https://api.anthropic.com/v1/claude_code/routines/${trigger}/fire`;
-  return trigger;
+  // Anything else is a misconfiguration (e.g. the Anthropic token was pasted
+  // into CLAUDE_TRIGGER). Reject it instead of trying to fetch() a non-URL —
+  // that throws an error whose text would leak the value back to the caller.
+  return null;
 }
 
 function bearer(req) {
@@ -85,7 +88,7 @@ export default async (req) => {
 
   const url = resolveFireUrl(process.env.CLAUDE_TRIGGER || process.env.CLAUDE_TRIGGER_URL);
   const token = process.env.CLAUDE_TOKEN || process.env.CLAUDE_TRIGGER_TOKEN || process.env.ANTHROPIC_API_KEY;
-  if (!url) return Response.json({ ok: false, error: 'CLAUDE_TRIGGER env var is not set (trigger id or fire URL).' }, { status: 500, headers: cors });
+  if (!url) return Response.json({ ok: false, error: 'CLAUDE_TRIGGER is missing or malformed — it must be a routine id (trig_…) or a full /fire URL, not the Anthropic token.' }, { status: 500, headers: cors });
   if (!token) return Response.json({ ok: false, error: 'No token — set CLAUDE_TOKEN (or ANTHROPIC_API_KEY) in Netlify env.' }, { status: 500, headers: cors });
 
   let incoming = {};
@@ -109,6 +112,9 @@ export default async (req) => {
       headers: { 'content-type': resp.headers.get('content-type') || 'application/json', ...cors },
     });
   } catch (err) {
-    return Response.json({ ok: false, error: String(err) }, { status: 502, headers: cors });
+    // Never surface the raw error: it can embed the fire URL / token. Log it
+    // server-side and return a generic message to the caller.
+    console.error('claude-trigger fetch failed:', err);
+    return Response.json({ ok: false, error: 'Failed to reach the Claude routine endpoint. Check CLAUDE_TRIGGER / CLAUDE_TOKEN.' }, { status: 502, headers: cors });
   }
 };
