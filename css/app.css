@@ -480,3 +480,9 @@ a { color: var(--periwinkle); }
 .trig-cfg .input { font-size: 12px; padding: var(--sp-2) var(--sp-3); }
 .cfg-addacct { width: 100%; justify-content: center; margin-top: var(--sp-2); }
 .acct-cfg > .btn--ghost { width: 100%; justify-content: center; }
+
+/* ── Settings: per-trigger test fire ───────────── */
+.trig-test { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-top: 2px; }
+.trig-status { font-family: var(--font-body); font-size: 12px; color: var(--text-mid); }
+.trig-status.is-ok { color: var(--lime); }
+.trig-status.is-err { color: var(--danger); }
