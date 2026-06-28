@@ -12,6 +12,14 @@ read due notes in `routines/scheduled/`, carry out their instructions, log
 results to `routines/logs/`, reschedule recurring ones / move one-offs to
 `routines/done/`, then commit and push.
 
+## If you were asked to plan a project / schedule routines
+
+Use the **[`plan-routines`](.claude/skills/plan-routines/SKILL.md)** skill. It
+lays a project out as timed routine blocks written into the shared
+`routiner_routines` table (the one the Calendar reads). Both Claude accounts
+(Sparks9679 / ZparxMarketing) share that table, tagged by the `account` column —
+read it first, then schedule your own account's blocks around what's there.
+
 ## If you're working on the app itself
 
 - `index.html`, `css/`, `js/app.js` — the single-page planner UI (`app.js` is an
