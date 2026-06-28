@@ -24,23 +24,75 @@ const MODELS = [
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (Mon–Fri)', weekly: 'Every week' };
 
-/* Claude accounts the routine can fire against. The `id` maps to the per-account
-   CLAUDE_TRIGGER_<ID> / CLAUDE_TOKEN_<ID> env vars in the Netlify function. */
-const ACCOUNTS = [
-  { id: 'sparks9679', label: 'Sparks9679' },
-  { id: 'zparxmarketing', label: 'ZparxMarketing' },
-];
+/* ---------- Accounts & triggers (user-managed) ----------
+   Each account holds a list of triggers (instances). A trigger is one Fire URL
+   (or trig_… id) + token. Routines target an account AND a specific trigger.
+   The structure lives in Supabase routiner_settings.accounts and is editable
+   in Settings; `accountsCfg` is the in-memory copy (secrets stripped) used to
+   render. */
+const KNOWN_LABELS = { sparks9679: 'Sparks9679', zparxmarketing: 'ZparxMarketing' };
 const DEFAULT_ACCOUNT = 'sparks9679';
-const accountLabel = (id) => (ACCOUNTS.find((a) => a.id === id) || {}).label || id || DEFAULT_ACCOUNT;
+const DEFAULT_ACCOUNTS = () => [
+  { id: 'sparks9679', label: 'Sparks9679', triggers: [] },
+  { id: 'zparxmarketing', label: 'ZparxMarketing', triggers: [] },
+];
+let accountsCfg = DEFAULT_ACCOUNTS();
 
-/* Each account gets one easy-to-read color on the calendar. Lime = Sparks9679,
-   blue = ZparxMarketing — distinct in both hue and brightness so overlapping
-   blocks from the two Claudes are instantly tellable apart. */
-const ACCOUNT_COLORS = {
-  sparks9679:     { solid: '#BCEF2F', ink: '#0C111F', edge: '#8FBE16' },
-  zparxmarketing: { solid: '#4D6BFF', ink: '#FFFFFF', edge: '#2F49C8' },
-};
-const accountColor = (id) => ACCOUNT_COLORS[id] || ACCOUNT_COLORS[DEFAULT_ACCOUNT];
+const genId = (p) => `${p}_${Math.random().toString(36).slice(2, 8)}`;
+
+/* Normalize whatever is stored (new array shape, old { id:{trigger,token} } map,
+   or empty) into the array shape. `keepSecrets:false` strips trigger/token so the
+   broadly-held copy carries only ids + labels. */
+function normalizeAccounts(raw, keepSecrets) {
+  const trig = (t, i) => ({ id: t.id || genId('t'), label: t.label || String.fromCharCode(65 + i),
+    trigger: keepSecrets ? (t.trigger || '') : '', token: keepSecrets ? (t.token || '') : '' });
+  if (Array.isArray(raw) && raw.length) {
+    return raw.map((a) => ({ id: a.id || genId('acc'), label: a.label || KNOWN_LABELS[a.id] || a.id,
+      triggers: (a.triggers || []).map(trig) }));
+  }
+  if (raw && typeof raw === 'object' && Object.keys(raw).length) { // old map shape
+    return Object.entries(raw).map(([id, v]) => ({ id, label: KNOWN_LABELS[id] || id,
+      triggers: (v && (v.trigger || v.token)) ? [trig({ id: 't1', label: 'A', trigger: v.trigger, token: v.token }, 0)] : [] }));
+  }
+  return DEFAULT_ACCOUNTS();
+}
+
+const listAccounts = () => accountsCfg;
+const getAccountCfg = (id) => accountsCfg.find((a) => a.id === id);
+const accountIndex = (id) => accountsCfg.findIndex((a) => a.id === id);
+const accountLabel = (id) => { const a = getAccountCfg(id); return a ? a.label : (KNOWN_LABELS[id] || id || ''); };
+const accountTriggers = (id) => (getAccountCfg(id) || {}).triggers || [];
+const triggerCfg = (accId, tId) => accountTriggers(accId).find((t) => t.id === tId);
+const triggerLabel = (accId, tId) => { const t = triggerCfg(accId, tId); return t ? t.label : ''; };
+
+/* Color engine: each account is a hue family; each trigger a distinct shade
+   within it — so A/B/C read as the same account, told apart by shade, and the
+   whole thing stays on-brand against the dark UI. */
+const HUE_FAMILIES = [
+  ['#BCEF2F', '#86E01E', '#C8FF45', '#9FD630', '#6FBF2A'], // lime / green
+  ['#4D6BFF', '#4DA6FF', '#22D3EE', '#7C9CFF', '#3D5AF1'], // blue / cyan
+  ['#FF7A33', '#FF9E2C', '#F5D33B', '#FFB066', '#E8631C'], // orange / amber
+  ['#B57BFF', '#9B5DE5', '#C77DFF', '#8A5CF6', '#7A3FF0'], // purple
+  ['#FF4D8D', '#FF7AA8', '#F15BB5', '#FF9EC4', '#E8327C'], // pink
+  ['#2EE6A6', '#3DDC97', '#6EE7B7', '#16C79A', '#0FB58E'], // teal
+];
+const hexToRgb = (h) => { h = h.replace('#', ''); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); };
+const lum = ([r, g, b]) => (0.2126 * r + 0.7152 * g + 0.114 * b) / 255;
+const inkFor = (hex) => lum(hexToRgb(hex)) > 0.55 ? '#0C111F' : '#FFFFFF';
+const darken = (hex, amt) => { const d = (v) => Math.round(v * (1 - amt)).toString(16).padStart(2, '0'); return '#' + hexToRgb(hex).map(d).join(''); };
+const swatch = (hex) => ({ solid: hex, ink: inkFor(hex), edge: darken(hex, 0.3) });
+const GREY = { solid: '#7C879E', ink: '#0C111F', edge: '#5A6377' };
+
+function triggerColor(accId, tId) {
+  const ai = accountIndex(accId);
+  if (ai < 0) return GREY;
+  const fam = HUE_FAMILIES[ai % HUE_FAMILIES.length];
+  const trigs = accountTriggers(accId);
+  let ti = trigs.findIndex((t) => t.id === tId);
+  if (ti < 0) ti = 0; // routine with no/unknown trigger → account's base shade
+  return swatch(fam[ti % fam.length]);
+}
+const accountColor = (accId) => triggerColor(accId, null); // base shade for the account
 
 /* How long a routine block occupies on the calendar */
 const DEFAULT_DURATION_MIN = 45;
@@ -107,13 +159,14 @@ function toast(msg, kind = '') {
 /* ---------- Row <-> object mapping ---------- */
 const fromRow = (r) => ({
   id: r.id, title: r.title, prompt: r.prompt, model: r.model, account: r.account || DEFAULT_ACCOUNT,
+  triggerKey: r.trigger_key || null,
   recurrence: r.recurrence, status: r.status, scheduledAt: r.scheduled_at, lastRun: r.last_run,
   durationMin: r.duration_min || DEFAULT_DURATION_MIN,
   createdAt: r.created_at, updatedAt: r.updated_at,
 });
 const toRow = (o) => ({
   title: o.title ?? '', prompt: o.prompt ?? '', model: o.model || DEFAULT_MODEL,
-  account: o.account || DEFAULT_ACCOUNT,
+  account: o.account || DEFAULT_ACCOUNT, trigger_key: o.triggerKey || null,
   recurrence: o.recurrence || 'none', status: o.status || 'library',
   duration_min: o.durationMin || DEFAULT_DURATION_MIN,
   scheduled_at: o.scheduledAt || null, last_run: o.lastRun || null,
@@ -121,10 +174,12 @@ const toRow = (o) => ({
 
 /* ---------- Data layer ---------- */
 async function loadAll() {
-  const [rRes, runRes] = await Promise.all([
+  const [rRes, runRes, setRes] = await Promise.all([
     sb.from('routiner_routines').select('*').order('updated_at', { ascending: false }),
     sb.from('routiner_runs').select('*').order('fired_at', { ascending: false }).limit(200),
+    sb.from('routiner_settings').select('accounts').maybeSingle(),
   ]);
+  accountsCfg = normalizeAccounts(setRes && setRes.data && setRes.data.accounts, false);
   if (rRes.error) { toast('Load failed: ' + rRes.error.message, 'error'); return; }
   routines = (rRes.data || []).map(fromRow);
   runs = (runRes.data || []).map((x) => ({ id: x.id, routineId: x.routine_id, title: x.title, status: x.status, output: x.output, firedAt: x.fired_at }));
@@ -176,7 +231,7 @@ async function dbInsertRun(routine, result) {
 async function fireTrigger(routine) {
   const direct = settings.triggerUrl.trim();
   const url = direct || TRIGGER_FN;
-  const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
+  const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, triggerKey: routine?.triggerKey || null, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
   // Send the signed-in user's access token so the gated function authorizes us.
   const headers = { 'content-type': 'application/json' };
   const { data: { session: s } } = await sb.auth.getSession();
@@ -263,10 +318,12 @@ function card(r) {
     ? `<span class="card__meta-item">⏰ <b>${fmt(r.scheduledAt)}</b> · ${relative(r.scheduledAt)}</span>`
     : (r.lastRun ? `<span class="card__meta-item">last run <b>${fmt(r.lastRun)}</b></span>` : '');
   const modelName = ((MODELS.find((m) => m.id === (r.model || settings.model)) || {}).label || '').split(' — ')[0] || r.model;
+  const tLabel = triggerLabel(r.account, r.triggerKey);
+  const acctText = accountLabel(r.account) + (tLabel ? ` · ${tLabel}` : '');
   return `<article class="card" data-id="${r.id}">
     <div class="card__head"><span class="card__title">${esc(r.title) || '<em>Untitled routine</em>'}</span>${statusChip(r)}</div>
     <div class="card__prompt">${esc(r.prompt) || '(no prompt)'}</div>
-    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${accountColor(r.account).solid}"></span><b>${esc(accountLabel(r.account))}</b></span><span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span><span class="card__meta-item">⏱ <b>${fmtDuration(r.durationMin || DEFAULT_DURATION_MIN)}</b></span>${when}</div>
+    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${triggerColor(r.account, r.triggerKey).solid}"></span><b>${esc(acctText)}</b></span><span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span><span class="card__meta-item">⏱ <b>${fmtDuration(r.durationMin || DEFAULT_DURATION_MIN)}</b></span>${when}</div>
     <div class="card__foot">${cardActions(r)}</div>
   </article>`;
 }
@@ -393,12 +450,14 @@ function calEventHtml(ev) {
   const top = ((s - winStart) / 60) * CAL.hourPx;
   const height = Math.max(((e - s) / 60) * CAL.hourPx, 20);
   const widthPct = 100 / ev.ncols, leftPct = ev.col * widthPct;
-  const c = accountColor(ev.routine.account);
+  const c = triggerColor(ev.routine.account, ev.routine.triggerKey);
   const past = ev.start.getTime() < Date.now();
   const hm = (d) => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   const timeStr = `${hm(ev.start)}–${hm(ev.end)}`;
   const showTime = height >= 34;
-  return `<div class="cal__ev${past ? ' cal__ev--past' : ''}" data-id="${ev.routine.id}" title="${esc(ev.routine.title)} · ${accountLabel(ev.routine.account)} · ${timeStr}"
+  const tLabel = triggerLabel(ev.routine.account, ev.routine.triggerKey);
+  const acctText = accountLabel(ev.routine.account) + (tLabel ? ` · ${tLabel}` : '');
+  return `<div class="cal__ev${past ? ' cal__ev--past' : ''}" data-id="${ev.routine.id}" title="${esc(ev.routine.title)} · ${esc(acctText)} · ${timeStr}"
     style="top:${top}px; height:${height}px; left:calc(${leftPct}% + 3px); width:calc(${widthPct}% - 5px); background:${c.solid}; color:${c.ink}; border-left-color:${c.edge};">
     <div class="cal__ev-title">${esc(ev.routine.title) || 'Untitled'}</div>
     ${showTime ? `<div class="cal__ev-time">${timeStr}</div>` : ''}
@@ -414,9 +473,11 @@ function renderCalendar() {
 
   const rangeLabel = `${weekStart.toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${weekEnd.toLocaleDateString([], { month: weekStart.getMonth() === weekEnd.getMonth() ? undefined : 'short', day: 'numeric' })}`;
 
-  const legend = ACCOUNTS.map((a) => {
-    const c = accountColor(a.id);
-    return `<span class="cal__leg"><span class="cal__sw" style="background:${c.solid}"></span>${esc(a.label)}</span>`;
+  const legend = listAccounts().map((a) => {
+    const swatches = (a.triggers && a.triggers.length)
+      ? a.triggers.map((t) => `<span class="cal__sw" title="${esc(t.label)}" style="background:${triggerColor(a.id, t.id).solid}"></span>`).join('')
+      : `<span class="cal__sw" style="background:${accountColor(a.id).solid}"></span>`;
+    return `<span class="cal__leg">${swatches}<span>${esc(a.label)}</span></span>`;
   }).join('');
 
   const dayHeaders = days.map((d) => {
@@ -445,7 +506,7 @@ function renderCalendar() {
     </div>
     <div class="cal__head"><div></div>${dayHeaders}</div>
     <div class="cal__scroll"><div class="cal__body">${gutter}${dayCols}</div></div>
-    ${total === 0 ? '<div class="cal__hint">No routines scheduled this week. Schedule a routine — pick its Claude account and a time — and it lands here as a colored block.</div>' : ''}
+    ${total === 0 ? '<div class="cal__hint">No routines scheduled this week. Schedule a routine — pick its account, trigger, and a time — and it lands here as a colored block.</div>' : ''}
   </div>`;
 
   view.querySelectorAll('[data-cal]').forEach((b) => b.addEventListener('click', () => {
@@ -468,20 +529,30 @@ function nowLineHtml() {
 
 /* ---------- Drawer (create / edit) ---------- */
 let editingId = null;
+function triggerOptions(accId, selectedKey) {
+  const trigs = accountTriggers(accId);
+  if (!trigs.length) return `<option value="">— none yet — add in Settings —</option>`;
+  return trigs.map((t) => `<option value="${t.id}" ${selectedKey === t.id ? 'selected' : ''}>${esc(t.label || '(unnamed)')}</option>`).join('');
+}
 function openDrawer(routine = null, opts = {}) {
   editingId = routine ? routine.id : null;
   drawerTitle.textContent = routine ? 'Edit routine' : 'New routine';
-  const r = routine || { title: '', prompt: '', model: settings.model, account: settings.account || DEFAULT_ACCOUNT, recurrence: 'none', scheduledAt: null };
+  const r = routine || { title: '', prompt: '', model: settings.model, account: settings.account || DEFAULT_ACCOUNT, triggerKey: null, recurrence: 'none', scheduledAt: null };
   const whenVal = r.scheduledAt ? toLocalInput(new Date(r.scheduledAt)) : defaultWhen();
+  const curAccount = getAccountCfg(r.account) ? r.account : (listAccounts()[0] || {}).id;
   drawerBody.innerHTML = `
     <div class="field"><label class="label" for="f-title">Title</label>
       <input class="input" id="f-title" placeholder="e.g. Morning competitor scan" value="${esc(r.title)}" /></div>
     <div class="field"><label class="label" for="f-prompt">Directions for Claude</label>
       <textarea class="textarea" id="f-prompt" placeholder="Describe the task. It runs in your Claude Code routine session with full tools.">${esc(r.prompt)}</textarea>
       <span class="hint">Sent to your routine as a session turn. Use {{date}} / {{datetime}} for the run time.</span></div>
-    <div class="field"><label class="label" for="f-account">Claude account</label>
-      <select class="select" id="f-account">${ACCOUNTS.map((a) => `<option value="${a.id}" ${(r.account || settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select>
-      <span class="hint">Which connected Claude account this routine fires against.</span></div>
+    <div class="field__row">
+      <div class="field"><label class="label" for="f-account">Claude account</label>
+        <select class="select" id="f-account">${listAccounts().map((a) => `<option value="${a.id}" ${curAccount === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
+      <div class="field"><label class="label" for="f-trigger">Trigger</label>
+        <select class="select" id="f-trigger">${triggerOptions(curAccount, r.triggerKey)}</select>
+        <span class="hint">Which instance fires it. Manage these in ⚙ Settings.</span></div>
+    </div>
     <div class="field"><label class="label" for="f-model">Model hint</label>
       <select class="select" id="f-model">${MODELS.map((m) => `<option value="${m.id}" ${(r.model || settings.model) === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
     <div class="field__row">
@@ -500,6 +571,7 @@ function openDrawer(routine = null, opts = {}) {
     <button class="btn btn--brand" data-do="schedule">⏰ Schedule</button>
     <button class="btn btn--secondary" data-do="library">▣ Save to library</button>`;
   $('#f-test', drawerBody).addEventListener('click', testLive);
+  $('#f-account', drawerBody).addEventListener('change', (e) => { $('#f-trigger', drawerBody).innerHTML = triggerOptions(e.target.value, null); });
   drawerFoot.querySelectorAll('[data-do]').forEach((b) => b.addEventListener('click', () => submitDrawer(b.dataset.do)));
   setTimeout(() => $(opts.forceSchedule ? '#f-when' : '#f-title', drawerBody)?.focus(), 50);
   overlay.classList.add('is-open');
@@ -514,14 +586,14 @@ async function testLive() {
   await dbInsertRun({ id: editingId, title: $('#f-title').value || 'Live test' }, res);
 }
 function readDrawer() {
-  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, account: $('#f-account').value, durationMin: parseInt($('#f-dur').value, 10) || DEFAULT_DURATION_MIN, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
+  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, account: $('#f-account').value, triggerKey: $('#f-trigger').value || null, durationMin: parseInt($('#f-dur').value, 10) || DEFAULT_DURATION_MIN, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
 }
 async function persist(base) { return editingId ? dbUpdate(editingId, Object.assign(getRoutine(editingId) || {}, base)) : dbCreate(base); }
 
 async function submitDrawer(action) {
   const d = readDrawer();
   if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
-  const base = { title: d.title, prompt: d.prompt, model: d.model, account: d.account, durationMin: d.durationMin, recurrence: d.recurrence };
+  const base = { title: d.title, prompt: d.prompt, model: d.model, account: d.account, triggerKey: d.triggerKey, durationMin: d.durationMin, recurrence: d.recurrence };
 
   if (action === 'library') {
     await persist(Object.assign(base, { status: 'library', scheduledAt: null }));
@@ -544,7 +616,53 @@ async function submitDrawer(action) {
 }
 function closeDrawer() { overlay.classList.remove('is-open'); editingId = null; }
 
-/* ---------- Settings ---------- */
+/* ---------- Settings (accounts & triggers manager) ---------- */
+let cfgModel = null; // editable deep copy of accounts (with secrets)
+const cfgColor = (ai, ti) => { const fam = HUE_FAMILIES[ai % HUE_FAMILIES.length]; return fam[(ti < 0 ? 0 : ti) % fam.length]; };
+
+function nextTrigLabel(a) {
+  const used = new Set((a.triggers || []).map((t) => t.label));
+  for (let i = 0; i < 26; i++) { const c = String.fromCharCode(65 + i); if (!used.has(c)) return c; }
+  return '';
+}
+function syncCfgFromDom() {
+  $$('.cfg-aname').forEach((el) => { const a = cfgModel[+el.dataset.ai]; if (a) a.label = el.value.trim() || a.label; });
+  $$('.cfg-tlabel').forEach((el) => { const t = (cfgModel[+el.dataset.ai] || {}).triggers?.[+el.dataset.ti]; if (t) t.label = el.value.trim(); });
+  $$('.cfg-turl').forEach((el) => { const t = (cfgModel[+el.dataset.ai] || {}).triggers?.[+el.dataset.ti]; if (t) t.trigger = el.value.trim(); });
+  $$('.cfg-ttoken').forEach((el) => { const t = (cfgModel[+el.dataset.ai] || {}).triggers?.[+el.dataset.ti]; if (t) { const v = el.value.trim(); if (v) t.token = v; } });
+}
+function renderCfgAccounts() {
+  const host = $('#cfg-accounts'); if (!host) return;
+  host.innerHTML = cfgModel.map((a, ai) => `
+    <div class="acct-cfg">
+      <div class="acct-cfg__head">
+        <span class="acct-dot" style="background:${cfgColor(ai, -1)}"></span>
+        <input class="input cfg-aname" data-ai="${ai}" value="${esc(a.label)}" placeholder="Account name" />
+        <button class="iconbtn" title="Remove account" data-act="del-acct" data-ai="${ai}">🗑</button>
+      </div>
+      <div class="trig-list">${a.triggers.map((t, ti) => `
+        <div class="trig-cfg">
+          <div class="trig-cfg__top">
+            <span class="acct-dot" style="background:${cfgColor(ai, ti)}"></span>
+            <input class="input cfg-tlabel" data-ai="${ai}" data-ti="${ti}" value="${esc(t.label)}" placeholder="Label" />
+            <button class="iconbtn" title="Remove trigger" data-act="del-trig" data-ai="${ai}" data-ti="${ti}">✕</button>
+          </div>
+          <input class="input cfg-turl" data-ai="${ai}" data-ti="${ti}" value="${esc(t.trigger)}" placeholder="Fire URL or trig_…" />
+          <input class="input cfg-ttoken" data-ai="${ai}" data-ti="${ti}" type="password" autocomplete="off" placeholder="${t.token ? '•••• saved — blank to keep' : 'Token (sk-ant-…)'}" />
+        </div>`).join('')}</div>
+      <button class="btn btn--ghost btn--sm" data-act="add-trig" data-ai="${ai}">＋ Add trigger</button>
+    </div>`).join('') + `<button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct">＋ Add account</button>`;
+
+  host.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
+    syncCfgFromDom();
+    const ai = +b.dataset.ai, ti = +b.dataset.ti, act = b.dataset.act;
+    if (act === 'add-acct') cfgModel.push({ id: genId('acc'), label: 'New account', triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '' }] });
+    else if (act === 'del-acct') cfgModel.splice(ai, 1);
+    else if (act === 'add-trig') cfgModel[ai].triggers.push({ id: genId('t'), label: nextTrigLabel(cfgModel[ai]), trigger: '', token: '' });
+    else if (act === 'del-trig') cfgModel[ai].triggers.splice(ti, 1);
+    renderCfgAccounts();
+  }));
+}
 async function openSettings() {
   editingId = null;
   drawerTitle.textContent = 'Settings';
@@ -552,56 +670,37 @@ async function openSettings() {
   drawerFoot.innerHTML = '';
   overlay.classList.add('is-open');
 
-  const creds = await dbLoadAccountCreds(); // { accountId: { trigger, token } }
-
-  const accountBlocks = ACCOUNTS.map((a) => {
-    const c = creds[a.id] || {};
-    const hasToken = !!c.token;
-    return `<div class="acct-cfg">
-      <div class="acct-cfg__head"><span class="acct-dot" style="background:${accountColor(a.id).solid}"></span><b>${esc(a.label)}</b></div>
-      <div class="field"><label class="label" for="s-trig-${a.id}">Routine trigger</label>
-        <input class="input" id="s-trig-${a.id}" data-acct="${a.id}" placeholder="trig_… or https://…/fire" value="${esc(c.trigger || '')}" />
-        <span class="hint">From your Claude Code routine — its trigger id (<code>trig_…</code>) or full <code>/fire</code> URL.</span></div>
-      <div class="field"><label class="label" for="s-tok-${a.id}">Anthropic token</label>
-        <input class="input" id="s-tok-${a.id}" data-acct="${a.id}" type="password" autocomplete="off" placeholder="${hasToken ? '•••••••• saved — leave blank to keep' : 'sk-ant-…'}" />
-        <span class="hint">Bearer token this account fires with. ${hasToken ? 'A token is saved; type to replace it.' : 'Stored to your account, used server-side to fire.'}</span></div>
-    </div>`;
-  }).join('');
+  cfgModel = normalizeAccounts(await dbLoadAccountCreds(), true);
 
   drawerBody.innerHTML = `
-    <div class="notice">Pop your Claude <b>trigger</b> + <b>token</b> in below — that's all it takes to make <b>Run now</b> and scheduled routines fire. They save to your account and are used server-side; no Netlify setup needed.</div>
-    <div class="field"><label class="label" for="s-account">Default Claude account</label>
-      <select class="select" id="s-account">${ACCOUNTS.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select>
-      <span class="hint">Pre-selected for new routines. Each routine can still pick its own account.</span></div>
-    <div class="field"><label class="label" for="s-model">Default model</label>
-      <select class="select" id="s-model">${MODELS.map((m) => `<option value="${m.id}" ${settings.model === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
-    <div class="cfg-sep">Claude accounts — trigger &amp; token</div>
-    ${accountBlocks}
+    <div class="notice">Add a Claude <b>account</b>, then give it one or more <b>triggers</b> — each is a Fire URL (or <code>trig_…</code>) + token. Routines pick which trigger fires them. Saved to your account and used server-side; no Netlify setup needed.</div>
+    <div class="field__row">
+      <div class="field"><label class="label" for="s-account">Default account</label>
+        <select class="select" id="s-account">${cfgModel.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
+      <div class="field"><label class="label" for="s-model">Default model</label>
+        <select class="select" id="s-model">${MODELS.map((m) => `<option value="${m.id}" ${settings.model === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
+    </div>
+    <div class="cfg-sep">Accounts &amp; triggers</div>
+    <div id="cfg-accounts"></div>
     <details class="cfg-adv"><summary>Advanced (optional)</summary>
       <div class="field"><label class="label" for="s-trigger">Trigger URL override</label>
         <input class="input" id="s-trigger" placeholder="leave blank to use the built-in function" value="${esc(settings.triggerUrl)}" />
-        <span class="hint">Leave blank to use <code>/.netlify/functions/claude-trigger</code>. Set a URL only to POST a different webhook directly (bypasses the per-account creds above).</span></div>
+        <span class="hint">Leave blank to use <code>/.netlify/functions/claude-trigger</code>. Set a URL only to POST a different webhook directly (bypasses the accounts above).</span></div>
       <div class="field"><label class="label" for="s-key">Anthropic API key (“Test live” only)</label>
         <input class="input" id="s-key" type="password" autocomplete="off" placeholder="sk-ant-…" value="${esc(settings.apiKey)}" />
         <span class="hint">Stored only in this browser; used only by the in-drawer Test button.</span></div>
     </details>`;
   drawerFoot.innerHTML = `<button class="btn btn--primary" id="s-save">Save settings</button>`;
+  renderCfgAccounts();
 
   $('#s-save').addEventListener('click', async () => {
-    // Merge account creds: keep an existing token when its field is left blank.
-    const next = { ...creds };
-    ACCOUNTS.forEach((a) => {
-      const trigger = $(`#s-trig-${a.id}`).value.trim();
-      const tokenIn = $(`#s-tok-${a.id}`).value.trim();
-      const prev = creds[a.id] || {};
-      const token = tokenIn || prev.token || '';
-      if (trigger || token) next[a.id] = { trigger, token };
-      else delete next[a.id];
-    });
+    syncCfgFromDom();
     const btn = $('#s-save'); btn.disabled = true; btn.textContent = 'Saving…';
-    const ok = await dbSaveAccountCreds(next);
-    settings.account = $('#s-account').value; settings.model = $('#s-model').value;
-    settings.triggerUrl = $('#s-trigger').value.trim(); settings.apiKey = $('#s-key').value.trim();
+    const ok = await dbSaveAccountCreds(cfgModel);
+    accountsCfg = normalizeAccounts(cfgModel, false);
+    settings.account = $('#s-account').value;
+    if (!getAccountCfg(settings.account)) settings.account = (accountsCfg[0] || {}).id || DEFAULT_ACCOUNT;
+    settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim(); settings.apiKey = $('#s-key').value.trim();
     saveSettings();
     btn.disabled = false; btn.textContent = 'Save settings';
     if (ok) { closeDrawer(); render(); toast('Settings saved.'); }

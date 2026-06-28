@@ -93,7 +93,24 @@ async function verifyUser(token) {
 // (routiner_settings, RLS per user) using their access token. Lets users
 // configure everything in-app — no Netlify env vars needed. Returns
 // { trigger, token } (either may be empty) or null when unavailable.
-async function loadUserCreds(accessToken, account) {
+function pickCreds(accounts, account, triggerKey) {
+  // New shape: array of { id, label, triggers: [ {id, label, trigger, token} ] }
+  if (Array.isArray(accounts)) {
+    const a = accounts.find((x) => x && x.id === account);
+    if (!a) return null;
+    const trigs = a.triggers || [];
+    const t = (triggerKey && trigs.find((x) => x.id === triggerKey)) || trigs[0];
+    return t ? { trigger: t.trigger || '', token: t.token || '' } : null;
+  }
+  // Old shape: { accountId: { trigger, token } }
+  if (accounts && typeof accounts === 'object') {
+    const a = accounts[account];
+    return a ? { trigger: a.trigger || '', token: a.token || '' } : null;
+  }
+  return null;
+}
+
+async function loadUserCreds(accessToken, account, triggerKey) {
   if (!accessToken || !account) return null;
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/routiner_settings?select=accounts`, {
@@ -102,9 +119,7 @@ async function loadUserCreds(accessToken, account) {
     if (!r.ok) return null;
     const rows = await r.json();
     const accounts = (rows && rows[0] && rows[0].accounts) || {};
-    const a = accounts[account];
-    if (!a) return null;
-    return { trigger: a.trigger || '', token: a.token || '' };
+    return pickCreds(accounts, account, triggerKey);
   } catch { return null; }
 }
 
@@ -138,11 +153,12 @@ export default async (req) => {
   try { incoming = JSON.parse((await req.text()) || '{}'); } catch { /* ignore */ }
   const text = incoming.text ?? incoming.prompt ?? '';
   const account = incoming.account ?? '';
+  const triggerKey = incoming.triggerKey ?? null;
 
   // Prefer the signed-in user's in-app settings; fall back to env vars per field.
   const accessToken = bearer(req);
   const userCreds = (accessToken && accessToken !== process.env.ROUTINER_FIRE_SECRET)
-    ? await loadUserCreds(accessToken, account) : null;
+    ? await loadUserCreds(accessToken, account, triggerKey) : null;
   const envCreds = resolveAccountCreds(account);
   const trigger = (userCreds && userCreds.trigger) || envCreds.trigger;
   const token = (userCreds && userCreds.token) || envCreds.token;

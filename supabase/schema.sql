@@ -15,6 +15,7 @@ create table if not exists public.routiner_routines (
   prompt       text not null default '',
   model        text not null default 'claude-sonnet-4-6',
   account      text not null default 'sparks9679',   -- which Claude account fires it
+  trigger_key  text,                                  -- which trigger (instance) within that account; null = first
   recurrence   text not null default 'none',         -- none | daily | weekdays | weekly
   status       text not null default 'library',      -- library | scheduled | archived
   duration_min integer not null default 45,          -- calendar block length
@@ -35,11 +36,14 @@ create table if not exists public.routiner_runs (
   fired_at   timestamptz not null default now()
 );
 
--- ── Per-user fire credentials (set in-app via Settings) ──────────────────
--- accounts is a map of { "<accountId>": { "trigger": "...", "token": "..." } }.
--- The Netlify claude-trigger function reads these server-side using the
--- caller's own access token, so users can configure everything in the app
--- with no environment variables.
+-- ── Per-user accounts + triggers (set in-app via Settings) ───────────────
+-- accounts is a list of accounts, each holding one or more triggers:
+--   [ { "id": "...", "label": "...",
+--       "triggers": [ { "id": "...", "label": "A", "trigger": "...", "token": "..." } ] } ]
+-- (An older flat map { "<accountId>": { "trigger", "token" } } is still read.)
+-- The Netlify claude-trigger function resolves a routine's account + trigger_key
+-- to one trigger and fires it, server-side via the caller's own access token —
+-- so users configure everything in the app with no environment variables.
 create table if not exists public.routiner_settings (
   user_id    uuid primary key default auth.uid() references auth.users(id) on delete cascade,
   accounts   jsonb not null default '{}'::jsonb,
