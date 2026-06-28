@@ -33,8 +33,8 @@ const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (
 const KNOWN_LABELS = { sparks9679: 'Sparks9679', zparxmarketing: 'ZparxMarketing' };
 const DEFAULT_ACCOUNT = 'sparks9679';
 const DEFAULT_ACCOUNTS = () => [
-  { id: 'sparks9679', label: 'Sparks9679', triggers: [] },
-  { id: 'zparxmarketing', label: 'ZparxMarketing', triggers: [] },
+  { id: 'sparks9679', label: 'Sparks9679', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'zparxmarketing', label: 'ZparxMarketing', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
 ];
 let accountsCfg = DEFAULT_ACCOUNTS();
 
@@ -649,6 +649,7 @@ function renderCfgAccounts() {
           </div>
           <input class="input cfg-turl" data-ai="${ai}" data-ti="${ti}" value="${esc(t.trigger)}" placeholder="Fire URL or trig_…" />
           <input class="input cfg-ttoken" data-ai="${ai}" data-ti="${ti}" type="password" autocomplete="off" placeholder="${t.token ? '•••• saved — blank to keep' : 'Token (sk-ant-…)'}" />
+          <div class="trig-test"><button class="btn btn--ghost btn--sm" data-act="test-trig" data-ai="${ai}" data-ti="${ti}">▶ Save &amp; test fire</button><span class="trig-status" data-ai="${ai}" data-ti="${ti}"></span></div>
         </div>`).join('')}</div>
       <button class="btn btn--ghost btn--sm" data-act="add-trig" data-ai="${ai}">＋ Add trigger</button>
     </div>`).join('') + `<button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct">＋ Add account</button>`;
@@ -656,12 +657,43 @@ function renderCfgAccounts() {
   host.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
     syncCfgFromDom();
     const ai = +b.dataset.ai, ti = +b.dataset.ti, act = b.dataset.act;
+    if (act === 'test-trig') return testTrigger(ai, ti); // no re-render — keep typed values + show status
     if (act === 'add-acct') cfgModel.push({ id: genId('acc'), label: 'New account', triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '' }] });
     else if (act === 'del-acct') cfgModel.splice(ai, 1);
     else if (act === 'add-trig') cfgModel[ai].triggers.push({ id: genId('t'), label: nextTrigLabel(cfgModel[ai]), trigger: '', token: '' });
     else if (act === 'del-trig') cfgModel[ai].triggers.splice(ti, 1);
     renderCfgAccounts();
   }));
+}
+
+/* Save current settings, then fire a harmless ping at one trigger so the user
+   gets immediate confirmation their Fire URL + token actually reach Claude. */
+async function pingTrigger(account, triggerKey) {
+  const url = settings.triggerUrl.trim() || TRIGGER_FN;
+  const headers = { 'content-type': 'application/json' };
+  const { data: { session: s } } = await sb.auth.getSession();
+  if (s && s.access_token) headers.Authorization = `Bearer ${s.access_token}`;
+  const body = JSON.stringify({ text: 'Connection test from the Routine Planner — no action needed.', account, triggerKey, source: 'planner-test', at: new Date().toISOString() });
+  try {
+    const r = await fetch(url, { method: 'POST', headers, body });
+    if (r.ok) return { ok: true };
+    const m = (await r.text().catch(() => '')).slice(0, 160);
+    return { ok: false, msg: `HTTP ${r.status}. ${m || 'Check the Fire URL + token.'}` };
+  } catch (e) { return { ok: false, msg: e.message }; }
+}
+async function testTrigger(ai, ti) {
+  syncCfgFromDom();
+  const acc = cfgModel[ai], t = acc && acc.triggers[ti];
+  const statusEl = $(`.trig-status[data-ai="${ai}"][data-ti="${ti}"]`);
+  if (!t) return;
+  if (!t.trigger) { statusEl.textContent = 'Add a Fire URL first.'; statusEl.className = 'trig-status is-err'; return; }
+  statusEl.textContent = 'Saving + testing…'; statusEl.className = 'trig-status';
+  const saved = await dbSaveAccountCreds(cfgModel);
+  accountsCfg = normalizeAccounts(cfgModel, false);
+  if (!saved) { statusEl.textContent = 'Couldn’t save settings.'; statusEl.className = 'trig-status is-err'; return; }
+  const res = await pingTrigger(acc.id, t.id);
+  statusEl.textContent = res.ok ? '✓ Reached your Claude routine — it’s live.' : `✕ ${res.msg}`;
+  statusEl.className = 'trig-status ' + (res.ok ? 'is-ok' : 'is-err');
 }
 async function openSettings() {
   editingId = null;
