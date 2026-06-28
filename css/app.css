@@ -486,3 +486,21 @@ a { color: var(--periwinkle); }
 .trig-status { font-family: var(--font-body); font-size: 12px; color: var(--text-mid); }
 .trig-status.is-ok { color: var(--lime); }
 .trig-status.is-err { color: var(--danger); }
+
+/* ── Board (comment board / intake) ────────────── */
+.board { max-width: 760px; margin: 0 auto; }
+.board__compose { background: linear-gradient(180deg, var(--bg-surface), #121829); border: 1px solid var(--hairline); border-radius: var(--r-lg); padding: var(--sp-4); margin-bottom: var(--sp-6); box-shadow: var(--shadow-sm); }
+.board__input { min-height: 92px; }
+.board__compose-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); margin-top: var(--sp-3); flex-wrap: wrap; }
+.board__feed { display: flex; flex-direction: column; gap: var(--sp-3); }
+.note { background: var(--bg-surface); border: 1px solid var(--hairline); border-left: 3px solid var(--lime); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); }
+.note--done, .note--dismissed { opacity: 0.6; border-left-color: var(--grey-700); }
+.note--planned { border-left-color: var(--blue-bright); }
+.note__body { font-family: var(--font-body); font-size: 14px; line-height: 1.5; color: var(--text-hi); white-space: pre-wrap; word-break: break-word; }
+.note__foot { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-3); flex-wrap: wrap; }
+.note__time { font-family: var(--font-mono); font-size: 11px; color: var(--text-low); }
+.note__actions { margin-left: auto; display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.chip--note-open { background: rgba(188,239,47,0.12); color: var(--lime); border-color: rgba(188,239,47,0.35); }
+.chip--note-planned { background: rgba(61,90,241,0.16); color: var(--periwinkle); border-color: rgba(61,90,241,0.4); }
+.chip--note-done { background: rgba(124,135,158,0.14); color: var(--grey-300); border-color: var(--grey-700); }
+.chip--note-dismissed { background: rgba(124,135,158,0.10); color: var(--grey-500); border-color: var(--grey-700); }

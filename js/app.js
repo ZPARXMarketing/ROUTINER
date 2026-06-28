@@ -114,6 +114,7 @@ function saveSettings() { localStorage.setItem(LS, JSON.stringify(settings)); }
 
 let routines = [];
 let runs = [];
+let notes = [];
 let currentView = 'calendar';
 let session = null;
 
@@ -183,6 +184,7 @@ async function loadAll() {
   if (rRes.error) { toast('Load failed: ' + rRes.error.message, 'error'); return; }
   routines = (rRes.data || []).map(fromRow);
   runs = (runRes.data || []).map((x) => ({ id: x.id, routineId: x.routine_id, title: x.title, status: x.status, output: x.output, firedAt: x.fired_at }));
+  await dbLoadNotes();
   render();
 }
 const getRoutine = (id) => routines.find((r) => r.id === id);
@@ -218,6 +220,30 @@ async function dbSaveAccountCreds(accounts) {
     .upsert({ user_id: user.id, accounts, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
   if (error) { toast('Save failed: ' + error.message, 'error'); return false; }
   return true;
+}
+
+/* ---------- Board notes ---------- */
+const NOTE_STATUS = { open: 'Open', planned: 'Planned', done: 'Done', dismissed: 'Dismissed' };
+const noteFromRow = (n) => ({ id: n.id, body: n.body, status: n.status, createdAt: n.created_at, updatedAt: n.updated_at });
+async function dbLoadNotes() {
+  const { data, error } = await sb.from('routiner_notes').select('*').order('created_at', { ascending: false }).limit(300);
+  if (error) { /* table may not exist yet on older deploys */ return; }
+  notes = (data || []).map(noteFromRow);
+}
+async function dbCreateNote(body) {
+  const { data, error } = await sb.from('routiner_notes').insert({ body, status: 'open' }).select().single();
+  if (error) { toast('Post failed: ' + error.message, 'error'); return null; }
+  const n = noteFromRow(data); notes.unshift(n); return n;
+}
+async function dbUpdateNote(id, patch) {
+  const { data, error } = await sb.from('routiner_notes').update(patch).eq('id', id).select().single();
+  if (error) { toast('Update failed: ' + error.message, 'error'); return null; }
+  const n = noteFromRow(data); const i = notes.findIndex((x) => x.id === id); if (i >= 0) notes[i] = n; return n;
+}
+async function dbDeleteNote(id) {
+  const { error } = await sb.from('routiner_notes').delete().eq('id', id);
+  if (error) { toast('Delete failed: ' + error.message, 'error'); return false; }
+  notes = notes.filter((x) => x.id !== id); return true;
 }
 
 async function dbInsertRun(routine, result) {
@@ -271,7 +297,7 @@ async function callClaude(prompt, model) {
 
 /* ---------- Rendering ---------- */
 function counts() {
-  const c = { scheduled: 0, library: 0, archived: 0, history: runs.length };
+  const c = { scheduled: 0, library: 0, archived: 0, history: runs.length, board: notes.filter((n) => n.status === 'open').length };
   routines.forEach((r) => { c[r.status] = (c[r.status] || 0) + 1; });
   return c;
 }
@@ -285,6 +311,7 @@ function paintStatus() {
 function render() {
   if (!session) return;
   paintCounts(); paintStatus();
+  if (currentView === 'board') return renderBoard();
   if (currentView === 'calendar') return renderCalendar();
   if (currentView === 'history') return renderHistory();
   const items = routines.filter((r) => r.status === currentView).sort((a, b) =>
@@ -366,6 +393,60 @@ function bindCards() {
       }
     });
   });
+}
+
+/* ---------- Board (comment board / intake) ---------- */
+function noteRow(n) {
+  const open = n.status === 'open';
+  const actions = open
+    ? `<button class="btn btn--ghost btn--sm" data-nact="done">✓ Done</button><button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>`
+    : `<button class="btn btn--ghost btn--sm" data-nact="reopen">↩ Reopen</button>`;
+  return `<div class="note note--${n.status}" data-id="${n.id}">
+    <div class="note__body">${esc(n.body)}</div>
+    <div class="note__foot">
+      <span class="chip chip--note-${n.status}">${esc(NOTE_STATUS[n.status] || n.status)}</span>
+      <span class="note__time">${relative(n.createdAt)}</span>
+      <span class="note__actions">${actions}<button class="btn btn--danger-ghost btn--sm" data-nact="delete">Delete</button></span>
+    </div>
+  </div>`;
+}
+function renderBoard() {
+  const open = notes.filter((n) => n.status === 'open');
+  const rest = notes.filter((n) => n.status !== 'open');
+  const ordered = [...open, ...rest];
+  view.innerHTML = `<div class="board">
+    <div class="board__compose">
+      <textarea class="textarea board__input" id="note-input" placeholder="Drop tasks, ideas, or context here — one note or a whole brain-dump. A planning routine reads open notes, decides what's simple vs multi-step, and schedules the work on the Calendar."></textarea>
+      <div class="board__compose-foot">
+        <span class="hint">Posted notes are visible to your Claude planning routine.</span>
+        <button class="btn btn--primary" id="note-post">＋ Post to board</button>
+      </div>
+    </div>
+    ${ordered.length
+      ? `<div class="board__feed">${ordered.map(noteRow).join('')}</div>`
+      : `<div class="empty"><h3>The board is empty</h3><p>Post a note above. Anything you drop here becomes input your Claude routine can plan from.</p></div>`}
+  </div>`;
+
+  const input = $('#note-input');
+  const post = async () => {
+    const body = input.value.trim();
+    if (!body) { input.focus(); return; }
+    post.btn.disabled = true;
+    const made = await dbCreateNote(body);
+    post.btn.disabled = false;
+    if (made) { input.value = ''; render(); toast('Posted to the board.'); }
+  };
+  post.btn = $('#note-post');
+  post.btn.addEventListener('click', post);
+  input.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') post(); });
+
+  $$('.note', view).forEach((el) => el.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-nact]'); if (!btn) return;
+    const id = el.dataset.id, act = btn.dataset.nact;
+    if (act === 'delete') { if (await dbDeleteNote(id)) { render(); } return; }
+    const status = act === 'done' ? 'done' : act === 'dismiss' ? 'dismissed' : 'open';
+    if (await dbUpdateNote(id, { status })) render();
+  }));
 }
 
 function renderHistory() {
@@ -806,7 +887,7 @@ async function init() {
   sb.auth.onAuthStateChange((_event, s) => {
     const was = !!session; session = s;
     if (s && !was) { showApp(); toast('Signed in.'); }
-    else if (!s && was) { routines = []; runs = []; showAuth('signin'); }
+    else if (!s && was) { routines = []; runs = []; notes = []; showAuth('signin'); }
     else if (s && was) { /* token refresh — ignore */ }
   });
 }

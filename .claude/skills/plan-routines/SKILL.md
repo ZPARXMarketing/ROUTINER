@@ -68,6 +68,32 @@ H_KEY=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABA
 
 ---
 
+## 1b. Read the board (the intake)
+
+The app has a **Board** where the human drops tasks/ideas/context as notes
+(`routiner_notes`, status `open | planned | done | dismissed`). Open notes are
+your work queue. Read them first:
+
+```bash
+curl -s "$SUPABASE_URL/rest/v1/routiner_notes?select=id,body,status&status=eq.open&order=created_at" "${H_KEY[@]}"
+```
+
+For each open note, decide:
+
+- **Simple / one-shot?** Just do it now (or schedule a single block today).
+- **Multi-step?** Decompose it into a sequence of blocks across the right
+  horizon (an hour → a week) so everything gets done in order.
+
+After you've turned a note into scheduled blocks, mark it so it isn't re-planned:
+
+```bash
+curl -s -X PATCH "$SUPABASE_URL/rest/v1/routiner_notes?id=eq.<note-id>" "${H_KEY[@]}" \
+  -H "Content-Type: application/json" -d '{"status":"planned"}'
+# use "done" instead if you fully handled it on the spot
+```
+
+---
+
 ## 2. Look at the app first (read the whole schedule)
 
 ```bash
