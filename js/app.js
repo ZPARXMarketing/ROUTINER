@@ -99,8 +99,8 @@ const DEFAULT_DURATION_MIN = 45;
 const DURATIONS = [15, 30, 45, 60, 90, 120, 180, 240];
 const fmtDuration = (m) => m < 60 ? `${m} min` : (m % 60 === 0 ? `${m / 60} hr` : `${(m / 60).toFixed(1)} hr`);
 
-/* Week-calendar layout knobs */
-const CAL = { startHour: 7, endHour: 21, hourPx: 52, defaultDurationMin: DEFAULT_DURATION_MIN };
+/* Week-calendar layout knobs — full 24h day (routines can fire overnight) */
+const CAL = { startHour: 0, endHour: 24, hourPx: 44, defaultDurationMin: DEFAULT_DURATION_MIN };
 let calRef = new Date(); // any day inside the week currently shown
 
 /* settings (model / default account / optional trigger override / test key) stay local */
@@ -223,15 +223,18 @@ async function dbSaveAccountCreds(accounts) {
 }
 
 /* ---------- Board notes ---------- */
-const NOTE_STATUS = { open: 'Open', planned: 'Planned', done: 'Done', dismissed: 'Dismissed' };
-const noteFromRow = (n) => ({ id: n.id, body: n.body, status: n.status, createdAt: n.created_at, updatedAt: n.updated_at });
+/* brainstorm = inactive (Claude ignores it) · active = work this · then the
+   downstream planned/done/dismissed. */
+const NOTE_STATUS = { active: 'Active', brainstorm: 'Brainstorm', planned: 'Planned', done: 'Done', dismissed: 'Dismissed' };
+const NOTE_ORDER = { active: 0, brainstorm: 1, planned: 2, done: 3, dismissed: 4 };
+const noteFromRow = (n) => ({ id: n.id, body: n.body, status: n.status === 'open' ? 'active' : n.status, createdAt: n.created_at, updatedAt: n.updated_at });
 async function dbLoadNotes() {
   const { data, error } = await sb.from('routiner_notes').select('*').order('created_at', { ascending: false }).limit(300);
   if (error) { /* table may not exist yet on older deploys */ return; }
   notes = (data || []).map(noteFromRow);
 }
-async function dbCreateNote(body) {
-  const { data, error } = await sb.from('routiner_notes').insert({ body, status: 'open' }).select().single();
+async function dbCreateNote(body, status) {
+  const { data, error } = await sb.from('routiner_notes').insert({ body, status: status || 'brainstorm' }).select().single();
   if (error) { toast('Post failed: ' + error.message, 'error'); return null; }
   const n = noteFromRow(data); notes.unshift(n); return n;
 }
@@ -297,7 +300,7 @@ async function callClaude(prompt, model) {
 
 /* ---------- Rendering ---------- */
 function counts() {
-  const c = { scheduled: 0, library: 0, archived: 0, history: runs.length, board: notes.filter((n) => n.status === 'open').length };
+  const c = { scheduled: 0, library: 0, archived: 0, history: runs.length, board: notes.filter((n) => n.status === 'active').length };
   routines.forEach((r) => { c[r.status] = (c[r.status] || 0) + 1; });
   return c;
 }
@@ -396,56 +399,59 @@ function bindCards() {
 }
 
 /* ---------- Board (comment board / intake) ---------- */
+function noteActions(n) {
+  const del = `<button class="btn btn--danger-ghost btn--sm" data-nact="delete">Delete</button>`;
+  if (n.status === 'brainstorm') return `<button class="btn btn--primary btn--sm" data-nact="activate">▶ Activate</button><button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>${del}`;
+  if (n.status === 'active') return `<button class="btn btn--secondary btn--sm" data-nact="brainstorm">⏸ Brainstorm</button><button class="btn btn--ghost btn--sm" data-nact="done">✓ Done</button>${del}`;
+  return `<button class="btn btn--ghost btn--sm" data-nact="activate">↩ Reactivate</button><button class="btn btn--ghost btn--sm" data-nact="brainstorm">To brainstorm</button>${del}`;
+}
 function noteRow(n) {
-  const open = n.status === 'open';
-  const actions = open
-    ? `<button class="btn btn--ghost btn--sm" data-nact="done">✓ Done</button><button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>`
-    : `<button class="btn btn--ghost btn--sm" data-nact="reopen">↩ Reopen</button>`;
   return `<div class="note note--${n.status}" data-id="${n.id}">
     <div class="note__body">${esc(n.body)}</div>
     <div class="note__foot">
       <span class="chip chip--note-${n.status}">${esc(NOTE_STATUS[n.status] || n.status)}</span>
       <span class="note__time">${relative(n.createdAt)}</span>
-      <span class="note__actions">${actions}<button class="btn btn--danger-ghost btn--sm" data-nact="delete">Delete</button></span>
+      <span class="note__actions">${noteActions(n)}</span>
     </div>
   </div>`;
 }
 function renderBoard() {
-  const open = notes.filter((n) => n.status === 'open');
-  const rest = notes.filter((n) => n.status !== 'open');
-  const ordered = [...open, ...rest];
+  const ordered = [...notes].sort((a, b) => (NOTE_ORDER[a.status] ?? 9) - (NOTE_ORDER[b.status] ?? 9) || new Date(b.createdAt) - new Date(a.createdAt));
   view.innerHTML = `<div class="board">
     <div class="board__compose">
-      <textarea class="textarea board__input" id="note-input" placeholder="Drop tasks, ideas, or context here — one note or a whole brain-dump. A planning routine reads open notes, decides what's simple vs multi-step, and schedules the work on the Calendar."></textarea>
+      <textarea class="textarea board__input" id="note-input" placeholder="Drop tasks, ideas, or context here — one note or a whole brain-dump.&#10;&#10;Post as Brainstorm to park an idea (Claude leaves it alone), or Active to signal Claude should plan and work it."></textarea>
       <div class="board__compose-foot">
-        <span class="hint">Posted notes are visible to your Claude planning routine.</span>
-        <button class="btn btn--primary" id="note-post">＋ Post to board</button>
+        <span class="hint"><b>Active</b> = Claude works it · <b>Brainstorm</b> = parked, ignored until you activate it.</span>
+        <span class="board__compose-btns">
+          <button class="btn btn--secondary" id="note-draft">Save as brainstorm</button>
+          <button class="btn btn--primary" id="note-active">▶ Post as active</button>
+        </span>
       </div>
     </div>
     ${ordered.length
       ? `<div class="board__feed">${ordered.map(noteRow).join('')}</div>`
-      : `<div class="empty"><h3>The board is empty</h3><p>Post a note above. Anything you drop here becomes input your Claude routine can plan from.</p></div>`}
+      : `<div class="empty"><h3>The board is empty</h3><p>Drop a note above. Park it as <b>Brainstorm</b> while you think, or post it <b>Active</b> when it's ready for Claude.</p></div>`}
   </div>`;
 
   const input = $('#note-input');
-  const post = async () => {
+  const postAs = async (status, btn) => {
     const body = input.value.trim();
     if (!body) { input.focus(); return; }
-    post.btn.disabled = true;
-    const made = await dbCreateNote(body);
-    post.btn.disabled = false;
-    if (made) { input.value = ''; render(); toast('Posted to the board.'); }
+    btn.disabled = true;
+    const made = await dbCreateNote(body, status);
+    btn.disabled = false;
+    if (made) { input.value = ''; render(); toast(status === 'active' ? 'Posted — active for Claude.' : 'Saved to brainstorm.'); }
   };
-  post.btn = $('#note-post');
-  post.btn.addEventListener('click', post);
-  input.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') post(); });
+  $('#note-active').addEventListener('click', (e) => postAs('active', e.currentTarget));
+  $('#note-draft').addEventListener('click', (e) => postAs('brainstorm', e.currentTarget));
+  input.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') postAs('active', $('#note-active')); });
 
   $$('.note', view).forEach((el) => el.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-nact]'); if (!btn) return;
     const id = el.dataset.id, act = btn.dataset.nact;
-    if (act === 'delete') { if (await dbDeleteNote(id)) { render(); } return; }
-    const status = act === 'done' ? 'done' : act === 'dismiss' ? 'dismissed' : 'open';
-    if (await dbUpdateNote(id, { status })) render();
+    if (act === 'delete') { if (await dbDeleteNote(id)) render(); return; }
+    const status = { activate: 'active', brainstorm: 'brainstorm', done: 'done', dismiss: 'dismissed' }[act];
+    if (status && await dbUpdateNote(id, { status })) render();
   }));
 }
 
@@ -567,8 +573,8 @@ function renderCalendar() {
   }).join('');
 
   const gutter = `<div class="cal__gutter" style="height:${colH}px">${Array.from({ length: CAL.endHour - CAL.startHour + 1 }, (_, i) => {
-    const h = CAL.startHour + i, ampm = h < 12 ? 'AM' : 'PM', h12 = ((h + 11) % 12) + 1;
-    return `<div class="cal__hr" style="top:${i * CAL.hourPx}px">${h12}${i === 0 || h === 12 ? ' ' + ampm : ''}</div>`;
+    const h = (CAL.startHour + i) % 24, ampm = h < 12 ? 'AM' : 'PM', h12 = ((h + 11) % 12) + 1;
+    return `<div class="cal__hr" style="top:${i * CAL.hourPx}px">${h12}${h % 12 === 0 ? ' ' + ampm : ''}</div>`;
   }).join('')}</div>`;
 
   const dayCols = days.map((d, i) => {
@@ -599,6 +605,9 @@ function renderCalendar() {
   view.querySelectorAll('.cal__ev').forEach((el) => el.addEventListener('click', () => {
     const r = getRoutine(el.dataset.id); if (r) openDrawer(r);
   }));
+  // Open scrolled to ~an hour before now so the day's in view (but night is a scroll up).
+  const scrollEl = $('.cal__scroll', view);
+  if (scrollEl) scrollEl.scrollTop = Math.max(0, (new Date().getHours() - 1 - CAL.startHour) * CAL.hourPx);
 }
 
 function nowLineHtml() {
@@ -687,11 +696,12 @@ async function submitDrawer(action) {
     let scheduledAt = when.toISOString();
     if (when.getTime() <= Date.now()) scheduledAt = nextOccurrence(scheduledAt, d.recurrence);
     await persist(Object.assign(base, { status: 'scheduled', scheduledAt }));
-    closeDrawer(); currentView = 'scheduled'; syncTabs(); render(); toast(`Scheduled — fires ${relative(scheduledAt)}.`); return;
+    // Land on the calendar, on the week the routine was scheduled into, so it's visibly there.
+    closeDrawer(); calRef = new Date(scheduledAt); currentView = 'calendar'; syncTabs(); render(); toast(`Scheduled — fires ${relative(scheduledAt)}. Added to the calendar.`); return;
   }
   if (action === 'now') {
     const r = await persist(Object.assign(base, { status: 'scheduled', scheduledAt: new Date().toISOString() }));
-    closeDrawer(); currentView = 'scheduled'; syncTabs(); render();
+    closeDrawer(); calRef = new Date(); currentView = 'calendar'; syncTabs(); render();
     if (r) await fireTrigger(r);
   }
 }

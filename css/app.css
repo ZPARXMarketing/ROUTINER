@@ -440,7 +440,7 @@ a { color: var(--periwinkle); }
 .cal__body { display: grid; grid-template-columns: 56px repeat(7, 1fr); position: relative; padding-top: 8px; }
 .cal__gutter { position: relative; }
 .cal__hr { position: absolute; right: 7px; font-family: var(--font-mono); font-size: 9px; color: var(--text-low); transform: translateY(-50%); white-space: nowrap; }
-.cal__day { position: relative; border-left: 1px solid #1f2740; background: repeating-linear-gradient(to bottom, rgba(42,52,84,0.30) 0 1px, transparent 1px 52px); }
+.cal__day { position: relative; border-left: 1px solid #1f2740; background: repeating-linear-gradient(to bottom, rgba(42,52,84,0.30) 0 1px, transparent 1px 44px); }
 
 .cal__ev { position: absolute; border-radius: 8px; padding: 4px 7px; overflow: hidden; cursor: pointer; box-sizing: border-box; border-left: 3px solid; transition: filter .12s ease, box-shadow .12s ease; }
 .cal__ev:hover { filter: brightness(1.07); z-index: 5; box-shadow: var(--shadow-md); }
@@ -493,14 +493,18 @@ a { color: var(--periwinkle); }
 .board__input { min-height: 92px; }
 .board__compose-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); margin-top: var(--sp-3); flex-wrap: wrap; }
 .board__feed { display: flex; flex-direction: column; gap: var(--sp-3); }
+.board__compose-btns { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
 .note { background: var(--bg-surface); border: 1px solid var(--hairline); border-left: 3px solid var(--lime); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); }
-.note--done, .note--dismissed { opacity: 0.6; border-left-color: var(--grey-700); }
+.note--active { border-left-color: var(--lime); box-shadow: inset 2px 0 0 rgba(188,239,47,0.25); }
+.note--brainstorm { border-left-style: dashed; border-left-color: var(--grey-500); opacity: 0.92; }
+.note--done, .note--dismissed { opacity: 0.55; border-left-color: var(--grey-700); }
 .note--planned { border-left-color: var(--blue-bright); }
 .note__body { font-family: var(--font-body); font-size: 14px; line-height: 1.5; color: var(--text-hi); white-space: pre-wrap; word-break: break-word; }
 .note__foot { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-3); flex-wrap: wrap; }
 .note__time { font-family: var(--font-mono); font-size: 11px; color: var(--text-low); }
 .note__actions { margin-left: auto; display: flex; gap: var(--sp-2); flex-wrap: wrap; }
-.chip--note-open { background: rgba(188,239,47,0.12); color: var(--lime); border-color: rgba(188,239,47,0.35); }
+.chip--note-active { background: rgba(188,239,47,0.14); color: var(--lime); border-color: rgba(188,239,47,0.4); }
+.chip--note-brainstorm { background: rgba(124,135,158,0.12); color: var(--grey-300); border-color: var(--grey-700); }
 .chip--note-planned { background: rgba(61,90,241,0.16); color: var(--periwinkle); border-color: rgba(61,90,241,0.4); }
 .chip--note-done { background: rgba(124,135,158,0.14); color: var(--grey-300); border-color: var(--grey-700); }
 .chip--note-dismissed { background: rgba(124,135,158,0.10); color: var(--grey-500); border-color: var(--grey-700); }

@@ -55,7 +55,7 @@ create table if not exists public.routiner_notes (
   id         uuid primary key default gen_random_uuid(),
   user_id    uuid not null default auth.uid() references auth.users(id) on delete cascade,
   body       text not null default '',
-  status     text not null default 'open',   -- open | planned | done | dismissed
+  status     text not null default 'brainstorm', -- active | brainstorm | planned | done | dismissed
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
