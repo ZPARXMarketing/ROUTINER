@@ -24,12 +24,21 @@ const MODELS = [
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (Mon–Fri)', weekly: 'Every week' };
 
-/* settings (model / optional trigger override / test key) stay local */
+/* Claude accounts the routine can fire against. The `id` maps to the per-account
+   CLAUDE_TRIGGER_<ID> / CLAUDE_TOKEN_<ID> env vars in the Netlify function. */
+const ACCOUNTS = [
+  { id: 'sparks9679', label: 'Sparks9679' },
+  { id: 'zparxmarketing', label: 'ZparxMarketing' },
+];
+const DEFAULT_ACCOUNT = 'sparks9679';
+const accountLabel = (id) => (ACCOUNTS.find((a) => a.id === id) || {}).label || id || DEFAULT_ACCOUNT;
+
+/* settings (model / default account / optional trigger override / test key) stay local */
 const LS = 'routiner.settings.v1';
 let settings = loadSettings();
 function loadSettings() {
-  try { return Object.assign({ model: DEFAULT_MODEL, triggerUrl: '', apiKey: '' }, JSON.parse(localStorage.getItem(LS) || '{}')); }
-  catch { return { model: DEFAULT_MODEL, triggerUrl: '', apiKey: '' }; }
+  try { return Object.assign({ model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', apiKey: '' }, JSON.parse(localStorage.getItem(LS) || '{}')); }
+  catch { return { model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', apiKey: '' }; }
 }
 function saveSettings() { localStorage.setItem(LS, JSON.stringify(settings)); }
 
@@ -79,12 +88,13 @@ function toast(msg, kind = '') {
 
 /* ---------- Row <-> object mapping ---------- */
 const fromRow = (r) => ({
-  id: r.id, title: r.title, prompt: r.prompt, model: r.model, recurrence: r.recurrence,
-  status: r.status, scheduledAt: r.scheduled_at, lastRun: r.last_run,
+  id: r.id, title: r.title, prompt: r.prompt, model: r.model, account: r.account || DEFAULT_ACCOUNT,
+  recurrence: r.recurrence, status: r.status, scheduledAt: r.scheduled_at, lastRun: r.last_run,
   createdAt: r.created_at, updatedAt: r.updated_at,
 });
 const toRow = (o) => ({
   title: o.title ?? '', prompt: o.prompt ?? '', model: o.model || DEFAULT_MODEL,
+  account: o.account || DEFAULT_ACCOUNT,
   recurrence: o.recurrence || 'none', status: o.status || 'library',
   scheduled_at: o.scheduledAt || null, last_run: o.lastRun || null,
 });
@@ -128,7 +138,7 @@ async function dbInsertRun(routine, result) {
 async function fireTrigger(routine) {
   const direct = settings.triggerUrl.trim();
   const url = direct || TRIGGER_FN;
-  const payload = JSON.stringify({ text: routine?.prompt || '', source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
+  const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
   // Send the signed-in user's access token so the gated function authorizes us.
   const headers = { 'content-type': 'application/json' };
   const { data: { session: s } } = await sb.auth.getSession();
@@ -217,7 +227,7 @@ function card(r) {
   return `<article class="card" data-id="${r.id}">
     <div class="card__head"><span class="card__title">${esc(r.title) || '<em>Untitled routine</em>'}</span>${statusChip(r)}</div>
     <div class="card__prompt">${esc(r.prompt) || '(no prompt)'}</div>
-    <div class="card__meta">${recur}<span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span>${when}</div>
+    <div class="card__meta">${recur}<span class="card__meta-item">👤 <b>${esc(accountLabel(r.account))}</b></span><span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span>${when}</div>
     <div class="card__foot">${cardActions(r)}</div>
   </article>`;
 }
@@ -283,7 +293,7 @@ let editingId = null;
 function openDrawer(routine = null, opts = {}) {
   editingId = routine ? routine.id : null;
   drawerTitle.textContent = routine ? 'Edit routine' : 'New routine';
-  const r = routine || { title: '', prompt: '', model: settings.model, recurrence: 'none', scheduledAt: null };
+  const r = routine || { title: '', prompt: '', model: settings.model, account: settings.account || DEFAULT_ACCOUNT, recurrence: 'none', scheduledAt: null };
   const whenVal = r.scheduledAt ? toLocalInput(new Date(r.scheduledAt)) : defaultWhen();
   drawerBody.innerHTML = `
     <div class="field"><label class="label" for="f-title">Title</label>
@@ -291,6 +301,9 @@ function openDrawer(routine = null, opts = {}) {
     <div class="field"><label class="label" for="f-prompt">Directions for Claude</label>
       <textarea class="textarea" id="f-prompt" placeholder="Describe the task. It runs in your Claude Code routine session with full tools.">${esc(r.prompt)}</textarea>
       <span class="hint">Sent to your routine as a session turn. Use {{date}} / {{datetime}} for the run time.</span></div>
+    <div class="field"><label class="label" for="f-account">Claude account</label>
+      <select class="select" id="f-account">${ACCOUNTS.map((a) => `<option value="${a.id}" ${(r.account || settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select>
+      <span class="hint">Which connected Claude account this routine fires against.</span></div>
     <div class="field"><label class="label" for="f-model">Model hint</label>
       <select class="select" id="f-model">${MODELS.map((m) => `<option value="${m.id}" ${(r.model || settings.model) === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
     <div class="field__row">
@@ -321,14 +334,14 @@ async function testLive() {
   await dbInsertRun({ id: editingId, title: $('#f-title').value || 'Live test' }, res);
 }
 function readDrawer() {
-  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
+  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, account: $('#f-account').value, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
 }
 async function persist(base) { return editingId ? dbUpdate(editingId, Object.assign(getRoutine(editingId) || {}, base)) : dbCreate(base); }
 
 async function submitDrawer(action) {
   const d = readDrawer();
   if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
-  const base = { title: d.title, prompt: d.prompt, model: d.model, recurrence: d.recurrence };
+  const base = { title: d.title, prompt: d.prompt, model: d.model, account: d.account, recurrence: d.recurrence };
 
   if (action === 'library') {
     await persist(Object.assign(base, { status: 'library', scheduledAt: null }));
@@ -357,6 +370,9 @@ function openSettings() {
   drawerTitle.textContent = 'Settings';
   drawerBody.innerHTML = `
     <div class="notice">Your routines are saved to your account and sync across devices. <b>Run now</b> fires your Claude routine via the Netlify <code>CLAUDE_TRIGGER</code> function.</div>
+    <div class="field"><label class="label" for="s-account">Default Claude account</label>
+      <select class="select" id="s-account">${ACCOUNTS.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select>
+      <span class="hint">Pre-selected for new routines. Each routine can still pick its own account.</span></div>
     <div class="field"><label class="label" for="s-model">Default model</label>
       <select class="select" id="s-model">${MODELS.map((m) => `<option value="${m.id}" ${settings.model === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
     <div class="field"><label class="label" for="s-trigger">Trigger URL override (optional)</label>
@@ -367,7 +383,7 @@ function openSettings() {
       <span class="hint">Stored only in this browser; used only by the in-drawer Test button.</span></div>`;
   drawerFoot.innerHTML = `<button class="btn btn--primary" id="s-save">Save settings</button>`;
   $('#s-save').addEventListener('click', () => {
-    settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim(); settings.apiKey = $('#s-key').value.trim();
+    settings.account = $('#s-account').value; settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim(); settings.apiKey = $('#s-key').value.trim();
     saveSettings(); closeDrawer(); render(); toast('Settings saved.');
   });
   overlay.classList.add('is-open');
