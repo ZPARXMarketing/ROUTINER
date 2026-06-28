@@ -12,6 +12,15 @@
  *                           (ANTHROPIC_API_KEY / CLAUDE_TRIGGER_TOKEN are aliases.)
  *   CLAUDE_ROUTINE_BETA   – optional override for the anthropic-beta header.
  *
+ *   --- multi-account routing ---
+ *   The browser sends an "account" id (e.g. "sparks9679", "zparxmarketing") in the
+ *   POST body. For account <ID> this function looks for CLAUDE_TRIGGER_<ID> /
+ *   CLAUDE_TOKEN_<ID> (id upper-cased, non-alphanumerics stripped), e.g.
+ *     CLAUDE_TRIGGER_SPARKS9679       / CLAUDE_TOKEN_SPARKS9679
+ *     CLAUDE_TRIGGER_ZPARXMARKETING   / CLAUDE_TOKEN_ZPARXMARKETING
+ *   If a per-account var is missing it falls back to the legacy CLAUDE_TRIGGER /
+ *   CLAUDE_TOKEN above, so the original single-account setup keeps working.
+ *
  *   --- gating (optional; when set, callers must be authorized) ---
  *   ROUTINER_FIRE_SECRET  – shared secret the scheduler presents. SETTING THIS
  *                           TURNS GATING ON: browser callers must then send a
@@ -42,6 +51,18 @@ function resolveFireUrl(trigger) {
   // into CLAUDE_TRIGGER). Reject it instead of trying to fetch() a non-URL —
   // that throws an error whose text would leak the value back to the caller.
   return null;
+}
+
+// Resolve the trigger + token for a given account id, falling back to the
+// legacy single-account vars when no per-account override is configured.
+function resolveAccountCreds(account) {
+  const suffix = String(account || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const env = process.env;
+  const legacyTrigger = env.CLAUDE_TRIGGER || env.CLAUDE_TRIGGER_URL;
+  const legacyToken = env.CLAUDE_TOKEN || env.CLAUDE_TRIGGER_TOKEN || env.ANTHROPIC_API_KEY;
+  const trigger = (suffix && env[`CLAUDE_TRIGGER_${suffix}`]) || legacyTrigger;
+  const token = (suffix && env[`CLAUDE_TOKEN_${suffix}`]) || legacyToken;
+  return { trigger, token };
 }
 
 function bearer(req) {
@@ -86,14 +107,16 @@ export default async (req) => {
   const denied = await authorize(req);
   if (denied) return denied;
 
-  const url = resolveFireUrl(process.env.CLAUDE_TRIGGER || process.env.CLAUDE_TRIGGER_URL);
-  const token = process.env.CLAUDE_TOKEN || process.env.CLAUDE_TRIGGER_TOKEN || process.env.ANTHROPIC_API_KEY;
-  if (!url) return Response.json({ ok: false, error: 'CLAUDE_TRIGGER is missing or malformed — it must be a routine id (trig_…) or a full /fire URL, not the Anthropic token.' }, { status: 500, headers: cors });
-  if (!token) return Response.json({ ok: false, error: 'No token — set CLAUDE_TOKEN (or ANTHROPIC_API_KEY) in Netlify env.' }, { status: 500, headers: cors });
-
   let incoming = {};
   try { incoming = JSON.parse((await req.text()) || '{}'); } catch { /* ignore */ }
   const text = incoming.text ?? incoming.prompt ?? '';
+  const account = incoming.account ?? '';
+
+  const creds = resolveAccountCreds(account);
+  const url = resolveFireUrl(creds.trigger);
+  const token = creds.token;
+  if (!url) return Response.json({ ok: false, error: `No trigger configured for account "${account || 'default'}" — set CLAUDE_TRIGGER_<ACCOUNT> (or the legacy CLAUDE_TRIGGER) in Netlify env. It must be a routine id (trig_…) or a full /fire URL.` }, { status: 500, headers: cors });
+  if (!token) return Response.json({ ok: false, error: `No token for account "${account || 'default'}" — set CLAUDE_TOKEN_<ACCOUNT> (or the legacy CLAUDE_TOKEN / ANTHROPIC_API_KEY) in Netlify env.` }, { status: 500, headers: cors });
 
   try {
     const resp = await fetch(url, {
