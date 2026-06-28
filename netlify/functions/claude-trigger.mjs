@@ -154,6 +154,9 @@ export default async (req) => {
   const text = incoming.text ?? incoming.prompt ?? '';
   const account = incoming.account ?? '';
   const triggerKey = incoming.triggerKey ?? null;
+  // Resolved model the caller (app/scheduler) picked for this run. Forwarded to
+  // the routine's /fire so the session can honor it; harmless if unsupported.
+  const model = incoming.model ?? null;
 
   // Prefer the signed-in user's in-app settings; fall back to env vars per field.
   const accessToken = bearer(req);
@@ -175,7 +178,7 @@ export default async (req) => {
         'anthropic-beta': BETA,
         'content-type': 'application/json',
       },
-      body: JSON.stringify(text ? { text } : {}),
+      body: JSON.stringify({ ...(text ? { text } : {}), ...(model ? { model } : {}) }),
     });
     const body = await resp.text();
     return new Response(body || JSON.stringify({ ok: resp.ok, status: resp.status }), {

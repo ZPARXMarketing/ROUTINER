@@ -9,19 +9,16 @@
    ============================================================ */
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import {
+  MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
+  effectiveModel, displayModel, getModelForTask, modelLabel, runViaOpenRouter,
+} from './model-router.js';
 
 const SUPABASE_URL = 'https://vonfdzttupyemtomsojy.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT';
 const TRIGGER_FN = '/.netlify/functions/claude-trigger';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-const MODELS = [
-  { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 — most capable' },
-  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 — balanced' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 — fast & cheap' },
-];
-const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (Mon–Fri)', weekly: 'Every week' };
 
 /* ---------- Accounts & triggers (user-managed) ----------
@@ -103,12 +100,18 @@ const fmtDuration = (m) => m < 60 ? `${m} min` : (m % 60 === 0 ? `${m / 60} hr` 
 const CAL = { startHour: 0, endHour: 24, hourPx: 44, defaultDurationMin: DEFAULT_DURATION_MIN };
 let calRef = new Date(); // any day inside the week currently shown
 
-/* settings (model / default account / optional trigger override / test key) stay local */
+/* settings (default model / default account / optional trigger override /
+   OpenRouter key for live tests) stay local */
 const LS = 'routiner.settings.v1';
 let settings = loadSettings();
 function loadSettings() {
-  try { return Object.assign({ model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', apiKey: '' }, JSON.parse(localStorage.getItem(LS) || '{}')); }
-  catch { return { model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', apiKey: '' }; }
+  const defaults = { model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', openrouterKey: '' };
+  try {
+    const s = Object.assign({}, defaults, JSON.parse(localStorage.getItem(LS) || '{}'));
+    if (!s.openrouterKey && s.apiKey) s.openrouterKey = s.apiKey; // migrate legacy field
+    delete s.apiKey;
+    return s;
+  } catch { return { ...defaults }; }
 }
 function saveSettings() { localStorage.setItem(LS, JSON.stringify(settings)); }
 
@@ -159,7 +162,8 @@ function toast(msg, kind = '') {
 
 /* ---------- Row <-> object mapping ---------- */
 const fromRow = (r) => ({
-  id: r.id, title: r.title, prompt: r.prompt, model: r.model, account: r.account || DEFAULT_ACCOUNT,
+  id: r.id, title: r.title, prompt: r.prompt, model: r.model || DEFAULT_MODEL, account: r.account || DEFAULT_ACCOUNT,
+  taskType: r.task_type || DEFAULT_TASK_TYPE, complexity: r.complexity || DEFAULT_COMPLEXITY,
   triggerKey: r.trigger_key || null,
   recurrence: r.recurrence, status: r.status, scheduledAt: r.scheduled_at, lastRun: r.last_run,
   durationMin: r.duration_min || DEFAULT_DURATION_MIN,
@@ -167,6 +171,7 @@ const fromRow = (r) => ({
 });
 const toRow = (o) => ({
   title: o.title ?? '', prompt: o.prompt ?? '', model: o.model || DEFAULT_MODEL,
+  task_type: o.taskType || DEFAULT_TASK_TYPE, complexity: o.complexity || DEFAULT_COMPLEXITY,
   account: o.account || DEFAULT_ACCOUNT, trigger_key: o.triggerKey || null,
   recurrence: o.recurrence || 'none', status: o.status || 'library',
   duration_min: o.durationMin || DEFAULT_DURATION_MIN,
@@ -260,7 +265,7 @@ async function dbInsertRun(routine, result) {
 async function fireTrigger(routine) {
   const direct = settings.triggerUrl.trim();
   const url = direct || TRIGGER_FN;
-  const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, triggerKey: routine?.triggerKey || null, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
+  const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, triggerKey: routine?.triggerKey || null, model: routine ? effectiveModel(routine) : undefined, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
   // Send the signed-in user's access token so the gated function authorizes us.
   const headers = { 'content-type': 'application/json' };
   const { data: { session: s } } = await sb.auth.getSession();
@@ -282,20 +287,11 @@ async function fireTrigger(routine) {
   }
 }
 
-/* ---------- Optional live test ---------- */
+/* ---------- Optional live test (runs the prompt on the chosen model via OpenRouter) ---------- */
 async function callClaude(prompt, model) {
-  const key = settings.apiKey.trim();
-  if (!key) return { status: 'dryrun', text: 'No API key set — add one in Settings to preview prompts live. (Optional; not needed for real runs.)' };
-  try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-      body: JSON.stringify({ model: model || settings.model, max_tokens: 2048, messages: [{ role: 'user', content: prompt }] }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) return { status: 'error', text: data?.error?.message || `HTTP ${resp.status}` };
-    return { status: 'success', text: (data.content || []).map((b) => b.text || '').join('\n').trim() || '(empty)' };
-  } catch (e) { return { status: 'error', text: 'Request failed: ' + e.message }; }
+  return runViaOpenRouter(prompt, model, (settings.openrouterKey || '').trim(), {
+    referer: location.origin, title: 'Routiner',
+  });
 }
 
 /* ---------- Rendering ---------- */
@@ -347,7 +343,7 @@ function card(r) {
   const when = r.status === 'scheduled'
     ? `<span class="card__meta-item">⏰ <b>${fmt(r.scheduledAt)}</b> · ${relative(r.scheduledAt)}</span>`
     : (r.lastRun ? `<span class="card__meta-item">last run <b>${fmt(r.lastRun)}</b></span>` : '');
-  const modelName = ((MODELS.find((m) => m.id === (r.model || settings.model)) || {}).label || '').split(' — ')[0] || r.model;
+  const modelName = displayModel(r);
   const tLabel = triggerLabel(r.account, r.triggerKey);
   const acctText = accountLabel(r.account) + (tLabel ? ` · ${tLabel}` : '');
   return `<article class="card" data-id="${r.id}">
@@ -383,7 +379,7 @@ function bindCards() {
         render(); await fireTrigger(r); return;
       }
       if (act === 'duplicate') {
-        const made = await dbCreate({ title: (r.title || 'Untitled') + ' (copy)', prompt: r.prompt, model: r.model, recurrence: r.recurrence, status: 'library', scheduledAt: null });
+        const made = await dbCreate({ title: (r.title || 'Untitled') + ' (copy)', prompt: r.prompt, model: r.model, taskType: r.taskType, complexity: r.complexity, recurrence: r.recurrence, status: 'library', scheduledAt: null });
         if (made) { render(); toast('Duplicated to Library.'); } return;
       }
       if (act === 'library' || act === 'archive') {
@@ -627,7 +623,7 @@ function triggerOptions(accId, selectedKey) {
 function openDrawer(routine = null, opts = {}) {
   editingId = routine ? routine.id : null;
   drawerTitle.textContent = routine ? 'Edit routine' : 'New routine';
-  const r = routine || { title: '', prompt: '', model: settings.model, account: settings.account || DEFAULT_ACCOUNT, triggerKey: null, recurrence: 'none', scheduledAt: null };
+  const r = routine || { title: '', prompt: '', model: settings.model, taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY, account: settings.account || DEFAULT_ACCOUNT, triggerKey: null, recurrence: 'none', scheduledAt: null };
   const whenVal = r.scheduledAt ? toLocalInput(new Date(r.scheduledAt)) : defaultWhen();
   const curAccount = getAccountCfg(r.account) ? r.account : (listAccounts()[0] || {}).id;
   drawerBody.innerHTML = `
@@ -643,8 +639,15 @@ function openDrawer(routine = null, opts = {}) {
         <select class="select" id="f-trigger">${triggerOptions(curAccount, r.triggerKey)}</select>
         <span class="hint">Which instance fires it. Manage these in ⚙ Settings.</span></div>
     </div>
-    <div class="field"><label class="label" for="f-model">Model hint</label>
+    <div class="field"><label class="label" for="f-model">Model</label>
       <select class="select" id="f-model">${MODELS.map((m) => `<option value="${m.id}" ${(r.model || settings.model) === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
+    <div class="field__row" id="f-auto-row">
+      <div class="field"><label class="label" for="f-tasktype">Task type</label>
+        <select class="select" id="f-tasktype">${TASK_TYPES.map((t) => `<option value="${t.id}" ${(r.taskType || DEFAULT_TASK_TYPE) === t.id ? 'selected' : ''}>${t.label}</option>`).join('')}</select></div>
+      <div class="field"><label class="label" for="f-complexity">Complexity</label>
+        <select class="select" id="f-complexity">${COMPLEXITIES.map((c) => `<option value="${c.id}" ${(r.complexity || DEFAULT_COMPLEXITY) === c.id ? 'selected' : ''}>${c.label}</option>`).join('')}</select></div>
+    </div>
+    <span class="hint" id="f-model-hint"></span>
     <div class="field__row">
       <div class="field"><label class="label" for="f-when">Fire at</label>
         <input class="input" type="datetime-local" id="f-when" value="${whenVal}" /></div>
@@ -653,7 +656,7 @@ function openDrawer(routine = null, opts = {}) {
       <div class="field"><label class="label" for="f-recur">Repeat</label>
         <select class="select" id="f-recur">${Object.entries(RECURRENCE).map(([k, v]) => `<option value="${k}" ${r.recurrence === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
     </div>
-    <div class="field"><button class="btn btn--ghost btn--sm" id="f-test" type="button">⚡ Test live (optional, uses API)</button>
+    <div class="field"><button class="btn btn--ghost btn--sm" id="f-test" type="button">⚡ Test live (optional, uses OpenRouter)</button>
       <div class="run__body" id="f-test-out" style="display:none"></div></div>
     <div class="notice"><b>Run now</b> fires your routine immediately with this prompt. <b>Schedule</b> queues it for the time above (repeating if set). <b>Save to library</b> parks it.</div>`;
   drawerFoot.innerHTML = `
@@ -662,28 +665,49 @@ function openDrawer(routine = null, opts = {}) {
     <button class="btn btn--secondary" data-do="library">▣ Save to library</button>`;
   $('#f-test', drawerBody).addEventListener('click', testLive);
   $('#f-account', drawerBody).addEventListener('change', (e) => { $('#f-trigger', drawerBody).innerHTML = triggerOptions(e.target.value, null); });
+  ['#f-model', '#f-tasktype', '#f-complexity'].forEach((s) => $(s, drawerBody).addEventListener('change', refreshModelHint));
+  refreshModelHint();
   drawerFoot.querySelectorAll('[data-do]').forEach((b) => b.addEventListener('click', () => submitDrawer(b.dataset.do)));
   setTimeout(() => $(opts.forceSchedule ? '#f-when' : '#f-title', drawerBody)?.focus(), 50);
   overlay.classList.add('is-open');
 }
+/* Reflect the model choice: when Auto, show the task-type/complexity inputs and
+   the model they resolve to; otherwise hide them and name the pinned model. */
+function refreshModelHint() {
+  const model = $('#f-model', drawerBody)?.value;
+  const isAuto = model === 'auto';
+  const row = $('#f-auto-row', drawerBody);
+  const hint = $('#f-model-hint', drawerBody);
+  if (row) row.style.display = isAuto ? '' : 'none';
+  if (!hint) return;
+  if (isAuto) {
+    const resolved = getModelForTask($('#f-tasktype', drawerBody).value, $('#f-complexity', drawerBody).value);
+    hint.innerHTML = `✨ Routiner will use <b>${esc(modelLabel(resolved))}</b> <code>${esc(resolved)}</code> for this task.`;
+  } else {
+    hint.innerHTML = `Pinned to <b>${esc(modelLabel(model))}</b> <code>${esc(model)}</code>.`;
+  }
+}
+
 async function testLive() {
   const prompt = $('#f-prompt').value;
   if (!prompt.trim()) return toast('Add directions first.', 'error');
+  const d = readDrawer();
+  const model = effectiveModel(d);
   const out = $('#f-test-out'), btn = $('#f-test');
-  btn.disabled = true; btn.textContent = '⚡ Testing…'; out.style.display = 'block'; out.textContent = 'Calling the Messages API…';
-  const res = await callClaude(prompt, $('#f-model').value);
-  out.textContent = res.text; btn.disabled = false; btn.textContent = '⚡ Test live (optional, uses API)';
+  btn.disabled = true; btn.textContent = '⚡ Testing…'; out.style.display = 'block'; out.textContent = `Running on ${modelLabel(model)} via OpenRouter…`;
+  const res = await callClaude(prompt, model);
+  out.textContent = res.text; btn.disabled = false; btn.textContent = '⚡ Test live (optional, uses OpenRouter)';
   await dbInsertRun({ id: editingId, title: $('#f-title').value || 'Live test' }, res);
 }
 function readDrawer() {
-  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, account: $('#f-account').value, triggerKey: $('#f-trigger').value || null, durationMin: parseInt($('#f-dur').value, 10) || DEFAULT_DURATION_MIN, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
+  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, taskType: $('#f-tasktype').value, complexity: $('#f-complexity').value, account: $('#f-account').value, triggerKey: $('#f-trigger').value || null, durationMin: parseInt($('#f-dur').value, 10) || DEFAULT_DURATION_MIN, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
 }
 async function persist(base) { return editingId ? dbUpdate(editingId, Object.assign(getRoutine(editingId) || {}, base)) : dbCreate(base); }
 
 async function submitDrawer(action) {
   const d = readDrawer();
   if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
-  const base = { title: d.title, prompt: d.prompt, model: d.model, account: d.account, triggerKey: d.triggerKey, durationMin: d.durationMin, recurrence: d.recurrence };
+  const base = { title: d.title, prompt: d.prompt, model: d.model, taskType: d.taskType, complexity: d.complexity, account: d.account, triggerKey: d.triggerKey, durationMin: d.durationMin, recurrence: d.recurrence };
 
   if (action === 'library') {
     await persist(Object.assign(base, { status: 'library', scheduledAt: null }));
@@ -801,7 +825,8 @@ async function openSettings() {
       <div class="field"><label class="label" for="s-account">Default account</label>
         <select class="select" id="s-account">${cfgModel.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
       <div class="field"><label class="label" for="s-model">Default model</label>
-        <select class="select" id="s-model">${MODELS.map((m) => `<option value="${m.id}" ${settings.model === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
+        <select class="select" id="s-model">${MODELS.map((m) => `<option value="${m.id}" ${settings.model === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select>
+        <span class="hint">New routines start here. <b>Auto</b> lets Routiner pick per task.</span></div>
     </div>
     <div class="cfg-sep">Accounts &amp; triggers</div>
     <div id="cfg-accounts"></div>
@@ -809,9 +834,9 @@ async function openSettings() {
       <div class="field"><label class="label" for="s-trigger">Trigger URL override</label>
         <input class="input" id="s-trigger" placeholder="leave blank to use the built-in function" value="${esc(settings.triggerUrl)}" />
         <span class="hint">Leave blank to use <code>/.netlify/functions/claude-trigger</code>. Set a URL only to POST a different webhook directly (bypasses the accounts above).</span></div>
-      <div class="field"><label class="label" for="s-key">Anthropic API key (“Test live” only)</label>
-        <input class="input" id="s-key" type="password" autocomplete="off" placeholder="sk-ant-…" value="${esc(settings.apiKey)}" />
-        <span class="hint">Stored only in this browser; used only by the in-drawer Test button.</span></div>
+      <div class="field"><label class="label" for="s-key">OpenRouter API key (“Test live” only)</label>
+        <input class="input" id="s-key" type="password" autocomplete="off" placeholder="sk-or-…" value="${esc(settings.openrouterKey)}" />
+        <span class="hint">Stored only in this browser; used only by the in-drawer Test button to run a prompt on the selected model. Get one at openrouter.ai/keys.</span></div>
     </details>`;
   drawerFoot.innerHTML = `<button class="btn btn--primary" id="s-save">Save settings</button>`;
   renderCfgAccounts();
@@ -823,7 +848,7 @@ async function openSettings() {
     accountsCfg = normalizeAccounts(cfgModel, false);
     settings.account = $('#s-account').value;
     if (!getAccountCfg(settings.account)) settings.account = (accountsCfg[0] || {}).id || DEFAULT_ACCOUNT;
-    settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim(); settings.apiKey = $('#s-key').value.trim();
+    settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim(); settings.openrouterKey = $('#s-key').value.trim();
     saveSettings();
     btn.disabled = false; btn.textContent = 'Save settings';
     if (ok) { closeDrawer(); render(); toast('Settings saved.'); }

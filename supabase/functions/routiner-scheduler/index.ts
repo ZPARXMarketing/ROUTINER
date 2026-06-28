@@ -22,6 +22,40 @@ const dbHeaders: Record<string, string> = {
   "Content-Type": "application/json",
 };
 
+// Mirror of js/model-router.js ROUTING_POLICY so scheduled fires pick the same
+// model the app would. Keep these two in sync if the policy changes.
+const ROUTING_POLICY: Record<string, Record<string, string>> = {
+  planning: {
+    low: "deepseek/deepseek-chat",
+    medium: "moonshotai/kimi-k2.7-code",
+    high: "moonshotai/kimi-k2.7-code",
+  },
+  execution: {
+    low: "meta-llama/llama-3.3-70b-instruct",
+    medium: "meta-llama/llama-3.3-70b-instruct",
+    high: "meta-llama/llama-3.3-70b-instruct",
+  },
+  general: {
+    low: "openrouter/auto",
+    medium: "openrouter/auto",
+    high: "openrouter/auto",
+  },
+};
+const FALLBACK_MODEL = "openrouter/auto";
+
+// A routine's effective model: an explicit pick wins; "auto" routes from
+// task_type + complexity.
+function effectiveModel(r: {
+  model?: string;
+  task_type?: string;
+  complexity?: string;
+}): string {
+  const m = r.model || "auto";
+  if (m && m !== "auto") return m;
+  const row = ROUTING_POLICY[r.task_type || "general"] || ROUTING_POLICY.general;
+  return row[r.complexity || "medium"] || row.medium || FALLBACK_MODEL;
+}
+
 function nextOccurrence(iso: string, rec: string): string | null {
   if (!iso || rec === "none") return null;
   const d = new Date(iso);
@@ -78,6 +112,9 @@ Deno.serve(async () => {
         headers: fireHeaders,
         body: JSON.stringify({
           text: r.prompt,
+          account: r.account,
+          triggerKey: r.trigger_key,
+          model: effectiveModel(r),
           source: "routiner-scheduler",
           routineId: r.id,
           title: r.title,
