@@ -132,6 +132,7 @@ curl -s -X POST "$SUPABASE_URL/rest/v1/routiner_routines" "${H_KEY[@]}" \
   -d '{
     "user_id": "1c336965-e8db-4c2a-919d-3e1e7d07fc79",
     "account": "zparxmarketing",
+    "trigger_key": "<a trigger id from this account>",
     "title": "[Q3 Launch] Draft landing copy",
     "prompt": "Write first-draft landing page copy for the Q3 launch. Pull positioning from docs/positioning.md, write the draft to drafts/landing-{{date}}.md, and list 3 open questions at the end.",
     "status": "scheduled",
@@ -146,13 +147,19 @@ Field notes:
 | field | value |
 |-------|-------|
 | `user_id` | the owner uuid from step 2 |
-| `account` | **your** account id (`sparks9679` or `zparxmarketing`) |
+| `account` | **your** account id (`sparks9679` or `zparxmarketing`, or any user-defined one) |
+| `trigger_key` | which trigger (instance) within that account fires it — an id from `routiner_settings.accounts[].triggers[].id`. Omit/null to use the account's first trigger. |
 | `title` | `[Project] Step` |
 | `prompt` | self-contained task for the future session |
 | `status` | `scheduled` (so it shows on the Calendar) |
 | `scheduled_at` | ISO-8601 UTC, in the future |
 | `recurrence` | `none` / `daily` / `weekdays` / `weekly` |
 | `model` | `claude-opus-4-8` / `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` |
+
+> **Accounts now hold multiple triggers.** Each account in `routiner_settings.accounts`
+> has a `triggers` list (A/B/C…), each its own Fire URL + token. Spreading a
+> project's steps across several triggers of one account lets them run truly in
+> parallel. Read the accounts structure first to pick valid `trigger_key`s.
 
 ---
 
