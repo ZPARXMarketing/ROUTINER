@@ -17,6 +17,9 @@ import {
 const SUPABASE_URL = 'https://vonfdzttupyemtomsojy.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT';
 const TRIGGER_FN = '/.netlify/functions/claude-trigger';
+/* The production site. Only this host defaults the master fire switch to live;
+   preview/branch/dev deploys default to paused so they don't fire by accident. */
+const MAIN_HOST = 'zroutiner.netlify.app';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
 const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (Mon–Fri)', weekly: 'Every week' };
@@ -110,8 +113,11 @@ function loadSettings() {
     const s = Object.assign({}, defaults, JSON.parse(localStorage.getItem(LS) || '{}'));
     if (!s.anthropicKey && s.apiKey) s.anthropicKey = s.apiKey; // legacy apiKey was the Anthropic key
     delete s.apiKey;
+    // Master fire switch (per browser/deployment): default live only on the
+    // main site, paused on preview/dev so they don't fire by accident.
+    if (typeof s.firing !== 'boolean') s.firing = (location.hostname === MAIN_HOST);
     return s;
-  } catch { return { ...defaults }; }
+  } catch { return { model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', anthropicKey: '', openrouterKey: '', firing: (location.hostname === MAIN_HOST) }; }
 }
 function saveSettings() { localStorage.setItem(LS, JSON.stringify(settings)); }
 
@@ -261,8 +267,27 @@ async function dbInsertRun(routine, result) {
   if (!error && data) runs.unshift({ id: data.id, routineId: data.routine_id, title: data.title, status: data.status, output: data.output, firedAt: data.fired_at });
 }
 
+/* ---------- Master fire switch (per browser/deployment) ---------- */
+function paintFireSwitch() {
+  const el = $('#fireSwitch'); if (!el) return;
+  const on = !!settings.firing;
+  el.classList.toggle('is-on', on);
+  el.classList.toggle('is-off', !on);
+  el.innerHTML = on ? '🟢 Firing live' : '⏸ Firing paused';
+  el.title = on
+    ? 'This site WILL fire routines (Run now / immediate). Click to pause.'
+    : 'This site will NOT fire routines from here. Click to go live.';
+}
+function toggleFireSwitch() {
+  settings.firing = !settings.firing;
+  saveSettings();
+  paintFireSwitch();
+  toast(settings.firing ? 'Firing enabled on this site.' : 'Firing paused — Run now won’t fire from here.', settings.firing ? '' : 'error');
+}
+
 /* ---------- Trigger (fire the Claude Code routine) ---------- */
 async function fireTrigger(routine) {
+  if (!settings.firing) { toast('Firing is paused on this site (top-right switch). Toggle it live to fire.', 'error'); return; }
   const direct = settings.triggerUrl.trim();
   const url = direct || TRIGGER_FN;
   const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, triggerKey: routine?.triggerKey || null, model: routine ? effectiveModel(routine) : undefined, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
@@ -867,7 +892,7 @@ function syncTabs() { $$('.tab').forEach((t) => t.classList.toggle('is-active', 
 /* ---------- Auth UI ---------- */
 function showAuth(mode = 'signin') {
   ['#tabs'].forEach((s) => { const e = $(s); if (e) e.style.display = 'none'; });
-  ['#settingsBtn', '#signOutBtn', '#newBtn', '#userChip'].forEach((s) => { const e = $(s); if (e) e.style.display = 'none'; });
+  ['#settingsBtn', '#signOutBtn', '#newBtn', '#userChip', '#fireSwitch'].forEach((s) => { const e = $(s); if (e) e.style.display = 'none'; });
   const signup = mode === 'signup';
   view.innerHTML = `<div class="auth">
     <h2>${signup ? 'Create your account' : 'Sign in'}</h2>
@@ -901,7 +926,8 @@ function showAuth(mode = 'signin') {
 
 function showApp() {
   $('#tabs').style.display = '';
-  ['#settingsBtn', '#signOutBtn', '#newBtn'].forEach((s) => { const e = $(s); if (e) e.style.display = ''; });
+  ['#settingsBtn', '#signOutBtn', '#newBtn', '#fireSwitch'].forEach((s) => { const e = $(s); if (e) e.style.display = ''; });
+  paintFireSwitch();
   const chip = $('#userChip');
   if (chip) { chip.style.display = ''; chip.innerHTML = `☁ <b>${esc(session.user.email)}</b>`; }
   syncTabs();
@@ -911,6 +937,7 @@ function showApp() {
 /* ---------- Init ---------- */
 function wireOnce() {
   $('#newBtn').addEventListener('click', () => openDrawer());
+  $('#fireSwitch').addEventListener('click', toggleFireSwitch);
   $('#settingsBtn').addEventListener('click', openSettings);
   $('#signOutBtn').addEventListener('click', async () => { await sb.auth.signOut(); });
   $('#drawerClose').addEventListener('click', closeDrawer);
