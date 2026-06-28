@@ -140,6 +140,24 @@ async function dbDelete(id) {
   if (error) { toast('Delete failed: ' + error.message, 'error'); return false; }
   routines = routines.filter((x) => x.id !== id); return true;
 }
+/* Per-account fire credentials (trigger + token), stored in Supabase
+   (routiner_settings, RLS per user). The Netlify function reads these
+   server-side using your session, so you can set everything in-app —
+   no Netlify env vars required. */
+async function dbLoadAccountCreds() {
+  const { data, error } = await sb.from('routiner_settings').select('accounts').maybeSingle();
+  if (error) { toast('Couldn’t load account settings: ' + error.message, 'error'); return {}; }
+  return (data && data.accounts) || {};
+}
+async function dbSaveAccountCreds(accounts) {
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) { toast('Sign in to save settings.', 'error'); return false; }
+  const { error } = await sb.from('routiner_settings')
+    .upsert({ user_id: user.id, accounts, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+  if (error) { toast('Save failed: ' + error.message, 'error'); return false; }
+  return true;
+}
+
 async function dbInsertRun(routine, result) {
   const { data, error } = await sb.from('routiner_runs')
     .insert({ routine_id: routine.id || null, title: routine.title || 'Untitled', status: result.status, output: result.text })
@@ -517,28 +535,67 @@ async function submitDrawer(action) {
 function closeDrawer() { overlay.classList.remove('is-open'); editingId = null; }
 
 /* ---------- Settings ---------- */
-function openSettings() {
+async function openSettings() {
   editingId = null;
   drawerTitle.textContent = 'Settings';
+  drawerBody.innerHTML = `<div class="notice">Loading your settings…</div>`;
+  drawerFoot.innerHTML = '';
+  overlay.classList.add('is-open');
+
+  const creds = await dbLoadAccountCreds(); // { accountId: { trigger, token } }
+
+  const accountBlocks = ACCOUNTS.map((a) => {
+    const c = creds[a.id] || {};
+    const hasToken = !!c.token;
+    return `<div class="acct-cfg">
+      <div class="acct-cfg__head"><span class="acct-dot" style="background:${accountColor(a.id).solid}"></span><b>${esc(a.label)}</b></div>
+      <div class="field"><label class="label" for="s-trig-${a.id}">Routine trigger</label>
+        <input class="input" id="s-trig-${a.id}" data-acct="${a.id}" placeholder="trig_… or https://…/fire" value="${esc(c.trigger || '')}" />
+        <span class="hint">From your Claude Code routine — its trigger id (<code>trig_…</code>) or full <code>/fire</code> URL.</span></div>
+      <div class="field"><label class="label" for="s-tok-${a.id}">Anthropic token</label>
+        <input class="input" id="s-tok-${a.id}" data-acct="${a.id}" type="password" autocomplete="off" placeholder="${hasToken ? '•••••••• saved — leave blank to keep' : 'sk-ant-…'}" />
+        <span class="hint">Bearer token this account fires with. ${hasToken ? 'A token is saved; type to replace it.' : 'Stored to your account, used server-side to fire.'}</span></div>
+    </div>`;
+  }).join('');
+
   drawerBody.innerHTML = `
-    <div class="notice">Your routines are saved to your account and sync across devices. <b>Run now</b> fires your Claude routine via the Netlify <code>CLAUDE_TRIGGER</code> function.</div>
+    <div class="notice">Pop your Claude <b>trigger</b> + <b>token</b> in below — that's all it takes to make <b>Run now</b> and scheduled routines fire. They save to your account and are used server-side; no Netlify setup needed.</div>
     <div class="field"><label class="label" for="s-account">Default Claude account</label>
       <select class="select" id="s-account">${ACCOUNTS.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select>
       <span class="hint">Pre-selected for new routines. Each routine can still pick its own account.</span></div>
     <div class="field"><label class="label" for="s-model">Default model</label>
       <select class="select" id="s-model">${MODELS.map((m) => `<option value="${m.id}" ${settings.model === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
-    <div class="field"><label class="label" for="s-trigger">Trigger URL override (optional)</label>
-      <input class="input" id="s-trigger" placeholder="leave blank to use the Netlify CLAUDE_TRIGGER function" value="${esc(settings.triggerUrl)}" />
-      <span class="hint">Leave blank to use <code>/.netlify/functions/claude-trigger</code>. Set a URL only to POST a different webhook directly.</span></div>
-    <div class="field"><label class="label" for="s-key">Anthropic API key (optional — “Test live” only)</label>
-      <input class="input" id="s-key" type="password" placeholder="sk-ant-…" value="${esc(settings.apiKey)}" />
-      <span class="hint">Stored only in this browser; used only by the in-drawer Test button.</span></div>`;
+    <div class="cfg-sep">Claude accounts — trigger &amp; token</div>
+    ${accountBlocks}
+    <details class="cfg-adv"><summary>Advanced (optional)</summary>
+      <div class="field"><label class="label" for="s-trigger">Trigger URL override</label>
+        <input class="input" id="s-trigger" placeholder="leave blank to use the built-in function" value="${esc(settings.triggerUrl)}" />
+        <span class="hint">Leave blank to use <code>/.netlify/functions/claude-trigger</code>. Set a URL only to POST a different webhook directly (bypasses the per-account creds above).</span></div>
+      <div class="field"><label class="label" for="s-key">Anthropic API key (“Test live” only)</label>
+        <input class="input" id="s-key" type="password" autocomplete="off" placeholder="sk-ant-…" value="${esc(settings.apiKey)}" />
+        <span class="hint">Stored only in this browser; used only by the in-drawer Test button.</span></div>
+    </details>`;
   drawerFoot.innerHTML = `<button class="btn btn--primary" id="s-save">Save settings</button>`;
-  $('#s-save').addEventListener('click', () => {
-    settings.account = $('#s-account').value; settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim(); settings.apiKey = $('#s-key').value.trim();
-    saveSettings(); closeDrawer(); render(); toast('Settings saved.');
+
+  $('#s-save').addEventListener('click', async () => {
+    // Merge account creds: keep an existing token when its field is left blank.
+    const next = { ...creds };
+    ACCOUNTS.forEach((a) => {
+      const trigger = $(`#s-trig-${a.id}`).value.trim();
+      const tokenIn = $(`#s-tok-${a.id}`).value.trim();
+      const prev = creds[a.id] || {};
+      const token = tokenIn || prev.token || '';
+      if (trigger || token) next[a.id] = { trigger, token };
+      else delete next[a.id];
+    });
+    const btn = $('#s-save'); btn.disabled = true; btn.textContent = 'Saving…';
+    const ok = await dbSaveAccountCreds(next);
+    settings.account = $('#s-account').value; settings.model = $('#s-model').value;
+    settings.triggerUrl = $('#s-trigger').value.trim(); settings.apiKey = $('#s-key').value.trim();
+    saveSettings();
+    btn.disabled = false; btn.textContent = 'Save settings';
+    if (ok) { closeDrawer(); render(); toast('Settings saved.'); }
   });
-  overlay.classList.add('is-open');
 }
 
 /* ---------- Tabs ---------- */

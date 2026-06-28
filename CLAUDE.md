@@ -27,8 +27,11 @@ read it first, then schedule your own account's blocks around what's there.
 - **Storage + auth is Supabase** (project `zparx-dashboard`): tables
   `routiner_routines` / `routiner_runs`, RLS per user, email+password login.
 - **Run now** POSTs `netlify/functions/claude-trigger.mjs`, which fires the
-  Claude Code routine `/fire` endpoint using the `CLAUDE_TRIGGER` + `CLAUDE_TOKEN`
-  Netlify env vars and passes the prompt as `{"text": …}`.
+  Claude Code routine `/fire` endpoint and passes the prompt as `{"text": …}`.
+  Per-account trigger + token come from the signed-in user's in-app **Settings**
+  first (stored in Supabase `routiner_settings`, read server-side via their
+  session — no env setup needed), falling back to the `CLAUDE_TRIGGER` /
+  `CLAUDE_TOKEN` (and `…_<ACCOUNT>`) Netlify env vars.
 - Styling follows the ZPARX design system (vendored in `css/tokens.css`):
   dark-mode-first; lime and yellow are dark-surface-only accents.
 
