@@ -1,0 +1,79 @@
+-- Claude Routine Planner — full database schema (one-paste setup).
+--
+-- Forking this project? Create a free Supabase project, open the SQL editor,
+-- and paste this whole file. It creates every table the app needs with
+-- row-level security so each signed-in user only ever sees their own rows.
+-- Idempotent: safe to re-run. (This is the consolidated equivalent of the
+-- files in supabase/migrations/. The pg_cron scheduler is optional and lives
+-- in supabase/migrations/0002_routiner_scheduler.sql + supabase/functions/.)
+
+-- ── Routines ─────────────────────────────────────────────────────────────
+create table if not exists public.routiner_routines (
+  id           uuid primary key default gen_random_uuid(),
+  user_id      uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  title        text not null default '',
+  prompt       text not null default '',
+  model        text not null default 'claude-sonnet-4-6',
+  account      text not null default 'sparks9679',   -- which Claude account fires it
+  recurrence   text not null default 'none',         -- none | daily | weekdays | weekly
+  status       text not null default 'library',      -- library | scheduled | archived
+  duration_min integer not null default 45,          -- calendar block length
+  scheduled_at timestamptz,
+  last_run     timestamptz,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+
+-- ── Run history ──────────────────────────────────────────────────────────
+create table if not exists public.routiner_runs (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  routine_id uuid references public.routiner_routines(id) on delete set null,
+  title      text not null default '',
+  status     text not null default 'success',
+  output     text not null default '',
+  fired_at   timestamptz not null default now()
+);
+
+-- ── Per-user fire credentials (set in-app via Settings) ──────────────────
+-- accounts is a map of { "<accountId>": { "trigger": "...", "token": "..." } }.
+-- The Netlify claude-trigger function reads these server-side using the
+-- caller's own access token, so users can configure everything in the app
+-- with no environment variables.
+create table if not exists public.routiner_settings (
+  user_id    uuid primary key default auth.uid() references auth.users(id) on delete cascade,
+  accounts   jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists routiner_routines_user_idx on public.routiner_routines(user_id);
+create index if not exists routiner_runs_user_idx     on public.routiner_runs(user_id);
+
+-- ── Row-level security: every user is scoped to their own rows ───────────
+alter table public.routiner_routines enable row level security;
+alter table public.routiner_runs     enable row level security;
+alter table public.routiner_settings enable row level security;
+
+drop policy if exists "own routines" on public.routiner_routines;
+create policy "own routines" on public.routiner_routines
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+drop policy if exists "own runs" on public.routiner_runs;
+create policy "own runs" on public.routiner_runs
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+drop policy if exists "own settings" on public.routiner_settings;
+create policy "own settings" on public.routiner_settings
+  for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+-- ── Keep updated_at fresh on edit ────────────────────────────────────────
+create or replace function public.routiner_touch_updated_at()
+returns trigger language plpgsql as $$
+begin
+  new.updated_at = now();
+  return new;
+end; $$;
+
+drop trigger if exists routiner_routines_touch on public.routiner_routines;
+create trigger routiner_routines_touch before update on public.routiner_routines
+  for each row execute function public.routiner_touch_updated_at();

@@ -30,9 +30,14 @@ Netlify function, passing the prompt straight into the routine's session.
 ### 1. Supabase (storage + login) — already wired
 
 The app points at the `zparx-dashboard` Supabase project. Tables
-`routiner_routines` and `routiner_runs` are created with row-level security so
-each account only sees its own rows. The publishable key in `js/app.js` is safe
-to expose (RLS does the protecting).
+`routiner_routines`, `routiner_runs`, and `routiner_settings` are created with
+row-level security so each account only sees its own rows. The publishable key
+in `js/app.js` is safe to expose (RLS does the protecting).
+
+**Forking this project?** Create your own Supabase project, open the **SQL
+editor**, and paste [`supabase/schema.sql`](supabase/schema.sql) — that builds
+every table + RLS policy in one go. Then drop your project URL and publishable
+key into `js/app.js` (and `netlify/functions/claude-trigger.mjs`).
 
 **One manual step for email + password login:** in the Supabase dashboard →
 **Authentication → Sign In / Providers → Email**, turn **off "Confirm email"**
@@ -53,15 +58,24 @@ POST https://api.anthropic.com/v1/claude_code/routines/<trigger-id>/fire
   { "text": "<the routine's prompt>" }
 ```
 
+**Easiest path — set it in the app.** Sign in, open **⚙ Settings**, and paste
+each Claude account's **trigger** + **token** under "Claude accounts". They save
+to your account (Supabase `routiner_settings`, RLS per user) and the function
+reads them server-side via your session — **no environment variables needed**.
+
+**Or use Netlify env vars** (used as a fallback, and by the scheduler).
 Set these in **Netlify → Site settings → Environment variables**:
 
 | Var | Value |
 |---|---|
 | `CLAUDE_TRIGGER` | the routine trigger id (`trig_…`) or full `/fire` URL |
 | `CLAUDE_TOKEN` | your Anthropic bearer token (`ANTHROPIC_API_KEY` also works) |
+| `CLAUDE_TRIGGER_<ACCOUNT>` / `CLAUDE_TOKEN_<ACCOUNT>` | *(optional)* per-account overrides, e.g. `CLAUDE_TRIGGER_ZPARXMARKETING` |
 | `CLAUDE_ROUTINE_BETA` | *(optional)* override the `anthropic-beta` header |
 
-The token stays server-side — it's never exposed to the browser.
+With env vars the token stays server-side — never exposed to the browser. (The
+in-app option trades a little of that — your token lives in your RLS-protected
+Supabase row — for zero-config usability.)
 
 ### Locking the trigger to your login (recommended)
 
@@ -111,8 +125,11 @@ See `supabase/migrations/` for the schema and the cron schedule.
 index.html        # planner UI + ZPARX brand fonts
 css/tokens.css    # vendored ZPARX design tokens
 css/app.css       # application + auth styling
-js/app.js         # Supabase auth + storage, UI, trigger, live test (ES module)
+js/app.js         # Supabase auth + storage, UI, calendar, trigger (ES module)
 netlify/functions/claude-trigger.mjs   # server-side routine fire
+supabase/schema.sql                    # full DB schema — one paste for a fresh project
+supabase/migrations/                   # incremental migrations (schema + cron)
+.claude/skills/plan-routines/          # skill: plan a project into scheduled routines
 assets/           # ZPARX lockup logo + favicon
 ```
 
