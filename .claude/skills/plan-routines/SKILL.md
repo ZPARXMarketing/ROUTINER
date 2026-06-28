@@ -68,6 +68,36 @@ H_KEY=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABA
 
 ---
 
+## 1b. Read the board (the intake)
+
+The app has a **Board** where the human drops tasks/ideas/context as notes
+(`routiner_notes`, status `active | brainstorm | planned | done | dismissed`).
+Only **active** notes are your work queue — `brainstorm` notes are still being
+thought through, so **leave them alone**. Read the active ones first:
+
+```bash
+curl -s "$SUPABASE_URL/rest/v1/routiner_notes?select=id,body,status&status=eq.active&order=created_at" "${H_KEY[@]}"
+```
+
+> Never plan or act on a `brainstorm` note. The human activates a note when it's
+> ready for you.
+
+For each active note, decide:
+
+- **Simple / one-shot?** Just do it now (or schedule a single block today).
+- **Multi-step?** Decompose it into a sequence of blocks across the right
+  horizon (an hour → a week) so everything gets done in order.
+
+After you've turned a note into scheduled blocks, mark it so it isn't re-planned:
+
+```bash
+curl -s -X PATCH "$SUPABASE_URL/rest/v1/routiner_notes?id=eq.<note-id>" "${H_KEY[@]}" \
+  -H "Content-Type: application/json" -d '{"status":"planned"}'
+# use "done" instead if you fully handled it on the spot
+```
+
+---
+
 ## 2. Look at the app first (read the whole schedule)
 
 ```bash
