@@ -11,7 +11,7 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import {
   MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
-  effectiveModel, displayModel, getModelForTask, modelLabel, runViaOpenRouter,
+  effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel,
 } from './model-router.js';
 
 const SUPABASE_URL = 'https://vonfdzttupyemtomsojy.supabase.co';
@@ -105,10 +105,10 @@ let calRef = new Date(); // any day inside the week currently shown
 const LS = 'routiner.settings.v1';
 let settings = loadSettings();
 function loadSettings() {
-  const defaults = { model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', openrouterKey: '' };
+  const defaults = { model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', anthropicKey: '', openrouterKey: '' };
   try {
     const s = Object.assign({}, defaults, JSON.parse(localStorage.getItem(LS) || '{}'));
-    if (!s.openrouterKey && s.apiKey) s.openrouterKey = s.apiKey; // migrate legacy field
+    if (!s.anthropicKey && s.apiKey) s.anthropicKey = s.apiKey; // legacy apiKey was the Anthropic key
     delete s.apiKey;
     return s;
   } catch { return { ...defaults }; }
@@ -287,9 +287,10 @@ async function fireTrigger(routine) {
   }
 }
 
-/* ---------- Optional live test (runs the prompt on the chosen model via OpenRouter) ---------- */
+/* ---------- Optional live test (runs the prompt on the chosen model, picking
+   the right provider: Claude → Anthropic, OpenRouter ids → OpenRouter) ---------- */
 async function callClaude(prompt, model) {
-  return runViaOpenRouter(prompt, model, (settings.openrouterKey || '').trim(), {
+  return runModel(prompt, model, { anthropic: settings.anthropicKey, openrouter: settings.openrouterKey }, {
     referer: location.origin, title: 'Routiner',
   });
 }
@@ -656,7 +657,7 @@ function openDrawer(routine = null, opts = {}) {
       <div class="field"><label class="label" for="f-recur">Repeat</label>
         <select class="select" id="f-recur">${Object.entries(RECURRENCE).map(([k, v]) => `<option value="${k}" ${r.recurrence === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
     </div>
-    <div class="field"><button class="btn btn--ghost btn--sm" id="f-test" type="button">⚡ Test live (optional, uses OpenRouter)</button>
+    <div class="field"><button class="btn btn--ghost btn--sm" id="f-test" type="button">⚡ Test live (optional, uses API)</button>
       <div class="run__body" id="f-test-out" style="display:none"></div></div>
     <div class="notice"><b>Run now</b> fires your routine immediately with this prompt. <b>Schedule</b> queues it for the time above (repeating if set). <b>Save to library</b> parks it.</div>`;
   drawerFoot.innerHTML = `
@@ -694,9 +695,10 @@ async function testLive() {
   const d = readDrawer();
   const model = effectiveModel(d);
   const out = $('#f-test-out'), btn = $('#f-test');
-  btn.disabled = true; btn.textContent = '⚡ Testing…'; out.style.display = 'block'; out.textContent = `Running on ${modelLabel(model)} via OpenRouter…`;
+  const via = isClaudeModel(model) ? 'Anthropic' : 'OpenRouter';
+  btn.disabled = true; btn.textContent = '⚡ Testing…'; out.style.display = 'block'; out.textContent = `Running on ${modelLabel(model)} via ${via}…`;
   const res = await callClaude(prompt, model);
-  out.textContent = res.text; btn.disabled = false; btn.textContent = '⚡ Test live (optional, uses OpenRouter)';
+  out.textContent = res.text; btn.disabled = false; btn.textContent = '⚡ Test live (optional, uses API)';
   await dbInsertRun({ id: editingId, title: $('#f-title').value || 'Live test' }, res);
 }
 function readDrawer() {
@@ -834,9 +836,12 @@ async function openSettings() {
       <div class="field"><label class="label" for="s-trigger">Trigger URL override</label>
         <input class="input" id="s-trigger" placeholder="leave blank to use the built-in function" value="${esc(settings.triggerUrl)}" />
         <span class="hint">Leave blank to use <code>/.netlify/functions/claude-trigger</code>. Set a URL only to POST a different webhook directly (bypasses the accounts above).</span></div>
-      <div class="field"><label class="label" for="s-key">OpenRouter API key (“Test live” only)</label>
-        <input class="input" id="s-key" type="password" autocomplete="off" placeholder="sk-or-…" value="${esc(settings.openrouterKey)}" />
-        <span class="hint">Stored only in this browser; used only by the in-drawer Test button to run a prompt on the selected model. Get one at openrouter.ai/keys.</span></div>
+      <div class="field"><label class="label" for="s-key">Anthropic API key (“Test live” on Claude models)</label>
+        <input class="input" id="s-key" type="password" autocomplete="off" placeholder="sk-ant-…" value="${esc(settings.anthropicKey)}" />
+        <span class="hint">Stored only in this browser; used only by the in-drawer Test button.</span></div>
+      <div class="field"><label class="label" for="s-or-key">OpenRouter API key (“Test live” on OpenRouter models)</label>
+        <input class="input" id="s-or-key" type="password" autocomplete="off" placeholder="sk-or-…" value="${esc(settings.openrouterKey)}" />
+        <span class="hint">Optional. Only needed to preview OpenRouter models. Get one at openrouter.ai/keys.</span></div>
     </details>`;
   drawerFoot.innerHTML = `<button class="btn btn--primary" id="s-save">Save settings</button>`;
   renderCfgAccounts();
@@ -848,7 +853,8 @@ async function openSettings() {
     accountsCfg = normalizeAccounts(cfgModel, false);
     settings.account = $('#s-account').value;
     if (!getAccountCfg(settings.account)) settings.account = (accountsCfg[0] || {}).id || DEFAULT_ACCOUNT;
-    settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim(); settings.openrouterKey = $('#s-key').value.trim();
+    settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim();
+    settings.anthropicKey = $('#s-key').value.trim(); settings.openrouterKey = $('#s-or-key').value.trim();
     saveSettings();
     btn.disabled = false; btn.textContent = 'Save settings';
     if (ok) { closeDrawer(); render(); toast('Settings saved.'); }

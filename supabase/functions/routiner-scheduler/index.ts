@@ -26,22 +26,22 @@ const dbHeaders: Record<string, string> = {
 // model the app would. Keep these two in sync if the policy changes.
 const ROUTING_POLICY: Record<string, Record<string, string>> = {
   planning: {
-    low: "deepseek/deepseek-chat",
-    medium: "moonshotai/kimi-k2.7-code",
-    high: "moonshotai/kimi-k2.7-code",
+    low: "claude-sonnet-4-6",
+    medium: "claude-sonnet-4-6",
+    high: "claude-opus-4-8",
   },
   execution: {
-    low: "meta-llama/llama-3.3-70b-instruct",
-    medium: "meta-llama/llama-3.3-70b-instruct",
-    high: "meta-llama/llama-3.3-70b-instruct",
+    low: "claude-haiku-4-5-20251001",
+    medium: "claude-haiku-4-5-20251001",
+    high: "claude-sonnet-4-6",
   },
   general: {
-    low: "openrouter/auto",
-    medium: "openrouter/auto",
-    high: "openrouter/auto",
+    low: "claude-haiku-4-5-20251001",
+    medium: "claude-sonnet-4-6",
+    high: "claude-opus-4-8",
   },
 };
-const FALLBACK_MODEL = "openrouter/auto";
+const FALLBACK_MODEL = "claude-sonnet-4-6";
 
 // A routine's effective model: an explicit pick wins; "auto" routes from
 // task_type + complexity.
