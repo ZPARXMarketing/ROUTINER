@@ -42,8 +42,13 @@ const ACCOUNT_COLORS = {
 };
 const accountColor = (id) => ACCOUNT_COLORS[id] || ACCOUNT_COLORS[DEFAULT_ACCOUNT];
 
+/* How long a routine block occupies on the calendar */
+const DEFAULT_DURATION_MIN = 45;
+const DURATIONS = [15, 30, 45, 60, 90, 120, 180, 240];
+const fmtDuration = (m) => m < 60 ? `${m} min` : (m % 60 === 0 ? `${m / 60} hr` : `${(m / 60).toFixed(1)} hr`);
+
 /* Week-calendar layout knobs */
-const CAL = { startHour: 7, endHour: 21, hourPx: 52, defaultDurationMin: 45 };
+const CAL = { startHour: 7, endHour: 21, hourPx: 52, defaultDurationMin: DEFAULT_DURATION_MIN };
 let calRef = new Date(); // any day inside the week currently shown
 
 /* settings (model / default account / optional trigger override / test key) stay local */
@@ -103,12 +108,14 @@ function toast(msg, kind = '') {
 const fromRow = (r) => ({
   id: r.id, title: r.title, prompt: r.prompt, model: r.model, account: r.account || DEFAULT_ACCOUNT,
   recurrence: r.recurrence, status: r.status, scheduledAt: r.scheduled_at, lastRun: r.last_run,
+  durationMin: r.duration_min || DEFAULT_DURATION_MIN,
   createdAt: r.created_at, updatedAt: r.updated_at,
 });
 const toRow = (o) => ({
   title: o.title ?? '', prompt: o.prompt ?? '', model: o.model || DEFAULT_MODEL,
   account: o.account || DEFAULT_ACCOUNT,
   recurrence: o.recurrence || 'none', status: o.status || 'library',
+  duration_min: o.durationMin || DEFAULT_DURATION_MIN,
   scheduled_at: o.scheduledAt || null, last_run: o.lastRun || null,
 });
 
@@ -259,7 +266,7 @@ function card(r) {
   return `<article class="card" data-id="${r.id}">
     <div class="card__head"><span class="card__title">${esc(r.title) || '<em>Untitled routine</em>'}</span>${statusChip(r)}</div>
     <div class="card__prompt">${esc(r.prompt) || '(no prompt)'}</div>
-    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${accountColor(r.account).solid}"></span><b>${esc(accountLabel(r.account))}</b></span><span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span>${when}</div>
+    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${accountColor(r.account).solid}"></span><b>${esc(accountLabel(r.account))}</b></span><span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span><span class="card__meta-item">⏱ <b>${fmtDuration(r.durationMin || DEFAULT_DURATION_MIN)}</b></span>${when}</div>
     <div class="card__foot">${cardActions(r)}</div>
   </article>`;
 }
@@ -388,7 +395,8 @@ function calEventHtml(ev) {
   const widthPct = 100 / ev.ncols, leftPct = ev.col * widthPct;
   const c = accountColor(ev.routine.account);
   const past = ev.start.getTime() < Date.now();
-  const timeStr = ev.start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const hm = (d) => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const timeStr = `${hm(ev.start)}–${hm(ev.end)}`;
   const showTime = height >= 34;
   return `<div class="cal__ev${past ? ' cal__ev--past' : ''}" data-id="${ev.routine.id}" title="${esc(ev.routine.title)} · ${accountLabel(ev.routine.account)} · ${timeStr}"
     style="top:${top}px; height:${height}px; left:calc(${leftPct}% + 3px); width:calc(${widthPct}% - 5px); background:${c.solid}; color:${c.ink}; border-left-color:${c.edge};">
@@ -479,6 +487,8 @@ function openDrawer(routine = null, opts = {}) {
     <div class="field__row">
       <div class="field"><label class="label" for="f-when">Fire at</label>
         <input class="input" type="datetime-local" id="f-when" value="${whenVal}" /></div>
+      <div class="field"><label class="label" for="f-dur">Duration</label>
+        <select class="select" id="f-dur">${DURATIONS.map((d) => `<option value="${d}" ${(r.durationMin || DEFAULT_DURATION_MIN) === d ? 'selected' : ''}>${fmtDuration(d)}</option>`).join('')}</select></div>
       <div class="field"><label class="label" for="f-recur">Repeat</label>
         <select class="select" id="f-recur">${Object.entries(RECURRENCE).map(([k, v]) => `<option value="${k}" ${r.recurrence === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
     </div>
@@ -504,14 +514,14 @@ async function testLive() {
   await dbInsertRun({ id: editingId, title: $('#f-title').value || 'Live test' }, res);
 }
 function readDrawer() {
-  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, account: $('#f-account').value, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
+  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, account: $('#f-account').value, durationMin: parseInt($('#f-dur').value, 10) || DEFAULT_DURATION_MIN, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
 }
 async function persist(base) { return editingId ? dbUpdate(editingId, Object.assign(getRoutine(editingId) || {}, base)) : dbCreate(base); }
 
 async function submitDrawer(action) {
   const d = readDrawer();
   if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
-  const base = { title: d.title, prompt: d.prompt, model: d.model, account: d.account, recurrence: d.recurrence };
+  const base = { title: d.title, prompt: d.prompt, model: d.model, account: d.account, durationMin: d.durationMin, recurrence: d.recurrence };
 
   if (action === 'library') {
     await persist(Object.assign(base, { status: 'library', scheduledAt: null }));
