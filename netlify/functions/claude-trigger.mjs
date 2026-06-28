@@ -6,9 +6,17 @@
  * Supabase access token; this function adds the Anthropic auth + beta headers
  * server-side so the token never reaches the client.
  *
+ * Credential sources (checked in this order, per account):
+ *   1. The signed-in user's in-app Settings — stored in Supabase
+ *      `routiner_settings` (RLS per user) and read here server-side via the
+ *      caller's access token. This is the zero-config path: a user just pops
+ *      their trigger + token into the app's Settings and it works.
+ *   2. Netlify environment variables (below) — used as a fallback, and for the
+ *      scheduler which fires with the shared secret instead of a user session.
+ *
  * Netlify environment variables (Site settings → Environment variables):
- *   CLAUDE_TRIGGER        – routine trigger id ("trig_…") OR full /fire URL. Required.
- *   CLAUDE_TOKEN          – Anthropic bearer token. Required.
+ *   CLAUDE_TRIGGER        – routine trigger id ("trig_…") OR full /fire URL.
+ *   CLAUDE_TOKEN          – Anthropic bearer token.
  *                           (ANTHROPIC_API_KEY / CLAUDE_TRIGGER_TOKEN are aliases.)
  *   CLAUDE_ROUTINE_BETA   – optional override for the anthropic-beta header.
  *
@@ -81,6 +89,25 @@ async function verifyUser(token) {
   } catch { return null; }
 }
 
+// Look up the caller's own per-account trigger+token from Supabase
+// (routiner_settings, RLS per user) using their access token. Lets users
+// configure everything in-app — no Netlify env vars needed. Returns
+// { trigger, token } (either may be empty) or null when unavailable.
+async function loadUserCreds(accessToken, account) {
+  if (!accessToken || !account) return null;
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/routiner_settings?select=accounts`, {
+      headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${accessToken}` },
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    const accounts = (rows && rows[0] && rows[0].accounts) || {};
+    const a = accounts[account];
+    if (!a) return null;
+    return { trigger: a.trigger || '', token: a.token || '' };
+  } catch { return null; }
+}
+
 // Returns null if authorized, otherwise a Response to short-circuit with.
 async function authorize(req) {
   const secret = process.env.ROUTINER_FIRE_SECRET;
@@ -112,11 +139,16 @@ export default async (req) => {
   const text = incoming.text ?? incoming.prompt ?? '';
   const account = incoming.account ?? '';
 
-  const creds = resolveAccountCreds(account);
-  const url = resolveFireUrl(creds.trigger);
-  const token = creds.token;
-  if (!url) return Response.json({ ok: false, error: `No trigger configured for account "${account || 'default'}" — set CLAUDE_TRIGGER_<ACCOUNT> (or the legacy CLAUDE_TRIGGER) in Netlify env. It must be a routine id (trig_…) or a full /fire URL.` }, { status: 500, headers: cors });
-  if (!token) return Response.json({ ok: false, error: `No token for account "${account || 'default'}" — set CLAUDE_TOKEN_<ACCOUNT> (or the legacy CLAUDE_TOKEN / ANTHROPIC_API_KEY) in Netlify env.` }, { status: 500, headers: cors });
+  // Prefer the signed-in user's in-app settings; fall back to env vars per field.
+  const accessToken = bearer(req);
+  const userCreds = (accessToken && accessToken !== process.env.ROUTINER_FIRE_SECRET)
+    ? await loadUserCreds(accessToken, account) : null;
+  const envCreds = resolveAccountCreds(account);
+  const trigger = (userCreds && userCreds.trigger) || envCreds.trigger;
+  const token = (userCreds && userCreds.token) || envCreds.token;
+  const url = resolveFireUrl(trigger);
+  if (!url) return Response.json({ ok: false, error: `No trigger configured for account "${account || 'default'}" — add its trigger in the app's Settings, or set CLAUDE_TRIGGER_<ACCOUNT> in Netlify env. It must be a routine id (trig_…) or a full /fire URL.` }, { status: 500, headers: cors });
+  if (!token) return Response.json({ ok: false, error: `No token for account "${account || 'default'}" — add its token in the app's Settings, or set CLAUDE_TOKEN_<ACCOUNT> in Netlify env.` }, { status: 500, headers: cors });
 
   try {
     const resp = await fetch(url, {

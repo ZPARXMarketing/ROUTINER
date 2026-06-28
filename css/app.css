@@ -457,3 +457,13 @@ a { color: var(--periwinkle); }
   .cal__legend { margin-left: 0; width: 100%; }
   .cal__dnum { font-size: 13px; }
 }
+
+/* ── Settings: per-account trigger + token ─────── */
+.cfg-sep { font-family: var(--font-pixel); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-low); margin: var(--sp-5, 20px) 0 var(--sp-3); padding-top: var(--sp-4); border-top: 1px solid var(--hairline); }
+.acct-cfg { border: 1px solid var(--hairline); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4) var(--sp-1); margin-bottom: var(--sp-3); background: rgba(20,27,46,0.5); }
+.acct-cfg__head { display: flex; align-items: center; font-family: var(--font-body); font-size: 13px; color: var(--text-hi); margin-bottom: var(--sp-2); }
+.acct-cfg__head b { font-weight: 700; }
+.cfg-adv { margin-top: var(--sp-4); border-top: 1px solid var(--hairline); padding-top: var(--sp-3); }
+.cfg-adv summary { cursor: pointer; font-family: var(--font-body); font-weight: 600; font-size: 13px; color: var(--text-mid); list-style: revert; }
+.cfg-adv summary:hover { color: var(--text-hi); }
+.cfg-adv[open] summary { margin-bottom: var(--sp-3); }
