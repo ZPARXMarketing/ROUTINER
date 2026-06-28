@@ -33,6 +33,19 @@ const ACCOUNTS = [
 const DEFAULT_ACCOUNT = 'sparks9679';
 const accountLabel = (id) => (ACCOUNTS.find((a) => a.id === id) || {}).label || id || DEFAULT_ACCOUNT;
 
+/* Each account gets one easy-to-read color on the calendar. Lime = Sparks9679,
+   blue = ZparxMarketing — distinct in both hue and brightness so overlapping
+   blocks from the two Claudes are instantly tellable apart. */
+const ACCOUNT_COLORS = {
+  sparks9679:     { solid: '#BCEF2F', ink: '#0C111F', edge: '#8FBE16' },
+  zparxmarketing: { solid: '#4D6BFF', ink: '#FFFFFF', edge: '#2F49C8' },
+};
+const accountColor = (id) => ACCOUNT_COLORS[id] || ACCOUNT_COLORS[DEFAULT_ACCOUNT];
+
+/* Week-calendar layout knobs */
+const CAL = { startHour: 7, endHour: 21, hourPx: 52, defaultDurationMin: 45 };
+let calRef = new Date(); // any day inside the week currently shown
+
 /* settings (model / default account / optional trigger override / test key) stay local */
 const LS = 'routiner.settings.v1';
 let settings = loadSettings();
@@ -44,7 +57,7 @@ function saveSettings() { localStorage.setItem(LS, JSON.stringify(settings)); }
 
 let routines = [];
 let runs = [];
-let currentView = 'scheduled';
+let currentView = 'calendar';
 let session = null;
 
 /* ---------- DOM helpers ---------- */
@@ -192,6 +205,7 @@ function paintStatus() {
 function render() {
   if (!session) return;
   paintCounts(); paintStatus();
+  if (currentView === 'calendar') return renderCalendar();
   if (currentView === 'history') return renderHistory();
   const items = routines.filter((r) => r.status === currentView).sort((a, b) =>
     currentView === 'scheduled' ? new Date(a.scheduledAt || 0) - new Date(b.scheduledAt || 0) : new Date(b.updatedAt) - new Date(a.updatedAt));
@@ -227,7 +241,7 @@ function card(r) {
   return `<article class="card" data-id="${r.id}">
     <div class="card__head"><span class="card__title">${esc(r.title) || '<em>Untitled routine</em>'}</span>${statusChip(r)}</div>
     <div class="card__prompt">${esc(r.prompt) || '(no prompt)'}</div>
-    <div class="card__meta">${recur}<span class="card__meta-item">👤 <b>${esc(accountLabel(r.account))}</b></span><span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span>${when}</div>
+    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${accountColor(r.account).solid}"></span><b>${esc(accountLabel(r.account))}</b></span><span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span>${when}</div>
     <div class="card__foot">${cardActions(r)}</div>
   </article>`;
 }
@@ -286,6 +300,144 @@ function runRow(run) {
       <span class="run__title">${esc(run.title)}</span>
       <span class="run__time">${fmt(run.firedAt)}</span>
     </div><div class="run__body">${esc(run.output)}</div></div>`;
+}
+
+/* ---------- Calendar (week plan) ---------- */
+function startOfWeek(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); const dow = (x.getDay() + 6) % 7; x.setDate(x.getDate() - dow); return x; } // Monday
+function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+function sameDate(a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); }
+const DOW = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+
+/* Does a routine fire on `day`? Handles recurrence projection. */
+function occursOn(routine, day) {
+  if (!routine.scheduledAt) return false;
+  const anchor = new Date(routine.scheduledAt);
+  const a0 = new Date(anchor); a0.setHours(0, 0, 0, 0);
+  const d0 = new Date(day); d0.setHours(0, 0, 0, 0);
+  const rec = routine.recurrence || 'none';
+  if (rec === 'none') return sameDate(anchor, day);
+  if (d0 < a0) return false;
+  const dow = day.getDay();
+  if (rec === 'daily') return true;
+  if (rec === 'weekdays') return dow >= 1 && dow <= 5;
+  if (rec === 'weekly') return dow === anchor.getDay();
+  return false;
+}
+
+/* Build the {days, perDay[]} event model for the visible week. */
+function weekEvents(weekStart) {
+  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  const perDay = days.map(() => []);
+  routines.forEach((r) => {
+    if (r.status !== 'scheduled') return;
+    days.forEach((day, i) => {
+      if (!occursOn(r, day)) return;
+      const anchor = new Date(r.scheduledAt);
+      const start = new Date(day); start.setHours(anchor.getHours(), anchor.getMinutes(), 0, 0);
+      const durMin = r.durationMin || CAL.defaultDurationMin;
+      perDay[i].push({ routine: r, start, end: new Date(start.getTime() + durMin * 60000) });
+    });
+  });
+  return { days, perDay };
+}
+
+/* Interval-graph column packing: side-by-side columns for overlaps. */
+function layoutDay(events) {
+  const toMin = (d) => d.getHours() * 60 + d.getMinutes();
+  const evs = events.map((e) => ({ ...e, s: toMin(e.start), e2: Math.max(toMin(e.end), toMin(e.start) + 15) }))
+    .sort((a, b) => a.s - b.s || a.e2 - b.e2);
+  const colEnds = [];
+  evs.forEach((ev) => {
+    let placed = -1;
+    for (let c = 0; c < colEnds.length; c++) { if (colEnds[c] <= ev.s) { placed = c; colEnds[c] = ev.e2; break; } }
+    if (placed < 0) { placed = colEnds.length; colEnds.push(ev.e2); }
+    ev.col = placed;
+  });
+  // group consecutive overlapping events to know how many columns to divide by
+  let group = [], maxEnd = -1;
+  const flush = (g) => { if (!g.length) return; const n = Math.max(...g.map((x) => x.col)) + 1; g.forEach((x) => { x.ncols = n; }); };
+  evs.forEach((ev) => { if (group.length && ev.s >= maxEnd) { flush(group); group = []; maxEnd = -1; } group.push(ev); maxEnd = Math.max(maxEnd, ev.e2); });
+  flush(group);
+  return evs;
+}
+
+function calEventHtml(ev) {
+  const winStart = CAL.startHour * 60, winEnd = CAL.endHour * 60;
+  const s = Math.max(ev.s, winStart), e = Math.min(ev.e2, winEnd);
+  if (e <= winStart || s >= winEnd) return ''; // fully outside the visible window
+  const top = ((s - winStart) / 60) * CAL.hourPx;
+  const height = Math.max(((e - s) / 60) * CAL.hourPx, 20);
+  const widthPct = 100 / ev.ncols, leftPct = ev.col * widthPct;
+  const c = accountColor(ev.routine.account);
+  const past = ev.start.getTime() < Date.now();
+  const timeStr = ev.start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const showTime = height >= 34;
+  return `<div class="cal__ev${past ? ' cal__ev--past' : ''}" data-id="${ev.routine.id}" title="${esc(ev.routine.title)} · ${accountLabel(ev.routine.account)} · ${timeStr}"
+    style="top:${top}px; height:${height}px; left:calc(${leftPct}% + 3px); width:calc(${widthPct}% - 5px); background:${c.solid}; color:${c.ink}; border-left-color:${c.edge};">
+    <div class="cal__ev-title">${esc(ev.routine.title) || 'Untitled'}</div>
+    ${showTime ? `<div class="cal__ev-time">${timeStr}</div>` : ''}
+  </div>`;
+}
+
+function renderCalendar() {
+  const weekStart = startOfWeek(calRef), weekEnd = addDays(weekStart, 6);
+  const { days, perDay } = weekEvents(weekStart);
+  const total = perDay.reduce((n, d) => n + d.length, 0);
+  const today = new Date();
+  const colH = (CAL.endHour - CAL.startHour) * CAL.hourPx;
+
+  const rangeLabel = `${weekStart.toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${weekEnd.toLocaleDateString([], { month: weekStart.getMonth() === weekEnd.getMonth() ? undefined : 'short', day: 'numeric' })}`;
+
+  const legend = ACCOUNTS.map((a) => {
+    const c = accountColor(a.id);
+    return `<span class="cal__leg"><span class="cal__sw" style="background:${c.solid}"></span>${esc(a.label)}</span>`;
+  }).join('');
+
+  const dayHeaders = days.map((d) => {
+    const isToday = sameDate(d, today);
+    return `<div class="cal__dh${isToday ? ' cal__dh--today' : ''}"><div class="cal__dow">${DOW[(d.getDay() + 6) % 7]}</div><div class="cal__dnum">${d.getDate()}</div></div>`;
+  }).join('');
+
+  const gutter = `<div class="cal__gutter" style="height:${colH}px">${Array.from({ length: CAL.endHour - CAL.startHour + 1 }, (_, i) => {
+    const h = CAL.startHour + i, ampm = h < 12 ? 'AM' : 'PM', h12 = ((h + 11) % 12) + 1;
+    return `<div class="cal__hr" style="top:${i * CAL.hourPx}px">${h12}${i === 0 || h === 12 ? ' ' + ampm : ''}</div>`;
+  }).join('')}</div>`;
+
+  const dayCols = days.map((d, i) => {
+    const laid = layoutDay(perDay[i]);
+    const now = sameDate(d, today) ? nowLineHtml() : '';
+    return `<div class="cal__day" style="height:${colH}px">${laid.map(calEventHtml).join('')}${now}</div>`;
+  }).join('');
+
+  view.innerHTML = `<div class="cal">
+    <div class="cal__bar">
+      <span class="cal__range">${rangeLabel}</span>
+      <div class="cal__nav"><button class="cal__navbtn" data-cal="prev">‹</button><button class="cal__navbtn" data-cal="next">›</button></div>
+      <button class="cal__today" data-cal="today">Today</button>
+      <span class="cal__count">${total} event${total === 1 ? '' : 's'} this week</span>
+      <div class="cal__legend">${legend}</div>
+    </div>
+    <div class="cal__head"><div></div>${dayHeaders}</div>
+    <div class="cal__scroll"><div class="cal__body">${gutter}${dayCols}</div></div>
+    ${total === 0 ? '<div class="cal__hint">No routines scheduled this week. Schedule a routine — pick its Claude account and a time — and it lands here as a colored block.</div>' : ''}
+  </div>`;
+
+  view.querySelectorAll('[data-cal]').forEach((b) => b.addEventListener('click', () => {
+    const a = b.dataset.cal;
+    if (a === 'today') calRef = new Date();
+    else calRef = addDays(calRef, a === 'next' ? 7 : -7);
+    renderCalendar();
+  }));
+  view.querySelectorAll('.cal__ev').forEach((el) => el.addEventListener('click', () => {
+    const r = getRoutine(el.dataset.id); if (r) openDrawer(r);
+  }));
+}
+
+function nowLineHtml() {
+  const now = new Date(), mins = now.getHours() * 60 + now.getMinutes();
+  if (mins < CAL.startHour * 60 || mins > CAL.endHour * 60) return '';
+  const top = ((mins - CAL.startHour * 60) / 60) * CAL.hourPx;
+  return `<div class="cal__now" style="top:${top}px"></div><div class="cal__now-dot" style="top:${top - 4}px"></div>`;
 }
 
 /* ---------- Drawer (create / edit) ---------- */

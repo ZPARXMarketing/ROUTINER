@@ -409,3 +409,51 @@ a { color: var(--periwinkle); }
   .app { padding: var(--sp-4) var(--sp-4) var(--sp-16); }
   .brand__title { font-size: 18px; }
 }
+
+/* ============================================================
+   Calendar — week plan (color = Claude account)
+   ============================================================ */
+.acct-dot { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+.cal { background: var(--bg-base); border: 1px solid var(--hairline); border-radius: var(--r-lg); box-shadow: var(--shadow-lg); overflow: hidden; }
+
+.cal__bar { display: flex; align-items: center; gap: 14px; padding: 14px 18px; border-bottom: 1px solid var(--hairline); flex-wrap: wrap; }
+.cal__range { font-family: var(--font-display); font-weight: 800; font-size: 17px; color: var(--text-hi); letter-spacing: -0.02em; }
+.cal__nav { display: flex; gap: 4px; }
+.cal__navbtn { width: 28px; height: 28px; border: 1px solid var(--hairline); border-radius: 8px; background: transparent; color: var(--text-mid); font-family: var(--font-mono); font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.cal__navbtn:hover { color: var(--text-hi); border-color: var(--grey-700); }
+.cal__today { font-family: var(--font-body); font-weight: 600; font-size: 12px; color: var(--text-mid); background: transparent; border: 1px solid var(--hairline); border-radius: var(--r-pill); padding: 5px 13px; cursor: pointer; }
+.cal__today:hover { color: var(--text-hi); border-color: var(--grey-700); }
+.cal__count { font-family: var(--font-pixel); font-size: 10px; letter-spacing: 0.06em; color: var(--text-low); text-transform: uppercase; }
+.cal__legend { margin-left: auto; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.cal__leg { display: flex; align-items: center; gap: 7px; font-family: var(--font-body); font-weight: 500; font-size: 12px; color: var(--text-mid); }
+.cal__sw { width: 13px; height: 13px; border-radius: 4px; flex: 0 0 auto; }
+
+.cal__head { display: grid; grid-template-columns: 56px repeat(7, 1fr); border-bottom: 1px solid var(--hairline); }
+.cal__dh { padding: 8px 0; text-align: center; border-left: 1px solid #1f2740; }
+.cal__dow { font-family: var(--font-pixel); font-size: 10px; color: var(--text-low); }
+.cal__dnum { font-family: var(--font-body); font-weight: 700; font-size: 15px; color: var(--text-mid); margin-top: 2px; }
+.cal__dh--today .cal__dow { color: var(--lime); }
+.cal__dh--today .cal__dnum { color: var(--text-hi); }
+
+.cal__scroll { max-height: calc(100vh - 300px); overflow-y: auto; }
+.cal__body { display: grid; grid-template-columns: 56px repeat(7, 1fr); position: relative; padding-top: 8px; }
+.cal__gutter { position: relative; }
+.cal__hr { position: absolute; right: 7px; font-family: var(--font-mono); font-size: 9px; color: var(--text-low); transform: translateY(-50%); white-space: nowrap; }
+.cal__day { position: relative; border-left: 1px solid #1f2740; background: repeating-linear-gradient(to bottom, rgba(42,52,84,0.30) 0 1px, transparent 1px 52px); }
+
+.cal__ev { position: absolute; border-radius: 8px; padding: 4px 7px; overflow: hidden; cursor: pointer; box-sizing: border-box; border-left: 3px solid; transition: filter .12s ease, box-shadow .12s ease; }
+.cal__ev:hover { filter: brightness(1.07); z-index: 5; box-shadow: var(--shadow-md); }
+.cal__ev--past { opacity: 0.5; }
+.cal__ev-title { font-family: var(--font-body); font-weight: 600; font-size: 11px; line-height: 1.1; overflow: hidden; text-overflow: ellipsis; }
+.cal__ev-time { font-family: var(--font-mono); font-weight: 600; font-size: 9px; margin-top: 2px; opacity: 0.72; }
+
+.cal__now { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid var(--lime); box-shadow: 0 0 12px rgba(188,239,47,0.6); z-index: 6; pointer-events: none; }
+.cal__now-dot { position: absolute; left: -5px; width: 9px; height: 9px; border-radius: 50%; background: var(--lime); box-shadow: 0 0 10px rgba(188,239,47,0.8); z-index: 6; pointer-events: none; }
+
+.cal__hint { padding: 16px 20px; font-family: var(--font-body); font-size: 13px; color: var(--text-mid); border-top: 1px solid var(--hairline); }
+
+@media (max-width: 760px) {
+  .cal__legend { margin-left: 0; width: 100%; }
+  .cal__dnum { font-size: 13px; }
+}
