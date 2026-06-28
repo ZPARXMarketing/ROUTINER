@@ -30,11 +30,11 @@ const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (
    The structure lives in Supabase routiner_settings.accounts and is editable
    in Settings; `accountsCfg` is the in-memory copy (secrets stripped) used to
    render. */
-const KNOWN_LABELS = { sparks9679: 'Sparks9679', zparxmarketing: 'ZparxMarketing' };
+const KNOWN_LABELS = { sparks9679: 'A. Sparks9679', zparxmarketing: 'Z. Zparx Marketing' };
 const DEFAULT_ACCOUNT = 'sparks9679';
 const DEFAULT_ACCOUNTS = () => [
-  { id: 'sparks9679', label: 'Sparks9679', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
-  { id: 'zparxmarketing', label: 'ZparxMarketing', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'sparks9679', label: 'A. Sparks9679', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'zparxmarketing', label: 'Z. Zparx Marketing', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
 ];
 let accountsCfg = DEFAULT_ACCOUNTS();
 
