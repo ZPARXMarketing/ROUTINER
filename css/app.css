@@ -97,6 +97,23 @@ a { color: var(--periwinkle); }
 .btn--ghost { background: transparent; color: var(--text-mid); border-color: var(--hairline); }
 .btn--ghost:hover { color: var(--text-hi); border-color: var(--grey-700); }
 .btn--sm { padding: var(--sp-2) var(--sp-3); font-size: 12px; font-weight: 600; }
+
+/* ── Master fire switch (top bar) ──────────────── */
+.fire-switch {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: var(--r-pill);
+  padding: var(--sp-2) var(--sp-4);
+  cursor: pointer;
+  white-space: nowrap;
+  border: 1px solid var(--hairline);
+  transition: background .15s ease, border-color .15s ease, box-shadow .15s ease, color .15s ease;
+}
+.fire-switch.is-on { background: rgba(134, 224, 30, .12); color: var(--lime); border-color: rgba(134, 224, 30, .5); }
+.fire-switch.is-on:hover { box-shadow: var(--glow-lime); }
+.fire-switch.is-off { background: rgba(124, 135, 158, .12); color: var(--text-mid); border-color: var(--hairline); }
+.fire-switch.is-off:hover { color: var(--text-hi); border-color: var(--grey-700); }
 .btn--danger-ghost { background: transparent; color: var(--danger); border-color: transparent; }
 .btn--danger-ghost:hover { background: rgba(255,77,94,0.12); }
 .btn[disabled] { opacity: .5; cursor: not-allowed; }

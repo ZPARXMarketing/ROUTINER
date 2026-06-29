@@ -39,7 +39,9 @@ the exact Supabase REST recipes. The loop:
 - **`routiner_notes`** — the Board. `body`, `status`
   (`active`/`brainstorm`/`planned`/`done`/`dismissed`).
 - **`routiner_routines`** — the schedule the Calendar reads. `title`, `prompt`
-  (the future session's task), `account`, `trigger_key`, `model`, `recurrence`
+  (the future session's task), `account`, `trigger_key`, `model` (a model id, or
+  `'auto'` to let Routiner route by `task_type`+`complexity` — see
+  `js/model-router.js`), `task_type`, `complexity`, `recurrence`
   (`none`/`daily`/`weekdays`/`weekly`), `status`
   (`library`/`scheduled`/`archived`), `scheduled_at`, `duration_min`.
 - **`routiner_settings`** — per user, `accounts` jsonb: a **list of accounts**,

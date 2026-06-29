@@ -13,7 +13,9 @@ create table if not exists public.routiner_routines (
   user_id      uuid not null default auth.uid() references auth.users(id) on delete cascade,
   title        text not null default '',
   prompt       text not null default '',
-  model        text not null default 'claude-sonnet-4-6',
+  model        text not null default 'auto',          -- 'auto' = route by task_type+complexity (js/model-router.js); else a model id
+  task_type    text not null default 'general',       -- general | planning | execution (auto routing input)
+  complexity   text not null default 'medium',        -- low | medium | high (auto routing input)
   account      text not null default 'sparks9679',   -- which Claude account fires it
   trigger_key  text,                                  -- which trigger (instance) within that account; null = first
   recurrence   text not null default 'none',         -- none | daily | weekdays | weekly

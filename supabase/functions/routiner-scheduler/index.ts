@@ -22,6 +22,40 @@ const dbHeaders: Record<string, string> = {
   "Content-Type": "application/json",
 };
 
+// Mirror of js/model-router.js ROUTING_POLICY so scheduled fires pick the same
+// model the app would. Keep these two in sync if the policy changes.
+const ROUTING_POLICY: Record<string, Record<string, string>> = {
+  planning: {
+    low: "claude-sonnet-4-6",
+    medium: "claude-sonnet-4-6",
+    high: "claude-opus-4-8",
+  },
+  execution: {
+    low: "claude-haiku-4-5-20251001",
+    medium: "claude-haiku-4-5-20251001",
+    high: "claude-sonnet-4-6",
+  },
+  general: {
+    low: "claude-haiku-4-5-20251001",
+    medium: "claude-sonnet-4-6",
+    high: "claude-opus-4-8",
+  },
+};
+const FALLBACK_MODEL = "claude-sonnet-4-6";
+
+// A routine's effective model: an explicit pick wins; "auto" routes from
+// task_type + complexity.
+function effectiveModel(r: {
+  model?: string;
+  task_type?: string;
+  complexity?: string;
+}): string {
+  const m = r.model || "auto";
+  if (m && m !== "auto") return m;
+  const row = ROUTING_POLICY[r.task_type || "general"] || ROUTING_POLICY.general;
+  return row[r.complexity || "medium"] || row.medium || FALLBACK_MODEL;
+}
+
 function nextOccurrence(iso: string, rec: string): string | null {
   if (!iso || rec === "none") return null;
   const d = new Date(iso);
@@ -78,6 +112,9 @@ Deno.serve(async () => {
         headers: fireHeaders,
         body: JSON.stringify({
           text: r.prompt,
+          account: r.account,
+          triggerKey: r.trigger_key,
+          model: effectiveModel(r),
           source: "routiner-scheduler",
           routineId: r.id,
           title: r.title,
