@@ -9,9 +9,8 @@
    ============================================================ */
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 
-const SUPABASE_URL = 'https://vonfdzttupyemtomsojy.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT';
 const TRIGGER_FN = '/.netlify/functions/claude-trigger';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
