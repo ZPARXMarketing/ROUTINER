@@ -185,3 +185,8 @@ specific to the original deployment is a small handful of values. Checklist:
 Dark-mode-first ZPARX styling: electric lime and orange accents over deep navy,
 anchored by cobalt blue. The ZPARX lockup sits top-left; lime and yellow are
 dark-surface-only accents per the brand pairing rules.
+
+## License — MIT
+
+The code is released under the [MIT License](./LICENSE). (ZPARX branding is
+exempt — see the brand note above.)
