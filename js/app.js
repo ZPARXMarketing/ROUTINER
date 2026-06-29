@@ -400,8 +400,9 @@ function bindCards() {
 /* ---------- Board (comment board / intake) ---------- */
 function noteActions(n) {
   const del = `<button class="btn btn--danger-ghost btn--sm" data-nact="delete">Delete</button>`;
-  if (n.status === 'brainstorm') return `<button class="btn btn--primary btn--sm" data-nact="activate">▶ Activate</button><button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>${del}`;
-  if (n.status === 'active') return `<button class="btn btn--secondary btn--sm" data-nact="brainstorm">⏸ Brainstorm</button><button class="btn btn--ghost btn--sm" data-nact="done">✓ Done</button>${del}`;
+  const sched = `<button class="btn btn--primary btn--sm" data-nact="schedule">⏰ Schedule</button>`;
+  if (n.status === 'brainstorm') return `<button class="btn btn--secondary btn--sm" data-nact="activate">▶ Activate</button>${sched}<button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>${del}`;
+  if (n.status === 'active') return `${sched}<button class="btn btn--secondary btn--sm" data-nact="brainstorm">⏸ Brainstorm</button><button class="btn btn--ghost btn--sm" data-nact="done">✓ Done</button>${del}`;
   return `<button class="btn btn--ghost btn--sm" data-nact="activate">↩ Reactivate</button><button class="btn btn--ghost btn--sm" data-nact="brainstorm">To brainstorm</button>${del}`;
 }
 function noteRow(n) {
@@ -449,6 +450,7 @@ function renderBoard() {
     const btn = e.target.closest('[data-nact]'); if (!btn) return;
     const id = el.dataset.id, act = btn.dataset.nact;
     if (act === 'delete') { if (await dbDeleteNote(id)) render(); return; }
+    if (act === 'schedule') { const n = notes.find((x) => x.id === id); if (n) scheduleFromNote(n); return; }
     const status = { activate: 'active', brainstorm: 'brainstorm', done: 'done', dismiss: 'dismissed' }[act];
     if (status && await dbUpdateNote(id, { status })) render();
   }));
@@ -618,6 +620,16 @@ function nowLineHtml() {
 
 /* ---------- Drawer (create / edit) ---------- */
 let editingId = null;
+let schedulingNoteId = null; // set when the drawer was opened from a Board note
+
+/* Turn a Board note into a routine: open the create drawer prefilled with the
+   note's text, and remember the note so it's marked planned once it's scheduled. */
+function scheduleFromNote(n) {
+  schedulingNoteId = n.id;
+  const title = (n.body.split('\n').find((l) => l.trim()) || 'Untitled').trim().slice(0, 60);
+  openDrawer({ title, prompt: n.body, model: settings.model, account: settings.account || DEFAULT_ACCOUNT, triggerKey: null, recurrence: 'none', durationMin: DEFAULT_DURATION_MIN, scheduledAt: null }, { forceSchedule: true });
+  drawerTitle.textContent = 'Schedule from board';
+}
 function triggerOptions(accId, selectedKey) {
   const trigs = accountTriggers(accId);
   if (!trigs.length) return `<option value="">— none yet — add in Settings —</option>`;
@@ -683,9 +695,11 @@ async function submitDrawer(action) {
   const d = readDrawer();
   if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
   const base = { title: d.title, prompt: d.prompt, model: d.model, account: d.account, triggerKey: d.triggerKey, durationMin: d.durationMin, recurrence: d.recurrence };
+  const fromNote = schedulingNoteId; // if opened from a Board note, mark it planned once handled
 
   if (action === 'library') {
     await persist(Object.assign(base, { status: 'library', scheduledAt: null }));
+    if (fromNote) await dbUpdateNote(fromNote, { status: 'planned' });
     closeDrawer(); currentView = 'library'; syncTabs(); render(); toast('Saved to Library.'); return;
   }
   if (action === 'schedule') {
@@ -695,16 +709,18 @@ async function submitDrawer(action) {
     let scheduledAt = when.toISOString();
     if (when.getTime() <= Date.now()) scheduledAt = nextOccurrence(scheduledAt, d.recurrence);
     await persist(Object.assign(base, { status: 'scheduled', scheduledAt }));
+    if (fromNote) await dbUpdateNote(fromNote, { status: 'planned' });
     // Land on the calendar, on the week the routine was scheduled into, so it's visibly there.
     closeDrawer(); calRef = new Date(scheduledAt); currentView = 'calendar'; syncTabs(); render(); toast(`Scheduled — fires ${relative(scheduledAt)}. Added to the calendar.`); return;
   }
   if (action === 'now') {
     const r = await persist(Object.assign(base, { status: 'scheduled', scheduledAt: new Date().toISOString() }));
+    if (fromNote) await dbUpdateNote(fromNote, { status: 'planned' });
     closeDrawer(); calRef = new Date(); currentView = 'calendar'; syncTabs(); render();
     if (r) await fireTrigger(r);
   }
 }
-function closeDrawer() { overlay.classList.remove('is-open'); editingId = null; }
+function closeDrawer() { overlay.classList.remove('is-open'); editingId = null; schedulingNoteId = null; }
 
 /* ---------- Settings (accounts & triggers manager) ---------- */
 let cfgModel = null; // editable deep copy of accounts (with secrets)
