@@ -601,9 +601,56 @@ function renderCalendar() {
     else calRef = addDays(calRef, a === 'next' ? 7 : -7);
     renderCalendar();
   }));
-  view.querySelectorAll('.cal__ev').forEach((el) => el.addEventListener('click', () => {
-    const r = getRoutine(el.dataset.id); if (r) openDrawer(r);
-  }));
+  // Tap a block to open it; drag it (mouse / touch / pencil) to reschedule —
+  // slide to another time and/or day, snapping to 15 min, like Apple/Google Calendar.
+  const cols = Array.from(view.querySelectorAll('.cal__day'));
+  const colHpx = (CAL.endHour - CAL.startHour) * CAL.hourPx;
+  const step = CAL.hourPx / 4; // 15-minute grid
+  const colIndexAt = (clientX) => {
+    for (let i = 0; i < cols.length; i++) { const r = cols[i].getBoundingClientRect(); if (clientX >= r.left && clientX <= r.right) return i; }
+    return clientX < cols[0].getBoundingClientRect().left ? 0 : cols.length - 1; // clamp
+  };
+  view.querySelectorAll('.cal__ev').forEach((el) => {
+    el.addEventListener('pointerdown', (e) => {
+      if (!e.isPrimary) return;
+      const id = el.dataset.id;
+      const startX = e.clientX, startY = e.clientY;
+      const blockTop = parseFloat(el.style.top) || 0;
+      const grabOffsetY = startY - (el.parentElement.getBoundingClientRect().top + blockTop);
+      const height = el.offsetHeight;
+      let dragging = false, ti = 0, topPx = blockTop;
+      el.setPointerCapture(e.pointerId);
+
+      const onMove = (ev) => {
+        if (!dragging) { if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 6) return; dragging = true; el.classList.add('cal__ev--dragging'); }
+        ev.preventDefault();
+        ti = colIndexAt(ev.clientX);
+        const colRect = cols[ti].getBoundingClientRect();
+        topPx = Math.round((ev.clientY - grabOffsetY - colRect.top) / step) * step;
+        topPx = Math.max(0, Math.min(topPx, colHpx - height));
+        if (el.parentElement !== cols[ti]) cols[ti].appendChild(el);
+        el.style.top = `${topPx}px`; el.style.left = '3px'; el.style.width = 'calc(100% - 6px)';
+      };
+      const onUp = async (ev) => {
+        try { el.releasePointerCapture(e.pointerId); } catch { /* */ }
+        el.removeEventListener('pointermove', onMove);
+        el.removeEventListener('pointerup', onUp);
+        el.removeEventListener('pointercancel', onUp);
+        const r = getRoutine(id);
+        if (!dragging) { if (r) openDrawer(r); return; } // it was a tap
+        el.classList.remove('cal__ev--dragging');
+        const minutes = Math.round(CAL.startHour * 60 + (topPx / CAL.hourPx) * 60);
+        const day = days[ti];
+        const when = new Date(day); when.setHours(0, 0, 0, 0); when.setMinutes(minutes);
+        const iso = when.toISOString();
+        if (r && iso !== r.scheduledAt) { await dbUpdate(id, Object.assign({}, r, { scheduledAt: iso })); toast(`Moved to ${fmt(iso)}.`); }
+        renderCalendar();
+      };
+      el.addEventListener('pointermove', onMove);
+      el.addEventListener('pointerup', onUp);
+      el.addEventListener('pointercancel', onUp);
+    });
+  });
   // Open scrolled to ~an hour before now so the day's in view (but night is a scroll up).
   const scrollEl = $('.cal__scroll', view);
   if (scrollEl) scrollEl.scrollTop = Math.max(0, (new Date().getHours() - 1 - CAL.startHour) * CAL.hourPx);
