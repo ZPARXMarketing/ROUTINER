@@ -624,8 +624,21 @@ function renderCalendar() {
     else calRef = addDays(calRef, a === 'next' ? 7 : -7);
     renderCalendar();
   }));
-  view.querySelectorAll('.cal__ev').forEach((el) => el.addEventListener('click', () => {
+  view.querySelectorAll('.cal__ev').forEach((el) => el.addEventListener('click', (e) => {
+    e.stopPropagation();
     const r = getRoutine(el.dataset.id); if (r) openDrawer(r);
+  }));
+  // Click empty space in a day column to create a routine at that exact day + time.
+  view.querySelectorAll('.cal__day').forEach((col, i) => col.addEventListener('click', (e) => {
+    if (e.target.closest('.cal__ev')) return; // landed on an event — its own handler opens it
+    const day = days[i]; if (!day) return;
+    const rect = col.getBoundingClientRect();
+    const offsetY = e.clientY - rect.top;
+    let mins = CAL.startHour * 60 + (offsetY / CAL.hourPx) * 60;
+    mins = Math.round(mins / 15) * 15; // snap to nearest 15 minutes
+    mins = Math.max(CAL.startHour * 60, Math.min(mins, CAL.endHour * 60 - 15));
+    const when = new Date(day); when.setHours(0, 0, 0, 0); when.setMinutes(mins);
+    openDrawer({ title: '', prompt: '', model: settings.model, taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY, account: settings.account || DEFAULT_ACCOUNT, triggerKey: null, recurrence: 'none', scheduledAt: when.toISOString() }, { forceSchedule: true });
   }));
   // Open scrolled to ~an hour before now so the day's in view (but night is a scroll up).
   const scrollEl = $('.cal__scroll', view);
@@ -647,9 +660,10 @@ function triggerOptions(accId, selectedKey) {
   return trigs.map((t) => `<option value="${t.id}" ${selectedKey === t.id ? 'selected' : ''}>${esc(t.label || '(unnamed)')}</option>`).join('');
 }
 function openDrawer(routine = null, opts = {}) {
-  editingId = routine ? routine.id : null;
-  drawerTitle.textContent = routine ? 'Edit routine' : 'New routine';
-  const r = routine || { title: '', prompt: '', model: settings.model, taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY, account: settings.account || DEFAULT_ACCOUNT, triggerKey: null, recurrence: 'none', scheduledAt: null };
+  editingId = routine && routine.id ? routine.id : null;
+  drawerTitle.textContent = editingId ? 'Edit routine' : 'New routine';
+  const defaults = { title: '', prompt: '', model: settings.model, taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY, account: settings.account || DEFAULT_ACCOUNT, triggerKey: null, recurrence: 'none', scheduledAt: null };
+  const r = Object.assign(defaults, routine || {});
   const whenVal = r.scheduledAt ? toLocalInput(new Date(r.scheduledAt)) : defaultWhen();
   const curAccount = getAccountCfg(r.account) ? r.account : (listAccounts()[0] || {}).id;
   drawerBody.innerHTML = `
