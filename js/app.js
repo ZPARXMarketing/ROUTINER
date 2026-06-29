@@ -9,9 +9,8 @@
    ============================================================ */
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 
-const SUPABASE_URL = 'https://vonfdzttupyemtomsojy.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT';
 const TRIGGER_FN = '/.netlify/functions/claude-trigger';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -30,11 +29,11 @@ const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (
    The structure lives in Supabase routiner_settings.accounts and is editable
    in Settings; `accountsCfg` is the in-memory copy (secrets stripped) used to
    render. */
-const KNOWN_LABELS = { sparks9679: 'A. Sparks9679', zparxmarketing: 'Z. Zparx Marketing' };
+const KNOWN_LABELS = { sparks9679: 'Account A', zparxmarketing: 'Account B' };
 const DEFAULT_ACCOUNT = 'sparks9679';
 const DEFAULT_ACCOUNTS = () => [
-  { id: 'sparks9679', label: 'A. Sparks9679', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
-  { id: 'zparxmarketing', label: 'Z. Zparx Marketing', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'sparks9679', label: 'Account A', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'zparxmarketing', label: 'Account B', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
 ];
 let accountsCfg = DEFAULT_ACCOUNTS();
 
