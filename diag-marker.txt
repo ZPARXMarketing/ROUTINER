@@ -1,0 +1,1 @@
+DIAGNOSTIC RUN — do NOT do any normal routine work. You are running in the ROUTINER repo (github: zparxmarketing/routiner). To confirm task-text delivery, do EXACTLY this and nothing else: (1) create 
