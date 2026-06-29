@@ -64,6 +64,10 @@ const accountLabel = (id) => { const a = getAccountCfg(id); return a ? a.label :
 const accountTriggers = (id) => (getAccountCfg(id) || {}).triggers || [];
 const triggerCfg = (accId, tId) => accountTriggers(accId).find((t) => t.id === tId);
 const triggerLabel = (accId, tId) => { const t = triggerCfg(accId, tId); return t ? t.label : ''; };
+/* The single identity letter for an account — the "A"/"Z" prefix on its label
+   (e.g. "A. Sparks9679" → "A"), falling back to the first character of the id.
+   Used to tag each color swatch in the calendar key. */
+const accountLetter = (id) => { const m = /^\s*([A-Za-z0-9])\s*[.\-·]/.exec(accountLabel(id) || ''); return (m ? m[1] : (id || '?').charAt(0)).toUpperCase(); };
 
 /* Color engine: each account is a hue family; each trigger a distinct shade
    within it — so A/B/C read as the same account, told apart by shade, and the
@@ -583,9 +587,11 @@ function renderCalendar() {
   const rangeLabel = `${weekStart.toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${weekEnd.toLocaleDateString([], { month: weekStart.getMonth() === weekEnd.getMonth() ? undefined : 'short', day: 'numeric' })}`;
 
   const legend = listAccounts().map((a) => {
+    const letter = accountLetter(a.id);
+    const sw = (c, title) => `<span class="cal__sw" title="${esc(title)}" style="background:${c.solid};color:${c.ink}">${esc(letter)}</span>`;
     const swatches = (a.triggers && a.triggers.length)
-      ? a.triggers.map((t) => `<span class="cal__sw" title="${esc(t.label)}" style="background:${triggerColor(a.id, t.id).solid}"></span>`).join('')
-      : `<span class="cal__sw" style="background:${accountColor(a.id).solid}"></span>`;
+      ? a.triggers.map((t) => sw(triggerColor(a.id, t.id), `${letter} · ${t.label}`)).join('')
+      : sw(accountColor(a.id), letter);
     return `<span class="cal__leg">${swatches}<span>${esc(a.label)}</span></span>`;
   }).join('');
 
