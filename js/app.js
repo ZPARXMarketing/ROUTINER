@@ -321,9 +321,53 @@ async function callClaude(prompt, model) {
 }
 
 /* ---------- Rendering ---------- */
+/* A reusable routine is recurring — it keeps firing, so it stays in the
+   Library/Scheduled lists forever. A one-off (recurrence 'none') is a single
+   job: once it has fired (a run logged for it) or its scheduled time has
+   elapsed, it's *past* and belongs under History, not piling up in Library or
+   Scheduled. This keeps the Library reserved for reusable/recurring routines. */
+const isRecurringRoutine = (r) => (r.recurrence || 'none') !== 'none';
+function firedRoutineIds() {
+  const s = new Set();
+  runs.forEach((x) => { if (x.routineId) s.add(x.routineId); });
+  return s;
+}
+function isPastOneOff(r, fired) {
+  if (isRecurringRoutine(r)) return false;          // recurring never goes "past"
+  if (r.lastRun) return true;                        // recorded a run
+  if (fired && fired.has(r.id)) return true;         // has an entry in routiner_runs
+  if (r.scheduledAt && new Date(r.scheduledAt).getTime() <= Date.now()) return true; // scheduled time elapsed
+  return false;
+}
+/* The History feed: every logged run, plus past one-off routines that never
+   logged a run (e.g. fired by the external trigger, or simply elapsed), so a
+   finished one-off always surfaces somewhere. Newest first. */
+function historyItems() {
+  const fired = firedRoutineIds();
+  const items = runs.map((run) => ({
+    id: 'run-' + run.id, title: run.title, status: run.status || 'ran',
+    output: run.output, time: run.firedAt, routineId: run.routineId,
+  }));
+  routines.forEach((r) => {
+    if (r.status === 'archived') return;
+    if (!isPastOneOff(r, fired)) return;
+    if (fired.has(r.id)) return;                     // already shown via its run row(s)
+    items.push({ id: 'rt-' + r.id, title: r.title || 'Untitled', status: 'ran',
+      output: r.prompt || '', time: r.scheduledAt || r.lastRun || r.updatedAt });
+  });
+  items.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
+  return items;
+}
 function counts() {
-  const c = { scheduled: 0, library: 0, archived: 0, history: runs.length, board: notes.filter((n) => n.status === 'active').length };
-  routines.forEach((r) => { c[r.status] = (c[r.status] || 0) + 1; });
+  const fired = firedRoutineIds();
+  const c = { scheduled: 0, library: 0, archived: 0, history: 0, board: notes.filter((n) => n.status === 'active').length };
+  routines.forEach((r) => {
+    if (r.status === 'archived') { c.archived++; return; }
+    if (isPastOneOff(r, fired)) return;              // counted under History below
+    if (r.status === 'scheduled') c.scheduled++;
+    else if (r.status === 'library') c.library++;
+  });
+  c.history = historyItems().length;
   return c;
 }
 function paintCounts() { const c = counts(); $$('[data-count]').forEach((el) => { el.textContent = c[el.dataset.count] ?? 0; }); }
@@ -339,7 +383,12 @@ function render() {
   if (currentView === 'board') return renderBoard();
   if (currentView === 'calendar') return renderCalendar();
   if (currentView === 'history') return renderHistory();
-  const items = routines.filter((r) => r.status === currentView).sort((a, b) =>
+  const fired = firedRoutineIds();
+  const items = routines.filter((r) => {
+    if (r.status !== currentView) return false;
+    if (currentView === 'archived') return true;
+    return !isPastOneOff(r, fired); // Library/Scheduled: past one-offs move to History
+  }).sort((a, b) =>
     currentView === 'scheduled' ? new Date(a.scheduledAt || 0) - new Date(b.scheduledAt || 0) : new Date(b.updatedAt) - new Date(a.updatedAt));
   if (!items.length) return renderEmpty();
   view.innerHTML = `<div class="grid">${items.map(card).join('')}</div>`;
@@ -349,7 +398,7 @@ function render() {
 function renderEmpty() {
   const copy = {
     scheduled: ['No routines queued', 'Create a routine and give it a time to line it up here.'],
-    library: ['Your library is empty', 'Save prompts here to iterate on, then run or schedule them anytime.'],
+    library: ['Your library is empty', 'Reserved for reusable & recurring routines. Save prompts here to run or schedule anytime — finished one-offs move to History.'],
     archived: ['Nothing archived', 'Archived routines rest here. Restore them to the library anytime.'],
   }[currentView];
   view.innerHTML = `<div class="grid"><div class="empty"><h3>${copy[0]}</h3><p>${copy[1]}</p>
@@ -478,19 +527,21 @@ function renderBoard() {
 }
 
 function renderHistory() {
-  if (!runs.length) {
-    view.innerHTML = `<div class="empty"><h3>No runs yet</h3><p>Every time a routine fires — via Run now or a live test — it lands here.</p></div>`;
+  const items = historyItems();
+  if (!items.length) {
+    view.innerHTML = `<div class="empty"><h3>No history yet</h3><p>Finished routines land here — every fired routine, live test, and elapsed one-off.</p></div>`;
     return;
   }
-  view.innerHTML = `<div class="section-head"><h2>Run history</h2></div>
-    <div class="history">${runs.map(runRow).join('')}</div>`;
+  view.innerHTML = `<div class="section-head"><h2>History</h2><span class="hint">Past &amp; completed routines</span></div>
+    <div class="history">${items.map(runRow).join('')}</div>`;
 }
-function runRow(run) {
+function runRow(it) {
+  const body = it.output ? `<div class="run__body">${esc(it.output)}</div>` : '';
   return `<div class="run"><div class="run__head">
-      <span class="chip chip--${run.status}">${run.status}</span>
-      <span class="run__title">${esc(run.title)}</span>
-      <span class="run__time">${fmt(run.firedAt)}</span>
-    </div><div class="run__body">${esc(run.output)}</div></div>`;
+      <span class="chip chip--${it.status}">${esc(it.status)}</span>
+      <span class="run__title">${esc(it.title)}</span>
+      <span class="run__time">${it.time ? fmt(it.time) : ''}</span>
+    </div>${body}</div>`;
 }
 
 /* ---------- Calendar (week plan) ---------- */
