@@ -115,7 +115,7 @@ This returns **both accounts'** scheduled blocks. Study it before planning:
 
 ```bash
 curl -s "$SUPABASE_URL/rest/v1/routiner_routines?select=user_id&limit=1" "${H_KEY[@]}"
-# (currently 1c336965-e8db-4c2a-919d-3e1e7d07fc79 — but read it, don't assume)
+# (currently <owner-user-id> — but read it, don't assume)
 ```
 
 ---
@@ -160,7 +160,7 @@ One POST per block. `scheduled_at` is ISO-8601 UTC. Set `user_id` explicitly
 curl -s -X POST "$SUPABASE_URL/rest/v1/routiner_routines" "${H_KEY[@]}" \
   -H "Content-Type: application/json" -H "Prefer: return=representation" \
   -d '{
-    "user_id": "1c336965-e8db-4c2a-919d-3e1e7d07fc79",
+    "user_id": "<owner-user-id>",
     "account": "zparxmarketing",
     "trigger_key": "<a trigger id from this account>",
     "title": "[Q3 Launch] Draft landing copy",
