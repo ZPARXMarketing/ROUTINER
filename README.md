@@ -160,11 +160,11 @@ specific to the original deployment is a small handful of values. Checklist:
       [`supabase/schema.sql`](supabase/schema.sql) — that builds every table +
       RLS policy in one go. (Then turn **off** *Authentication → Email →
       "Confirm email"* if you want instant sign-ups.)
-- [ ] **(b) Set your own `SUPABASE_URL` / publishable key** in `js/config.js`.
-      _(These values currently live inline at the top of
-      [`js/app.js`](js/app.js) and in
-      [`netlify/functions/claude-trigger.mjs`](netlify/functions/claude-trigger.mjs);
-      swap in your own project's values there.)_
+- [ ] **(b) Set your own `SUPABASE_URL` / publishable key** in `js/config.js`
+      (the client reads them from there). _(The server function
+      [`netlify/functions/claude-trigger.mjs`](netlify/functions/claude-trigger.mjs)
+      keeps its own copy at the top — swap in your project's values there too,
+      and keep the two in sync.)_
 - [ ] **(c) Deploy to Netlify** — point a new site at your fork; it serves the
       static app and the `netlify/functions/` trigger. Set any env vars from the
       Setup section you need.
