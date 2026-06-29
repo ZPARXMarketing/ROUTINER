@@ -457,7 +457,8 @@ a { color: var(--periwinkle); }
 .cal__body { display: grid; grid-template-columns: 56px repeat(7, 1fr); position: relative; padding-top: 8px; }
 .cal__gutter { position: relative; }
 .cal__hr { position: absolute; right: 7px; font-family: var(--font-mono); font-size: 9px; color: var(--text-low); transform: translateY(-50%); white-space: nowrap; }
-.cal__day { position: relative; border-left: 1px solid #1f2740; background: repeating-linear-gradient(to bottom, rgba(42,52,84,0.30) 0 1px, transparent 1px 44px); }
+.cal__day { position: relative; border-left: 1px solid #1f2740; background: repeating-linear-gradient(to bottom, rgba(42,52,84,0.30) 0 1px, transparent 1px 44px); cursor: pointer; transition: box-shadow .12s ease; }
+.cal__day:hover { box-shadow: inset 0 0 0 100vmax rgba(188,239,47,0.04); }
 
 .cal__ev { position: absolute; border-radius: 8px; padding: 4px 7px; overflow: hidden; cursor: pointer; box-sizing: border-box; border-left: 3px solid; transition: filter .12s ease, box-shadow .12s ease; }
 .cal__ev:hover { filter: brightness(1.07); z-index: 5; box-shadow: var(--shadow-md); }
