@@ -273,10 +273,10 @@ function paintFireSwitch() {
   const on = !!settings.firing;
   el.classList.toggle('is-on', on);
   el.classList.toggle('is-off', !on);
-  el.innerHTML = on ? '🟢 Firing live' : '⏸ Firing paused';
+  const lbl = $('#fireLabel'); if (lbl) lbl.textContent = on ? 'Active' : 'Inactive';
   el.title = on
-    ? 'This site WILL fire routines (Run now / immediate). Click to pause.'
-    : 'This site will NOT fire routines from here. Click to go live.';
+    ? 'This site WILL fire routines (Run now / immediate). Click to set inactive.'
+    : 'This site will NOT fire routines from here. Click to set active.';
 }
 function toggleFireSwitch() {
   settings.firing = !settings.firing;
@@ -956,8 +956,7 @@ function syncTabs() { $$('.tab').forEach((t) => t.classList.toggle('is-active', 
 
 /* ---------- Auth UI ---------- */
 function showAuth(mode = 'signin') {
-  ['#tabs'].forEach((s) => { const e = $(s); if (e) e.style.display = 'none'; });
-  ['#settingsBtn', '#signOutBtn', '#newBtn', '#userChip', '#fireSwitch'].forEach((s) => { const e = $(s); if (e) e.style.display = 'none'; });
+  ['#sidebar', '#topbar'].forEach((s) => { const e = $(s); if (e) e.style.display = 'none'; });
   const signup = mode === 'signup';
   view.innerHTML = `<div class="auth">
     <h2>${signup ? 'Create your account' : 'Sign in'}</h2>
@@ -990,11 +989,10 @@ function showAuth(mode = 'signin') {
 }
 
 function showApp() {
-  $('#tabs').style.display = '';
-  ['#settingsBtn', '#signOutBtn', '#newBtn', '#fireSwitch'].forEach((s) => { const e = $(s); if (e) e.style.display = ''; });
+  ['#sidebar', '#topbar'].forEach((s) => { const e = $(s); if (e) e.style.display = ''; });
   paintFireSwitch();
   const chip = $('#userChip');
-  if (chip) { chip.style.display = ''; chip.innerHTML = `☁ <b>${esc(session.user.email)}</b>`; }
+  if (chip) { chip.innerHTML = `☁ <b>${esc(session.user.email)}</b>`; }
   syncTabs();
   loadAll();
 }
