@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>OpenRouter Usage — Routiner</title>
   <meta name="description" content="Live OpenRouter credit + spend meter for Routiner." />
   <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
@@ -23,7 +23,7 @@
         var(--bg-void);
       color: var(--text-hi);
       min-height: 100vh;
-      padding: var(--sp-8) var(--sp-4);
+      padding: max(var(--sp-8), env(safe-area-inset-top)) var(--sp-4) var(--sp-4);
     }
     .wrap { max-width: 920px; margin: 0 auto; }
     .head { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-6); }
