@@ -151,6 +151,63 @@ Decompose the goal into discrete steps, each one a block. Good blocks:
 
 ---
 
+## 3b. Divide the labor efficiently (parallel lanes + cheap-model offload)
+
+This is the whole point of the planner: get **a lot of work done over time with
+the least wall-clock and the least cost.** Two levers:
+
+### Lever 1 — Parallel lanes (an account's triggers)
+
+Each account has several **triggers** (A/B/C…) in `routiner_settings.accounts[].triggers`.
+Each trigger fires as its own independent session, so **independent steps placed
+on different triggers run truly in parallel.** Treat the triggers as lanes and
+spread independent work across them; keep a dependent chain on whatever lane
+frees up first.
+
+Don't lay this out by hand — the repo ships a tested, deterministic packer,
+`planSchedule` in `js/schedule.js`. Give it your steps (with `dependsOn` for
+ordering), the account's trigger ids as lanes, and a start time; it returns,
+per step, **which trigger runs it and exactly when**, load-balanced and never
+starting a step before its dependencies finish:
+
+```bash
+node --input-type=module -e '
+import { planSchedule } from "./js/schedule.js";
+const tasks = [
+  { id: "draft",  durationMin: 30 },
+  { id: "imgs",   durationMin: 30 },                       // independent → runs in parallel
+  { id: "review", durationMin: 20, dependsOn: ["draft","imgs"] },
+  { id: "ship",   durationMin: 15, dependsOn: ["review"] },
+];
+const lanes = ["A","B"];                                   // trigger ids for this account
+const startMs = Date.parse("2026-07-02T14:00:00Z");
+console.log(JSON.stringify(planSchedule(tasks, lanes, { startMs, gapMin: 5 }), null, 2));
+'
+```
+
+Then map each assignment straight onto a block in step 4:
+`trigger_key = assignment.lane`, `scheduled_at = assignment.startIso`. Anything
+in the returned `unplaced` array has a missing/cyclic dependency — fix the
+`dependsOn` and re-run. Use this whenever a note decomposes into more than ~3
+steps or any steps can overlap.
+
+### Lever 2 — Offload the cheap parts to OpenRouter
+
+Inside a block's own work, hand the **cheap, high-volume sub-tasks** (bulk
+drafting, reformatting, first-pass summaries, boilerplate) to a cheaper model
+through the `dynamic-responder` edge proxy, then review and use the output. See
+the **"Offloading cheap work to OpenRouter"** section of `CLAUDE.md` for the
+exact call. You stay the orchestrator; the cheap model is a tool.
+
+> The routine's own `model` field stays a **Claude id** (or `auto`) — scheduled
+> routines execute as Claude Code sessions and the fire endpoint ignores
+> non-Claude ids. Offload happens *inside* the session via the proxy, not by
+> setting `model` to an OpenRouter id. Bake the offload instruction into the
+> block's `prompt` when a step is mostly mechanical (e.g. "draft the 20 product
+> blurbs via the OpenRouter proxy, then review and tighten each").
+
+---
+
 ## 4. Schedule each block (write)
 
 One POST per block. `scheduled_at` is ISO-8601 UTC. Set `user_id` explicitly
