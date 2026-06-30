@@ -117,11 +117,12 @@ Deno.serve(async (req: Request) => {
       });
       const data = await r.json();
       if (!r.ok) return json({ ok: false, error: data?.message || `Insert failed (HTTP ${r.status})`, detail: data }, 502);
-      return json({ ok: true, inserted: data.map((x: Record<string, unknown>) => ({ id: x.id, title: x.title, account: x.account, trigger_key: x.trigger_key, scheduled_at: x.scheduled_at })) });
+      // Bracket access on "id" dodges markdown autolinkers that mangle x.id (".id" is a TLD).
+      return json({ ok: true, inserted: data.map((x: Record<string, unknown>) => ({ id: x["id"], title: x.title, account: x.account, trigger_key: x.trigger_key, scheduled_at: x.scheduled_at })) });
     }
 
     if (action === "markNote") {
-      const id = String(body.id || "");
+      const id = String(body["id"] || "");
       const status = String(body.status || "");
       if (!id) return json({ ok: false, error: "Missing note 'id'." }, 400);
       if (!NOTE_STATUSES.has(status)) return json({ ok: false, error: "status must be planned|done|dismissed." }, 400);
