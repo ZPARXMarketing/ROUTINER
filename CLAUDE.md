@@ -27,21 +27,21 @@ cheap model won't have.
 
 **How to call it (no key needed in your session).** A routine session has no
 `OPENROUTER_API_KEY` in its environment — and it shouldn't. The key lives in
-Supabase **edge secrets** and is used only by the `routiner-openrouter` edge
-function (`supabase/functions/routiner-openrouter/index.ts`), which proxies the
-call so the key never leaves Supabase. You POST a prompt to that function with
-the **public** publishable key and get the model's text back:
+Supabase **edge secrets** and is used only by the OpenRouter proxy edge function
+(`supabase/functions/dynamic-responder/index.ts`; deployed **slug** is
+`dynamic-responder`), which proxies the call so the key never leaves Supabase.
+You POST a prompt to that function and get the model's text back:
 
 ```bash
 # Delegate a sub-task via the Supabase edge proxy; review the result before using it.
-SUPA="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-openrouter"
-ANON="sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT"   # public, safe to embed
-OUT=$(curl -s "$SUPA" \
-  -H "Authorization: Bearer $ANON" -H "apikey: $ANON" -H "Content-Type: application/json" \
-  -d '{"model":"moonshotai/kimi-k2.7-code","max_tokens":4096,
+SUPA="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/dynamic-responder"
+OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
+  -d '{"model":"moonshotai/kimi-k2.7-code","max_tokens":1024,
        "prompt":"<the sub-task prompt>"}' | jq -r '.content')
 # $OUT now holds the draft — you read it, fix/verify it, then fold it into the real work.
-# On any error the JSON is {"ok":false,"error":"…"}; if it fails, just do the work yourself.
+# Errors come back as {"ok":false,"error":"…"}; if it fails, just do the work yourself.
+# If .content is "(empty)", the model spent the budget before emitting text —
+# raise max_tokens (>=512) and/or add "Output only the answer." to the prompt.
 ```
 
 Model picks (pass as `"model"`): `moonshotai/kimi-k2.7-code` (code-adjacent),
@@ -50,9 +50,11 @@ Model picks (pass as `"model"`): `moonshotai/kimi-k2.7-code` (code-adjacent),
 deliverable — you own the final output.
 
 > Setup (one-time, human): put the key in Supabase edge secrets as
-> `OPENROUTER_API_KEY`, then deploy the function:
-> `supabase functions deploy routiner-openrouter`. Rotating the key never
-> touches this repo or any session — just update the edge secret.
+> `OPENROUTER_API_KEY` and deploy the `dynamic-responder` function (Supabase →
+> Edge Functions → editor, or `supabase functions deploy dynamic-responder`).
+> The proxy currently runs with JWT verification off, so no auth header is
+> needed. Rotating the key never touches this repo or any session — just update
+> the edge secret.
 
 ## If you're a routine session, or asked to "process the board" / "plan" / "schedule work"
 

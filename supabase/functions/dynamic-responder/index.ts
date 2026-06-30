@@ -1,4 +1,6 @@
-// routiner-openrouter — OpenRouter proxy for Routiner routine sessions.
+// dynamic-responder — OpenRouter proxy for Routiner routine sessions.
+// (Deployed slug is `dynamic-responder`; the dashboard display name may read
+//  "routiner-openrouter". The invoke URL uses the slug.)
 //
 // Why this exists: a fired Claude Code routine session has NO OpenRouter key
 // in its environment, and Supabase *edge secrets* are only readable by edge
@@ -9,9 +11,10 @@
 // Edge secret (Supabase → Project Settings → Edge Functions → Secrets):
 //   OPENROUTER_API_KEY – your sk-or-… key.
 //
-// Auth: deployed with verify_jwt=true, so the Supabase gateway requires the
-// project's publishable/anon key (already public in the app). That keeps the
-// OpenRouter key fully server-side while letting any signed app/routine call it.
+// Auth: currently deployed with verify_jwt=false, so callers need no auth
+// header. The OpenRouter key stays fully server-side regardless; spend is
+// bounded by your OpenRouter credit and MAX_TOKENS_CAP. Flip verify_jwt on to
+// require the project's publishable key if you want a tighter gate.
 //
 // Request  (POST JSON): { prompt: string, model?: string, max_tokens?: number,
 //                         system?: string, temperature?: number }
@@ -20,7 +23,8 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+// .replace strips stray angle brackets that some editors add when pasting URLs.
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions".replace(/[<>]/g, "");
 const DEFAULT_MODEL = "moonshotai/kimi-k2.7-code";
 const MAX_TOKENS_CAP = 8192; // guardrail against runaway cost
 
