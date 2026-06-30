@@ -62,15 +62,36 @@ create table if not exists public.routiner_notes (
   updated_at timestamptz not null default now()
 );
 
+-- ── OpenRouter usage ledger (written by the dynamic-responder edge proxy) ──
+-- Not per-user: the proxy is shared + unauthenticated, so rows are global and
+-- RLS is enabled with NO policy → only the service role (edge functions) reads
+-- or writes. Clients see usage through the openrouter-usage edge function.
+create table if not exists public.routiner_openrouter_usage (
+  id                uuid primary key default gen_random_uuid(),
+  created_at        timestamptz not null default now(),
+  model             text not null default '',
+  prompt_tokens     integer not null default 0,
+  completion_tokens integer not null default 0,
+  total_tokens      integer not null default 0,
+  cost              numeric(12,6) not null default 0,   -- USD, from usage.cost
+  account           text,
+  trigger_key       text,
+  source            text not null default 'dynamic-responder'
+);
+
 create index if not exists routiner_routines_user_idx on public.routiner_routines(user_id);
 create index if not exists routiner_runs_user_idx     on public.routiner_runs(user_id);
 create index if not exists routiner_notes_user_idx    on public.routiner_notes(user_id);
+create index if not exists routiner_openrouter_usage_created_idx on public.routiner_openrouter_usage(created_at desc);
+create index if not exists routiner_openrouter_usage_model_idx   on public.routiner_openrouter_usage(model);
 
 -- ── Row-level security: every user is scoped to their own rows ───────────
 alter table public.routiner_routines enable row level security;
 alter table public.routiner_runs     enable row level security;
 alter table public.routiner_settings enable row level security;
 alter table public.routiner_notes    enable row level security;
+-- No policy on routiner_openrouter_usage → service-role-only (edge functions).
+alter table public.routiner_openrouter_usage enable row level security;
 
 drop policy if exists "own routines" on public.routiner_routines;
 create policy "own routines" on public.routiner_routines

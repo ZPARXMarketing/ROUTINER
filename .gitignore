@@ -1,0 +1,6 @@
+# Local OpenRouter usage history written by scripts/usage-meter.mjs
+.cache/
+
+# Node / tooling
+node_modules/
+.DS_Store

@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenRouter Usage — Routiner</title>
+  <meta name="description" content="Live OpenRouter credit + spend meter for Routiner." />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=JetBrains+Mono:wght@400;600&family=Silkscreen:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/tokens.css" />
+  <style>
+    /* Cyberpunk-neon usage dashboard. Reuses the ZPARX tokens; standalone so it
+       can't break the main SPA. Single source of data: the openrouter-usage
+       edge function. */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--font-body, system-ui), sans-serif;
+      background:
+        radial-gradient(1200px 600px at 80% -10%, rgba(255,60,172,.10), transparent 60%),
+        radial-gradient(900px 500px at -10% 110%, rgba(60,230,255,.10), transparent 60%),
+        var(--bg-void);
+      color: var(--text-hi);
+      min-height: 100vh;
+      padding: var(--sp-8) var(--sp-4);
+    }
+    .wrap { max-width: 920px; margin: 0 auto; }
+    .head { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-6); }
+    .eyebrow {
+      font-family: var(--font-pixel, monospace); font-size: 11px; letter-spacing: .12em;
+      color: var(--cyan, #3CE6FF); text-transform: uppercase;
+      text-shadow: 0 0 12px rgba(60,230,255,.6);
+    }
+    h1 { font-family: var(--font-display), sans-serif; font-weight: 800; font-size: 30px; letter-spacing: -.01em; }
+    h1 .mag { color: #FF3CAC; text-shadow: 0 0 18px rgba(255,60,172,.55); }
+    .sub { color: var(--text-low); font-size: 13px; }
+    .refresh { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); font-size: 12px; color: var(--text-low); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--lime); box-shadow: var(--glow-lime); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+    .card {
+      background: linear-gradient(180deg, rgba(28,37,64,.7), rgba(20,27,46,.7));
+      border: 1px solid var(--hairline); border-radius: var(--r-lg);
+      padding: var(--sp-6); margin-bottom: var(--sp-4); backdrop-filter: blur(6px);
+    }
+    .label { font-family: var(--font-pixel, monospace); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-low); margin-bottom: var(--sp-3); }
+
+    /* Credit meter */
+    .meter { height: 22px; border-radius: var(--r-pill); background: rgba(0,0,0,.4); border: 1px solid var(--hairline); overflow: hidden; position: relative; }
+    .meter__fill { height: 100%; border-radius: var(--r-pill); transition: width .6s cubic-bezier(.2,.8,.2,1);
+      background: linear-gradient(90deg, #3CE6FF, #C8FF45); box-shadow: 0 0 18px rgba(200,255,69,.5); }
+    .meter__fill.warn { background: linear-gradient(90deg, #F5D33B, #FF7A33); box-shadow: 0 0 18px rgba(255,122,51,.5); }
+    .meter__fill.danger { background: linear-gradient(90deg, #FF6A1F, #FF4D5E); box-shadow: 0 0 18px rgba(255,77,94,.55); }
+    .meter__row { display: flex; justify-content: space-between; margin-top: var(--sp-3); font-family: var(--font-mono, monospace); font-size: 14px; }
+    .big { font-size: 26px; font-weight: 800; }
+    .lime { color: var(--lime); } .cyan { color: #3CE6FF; } .mag { color: #FF3CAC; } .low { color: var(--text-low); }
+
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--sp-3); }
+    @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
+    .stat { background: rgba(12,17,31,.6); border: 1px solid var(--hairline); border-radius: var(--r-md); padding: var(--sp-4); }
+    .stat__k { font-family: var(--font-pixel, monospace); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-low); }
+    .stat__v { font-family: var(--font-mono, monospace); font-size: 22px; font-weight: 600; margin-top: 6px; }
+    .stat__m { font-size: 12px; color: var(--text-low); margin-top: 2px; }
+
+    table { width: 100%; border-collapse: collapse; font-family: var(--font-mono, monospace); font-size: 13px; }
+    th { text-align: left; font-family: var(--font-pixel, monospace); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-low); padding: 6px 8px; border-bottom: 1px solid var(--hairline); }
+    td { padding: 7px 8px; border-bottom: 1px solid rgba(42,52,84,.4); }
+    td.r, th.r { text-align: right; }
+    .modelbar { display: inline-block; height: 8px; border-radius: 4px; background: linear-gradient(90deg, #FF3CAC, #3CE6FF); box-shadow: 0 0 10px rgba(60,230,255,.4); vertical-align: middle; }
+    .pill { font-size: 11px; color: var(--text-low); }
+    .err { color: var(--danger); font-family: var(--font-mono, monospace); }
+    .foot { text-align: center; color: var(--text-low); font-size: 12px; margin-top: var(--sp-6); }
+    code { background: rgba(0,0,0,.35); padding: 1px 6px; border-radius: 4px; color: var(--periwinkle); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div>
+        <div class="eyebrow">Routiner · OpenRouter</div>
+        <h1><span class="mag">◆</span> Usage Meter</h1>
+        <div class="sub">Live credits &amp; per-call spend, straight from the edge proxy.</div>
+      </div>
+      <div class="refresh"><span class="dot"></span> <span id="refreshLbl">live</span></div>
+    </div>
+
+    <div id="content"><div class="card low">Loading usage…</div></div>
+
+    <div class="foot">
+      Data: <code>openrouter-usage</code> edge function · same numbers as
+      <code>node scripts/usage-meter.mjs</code>. Auto-refreshes every 60s.
+    </div>
+  </div>
+
+  <script type="module">
+    const DEFAULT_URL = "https://vonfdzttupyemtomsojy.supabase.co/functions/v1/openrouter-usage";
+    // Allow ?url= override for testing against another deployment.
+    const URL_ = new URLSearchParams(location.search).get("url") || DEFAULT_URL;
+    const $ = (id) => document.getElementById(id);
+
+    const usd = (n) => `$${(Number(n) || 0).toFixed(Number(n) && Math.abs(n) < 1 ? 4 : 2)}`;
+    const num = (n) => (Number(n) || 0).toLocaleString("en-US");
+    const ago = (iso) => {
+      const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+      if (s < 60) return `${Math.floor(s)}s`;
+      if (s < 3600) return `${Math.floor(s / 60)}m`;
+      if (s < 86400) return `${Math.floor(s / 3600)}h`;
+      return `${Math.floor(s / 86400)}d`;
+    };
+    const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+    function creditCard(k) {
+      if (!k) return `<div class="card"><div class="label">Credits</div><div class="low">Live balance unavailable — key not set or OpenRouter unreachable.</div></div>`;
+      let inner;
+      if (k.limit != null && k.limit > 0) {
+        const frac = Math.max(0, Math.min(1, (k.usage || 0) / k.limit));
+        const cls = frac >= 0.9 ? "danger" : frac >= 0.7 ? "warn" : "";
+        inner = `
+          <div class="meter"><div class="meter__fill ${cls}" style="width:${(frac * 100).toFixed(1)}%"></div></div>
+          <div class="meter__row">
+            <span><span class="big lime">${usd(k.usage)}</span> <span class="low">of ${usd(k.limit)}</span></span>
+            <span class="cyan">${usd(k.limit_remaining)} <span class="low">left</span></span>
+          </div>`;
+      } else {
+        inner = `<div class="meter__row"><span><span class="big lime">${usd(k.usage)}</span> <span class="low">used · pay-as-you-go (no limit set)</span></span></div>`;
+      }
+      return `<div class="card"><div class="label">Credits${k.is_free_tier ? " · free tier" : ""}</div>${inner}</div>`;
+    }
+
+    function statsCard(t, k) {
+      const cell = (key, b) => `<div class="stat"><div class="stat__k">${key}</div><div class="stat__v lime">${usd(b?.cost)}</div><div class="stat__m">${num(b?.tokens)} tok · ${b?.calls ?? 0} calls</div></div>`;
+      const life = k ? `<div class="stat"><div class="stat__k">lifetime</div><div class="stat__v">${usd(k.usage)}</div><div class="stat__m">on this key</div></div>` : "";
+      return `<div class="card"><div class="label">Spend</div><div class="grid">${cell("today", t?.today)}${cell("this month", t?.month)}${life}</div></div>`;
+    }
+
+    function modelCard(rows) {
+      if (!rows?.length) return "";
+      const max = Math.max(...rows.map((m) => m.cost), 1e-6);
+      const body = rows.slice(0, 8).map((m) => `
+        <tr>
+          <td>${esc(m.model)}</td>
+          <td><span class="modelbar" style="width:${Math.max(6, (m.cost / max) * 160)}px"></span></td>
+          <td class="r lime">${usd(m.cost)}</td>
+          <td class="r low">${num(m.tokens)}</td>
+          <td class="r pill">${m.calls}×</td>
+        </tr>`).join("");
+      return `<div class="card"><div class="label">By model · this month</div><table><thead><tr><th>Model</th><th></th><th class="r">Cost</th><th class="r">Tokens</th><th class="r">Calls</th></tr></thead><tbody>${body}</tbody></table></div>`;
+    }
+
+    function recentCard(rows) {
+      if (!rows?.length) return `<div class="card"><div class="label">Recent</div><div class="low">No calls logged yet — fire a routine that offloads to OpenRouter.</div></div>`;
+      const body = rows.slice(0, 12).map((r) => `
+        <tr>
+          <td class="low">${ago(r.created_at)} ago</td>
+          <td>${esc(r.model)}</td>
+          <td class="r cyan">${num(r.total_tokens)}</td>
+          <td class="r lime">${usd(r.cost)}</td>
+          <td class="r pill">${esc(r.account || "")}</td>
+        </tr>`).join("");
+      return `<div class="card"><div class="label">Recent calls</div><table><thead><tr><th>When</th><th>Model</th><th class="r">Tokens</th><th class="r">Cost</th><th class="r">Acct</th></tr></thead><tbody>${body}</tbody></table></div>`;
+    }
+
+    async function load() {
+      try {
+        const res = await fetch(URL_, { headers: { accept: "application/json" } });
+        const d = await res.json();
+        if (!res.ok || d.ok === false) throw new Error(d.error || `HTTP ${res.status}`);
+        $("content").innerHTML = creditCard(d.key) + statsCard(d.totals, d.key) + modelCard(d.by_model) + recentCard(d.recent);
+        $("refreshLbl").textContent = "updated " + new Date().toLocaleTimeString();
+      } catch (e) {
+        $("content").innerHTML = `<div class="card"><div class="label">Error</div><div class="err">✗ ${esc(e.message)}</div><div class="low" style="margin-top:8px">Deploy the <code>openrouter-usage</code> function and set <code>OPENROUTER_API_KEY</code> in edge secrets.</div></div>`;
+        $("refreshLbl").textContent = "error";
+      }
+    }
+    load();
+    setInterval(load, 60000);
+  </script>
+</body>
+</html>
