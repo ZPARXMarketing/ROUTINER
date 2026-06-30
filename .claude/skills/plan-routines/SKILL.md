@@ -36,87 +36,57 @@ for the other one. Never edit or delete the other account's blocks.
 
 ---
 
-## 1. Connection + auth
+## 1. Connection + auth (the admin proxy)
 
-The planner is Supabase project `vonfdzttupyemtomsojy`:
-
-```
-SUPABASE_URL=https://vonfdzttupyemtomsojy.supabase.co
-```
-
-Reads and writes go through the Supabase REST API. Because routines are
-row-level-secured per user, an automated session must authenticate with the
-**service-role key**, provided to this session as a secret env var:
-
-```
-SUPABASE_SERVICE_ROLE_KEY=<set in the routine session's environment / secrets>
-```
-
-> Get it from Supabase → Project Settings → API → `service_role` key. It is
-> powerful (bypasses RLS). Keep it only in the session's secret store — never
-> echo it, never commit it, never put it in a routine `prompt`.
-
-**If `SUPABASE_SERVICE_ROLE_KEY` is not set**, do not fail and do not guess a
-key. Produce the plan as a markdown table (title · account · when · repeat ·
-prompt) for the human to apply, say the key is missing, and stop.
-
-Common headers (reuse for every call):
+The `routiner_*` tables are row-level-secured per user, and a fired routine
+session has **no Supabase key** in its environment. So reads and writes go
+through a Supabase **edge function**, `routiner-admin`, which holds the
+service-role key inside Supabase (auto-injected; never exposed) and exposes only
+the three operations this skill needs. You call it with the **public**
+publishable key:
 
 ```bash
-H_KEY=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY")
+ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
+ANON="sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT"   # public, safe to embed
+A=(-H "Authorization: Bearer $ANON" -H "apikey: $ANON" -H "Content-Type: application/json")
 ```
+
+Operations (all return JSON `{ ok: true, ... }` or `{ ok: false, error }`):
+
+| action | call | does |
+|--------|------|------|
+| `context` | `{"action":"context"}` | one read: `ownerUserId`, `activeNotes`, `scheduled` (both accounts), `accounts` (triggers) |
+| `schedule` | `{"action":"schedule","blocks":[…]}` | inserts routine blocks (status forced `scheduled`) |
+| `markNote` | `{"action":"markNote","id":"…","status":"planned"}` | sets a note to `planned`/`done`/`dismissed` |
+
+**If `routiner-admin` is unreachable** (404 / `ok:false`), do not guess another
+auth path. Produce the plan as a markdown table (title · account · when · repeat
+· prompt) for the human to apply, say the proxy is missing, and stop.
 
 ---
 
-## 1b. Read the board (the intake)
-
-The app has a **Board** where the human drops tasks/ideas/context as notes
-(`routiner_notes`, status `active | brainstorm | planned | done | dismissed`).
-Only **active** notes are your work queue — `brainstorm` notes are still being
-thought through, so **leave them alone**. Read the active ones first:
+## 2. Read everything first (one `context` call)
 
 ```bash
-curl -s "$SUPABASE_URL/rest/v1/routiner_notes?select=id,body,status&status=eq.active&order=created_at" "${H_KEY[@]}"
+curl -s "$ADMIN" "${A[@]}" -d '{"action":"context"}'
 ```
 
-> Never plan or act on a `brainstorm` note. The human activates a note when it's
-> ready for you.
+That single call returns all the inputs you need:
 
-For each active note, decide:
+- **`activeNotes`** — the Board intake (`routiner_notes`, status `active`). These
+  are your work queue. The app also has `brainstorm` notes; the proxy never
+  returns them, because **you must never plan or act on a brainstorm note** — the
+  human activates a note when it's ready for you.
+- **`scheduled`** — **both accounts'** scheduled blocks. Study before planning:
+  what times is *your* account already busy? What is the *other* account doing
+  (running concurrently is fine — that's the point — just don't accidentally make
+  the day lopsided)?
+- **`accounts`** — each account and its **triggers** (the parallel lanes; see §3b).
+- **`ownerUserId`** — handled server-side on writes; you don't pass it.
 
-- **Simple / one-shot?** Just do it now (or schedule a single block today).
-- **Multi-step?** Decompose it into a sequence of blocks across the right
-  horizon (an hour → a week) so everything gets done in order.
-
-After you've turned a note into scheduled blocks, mark it so it isn't re-planned:
-
-```bash
-curl -s -X PATCH "$SUPABASE_URL/rest/v1/routiner_notes?id=eq.<note-id>" "${H_KEY[@]}" \
-  -H "Content-Type: application/json" -d '{"status":"planned"}'
-# use "done" instead if you fully handled it on the spot
-```
-
----
-
-## 2. Look at the app first (read the whole schedule)
-
-```bash
-curl -s "$SUPABASE_URL/rest/v1/routiner_routines?select=id,title,account,status,recurrence,scheduled_at&status=eq.scheduled&order=scheduled_at" "${H_KEY[@]}"
-```
-
-This returns **both accounts'** scheduled blocks. Study it before planning:
-
-- What times are already busy for **your** account? Avoid stacking your own
-  blocks on top of each other unless you mean to.
-- What is the **other** account doing? You may intentionally run concurrently
-  with it (the two Claudes working in parallel is the whole point) — just be
-  aware of it so the day isn't accidentally lopsided.
-- Grab the owner `user_id` you'll need for inserts from any existing row:
-
-```bash
-curl -s "$SUPABASE_URL/rest/v1/routiner_routines?select=user_id&limit=1" "${H_KEY[@]}"
-# (currently <owner-user-id> — but read it, don't assume)
-```
+For each active note decide: **simple/one-shot** → do it now or one block today;
+**multi-step** → decompose into a sequence across the right horizon (an hour → a
+week) so everything gets done in order.
 
 ---
 
@@ -131,20 +101,19 @@ Decompose the goal into discrete steps, each one a block. Good blocks:
 - **Sequenced by time.** For "events in succession", order steps by
   `scheduled_at`. If step B needs step A's output, schedule B later AND say so
   in B's prompt ("read the summary step A wrote to …").
-- **Project-tagged titles.** Prefix every title with the project in brackets so
-  the shape is obvious on the calendar and to the other Claude:
+- **Project-tagged titles.** Prefix every title with the project in brackets:
   `"[Q3 Launch] Draft landing copy"`.
-- **Right cadence.** `recurrence` ∈ `none | daily | weekdays | weekly`. Use
-  recurring blocks for standing work (a daily digest), one-offs for milestones.
-- **Realistic spacing.** Leave buffer between your own dependent steps; don't
-  schedule a step in the past.
+- **Right cadence.** `recurrence` ∈ `none | daily | weekdays | weekly`. Recurring
+  blocks for standing work; one-offs for milestones.
+- **Realistic spacing.** Leave buffer between your own dependent steps; never
+  schedule in the past.
 
 ### Coordination contract (how the two Claudes stay "in unison")
 
-1. Read the full table first (step 2) — every time.
+1. Read the full `context` first — every time.
 2. Write only under your own `account`.
 3. Concurrency across accounts is allowed; collisions within your own account
-   are not — stagger your own blocks.
+   are not — stagger your own blocks (or spread them across lanes, §3b).
 4. Shared milestones: if both accounts must hit the same moment, each schedules
    its own block at that time under its own account.
 5. Treat the other account's blocks as read-only facts to plan around.
@@ -158,11 +127,11 @@ the least wall-clock and the least cost.** Two levers:
 
 ### Lever 1 — Parallel lanes (an account's triggers)
 
-Each account has several **triggers** (A/B/C…) in `routiner_settings.accounts[].triggers`.
-Each trigger fires as its own independent session, so **independent steps placed
-on different triggers run truly in parallel.** Treat the triggers as lanes and
-spread independent work across them; keep a dependent chain on whatever lane
-frees up first.
+Each account has several **triggers** (A/B/C…) in the `accounts` you read from
+`context`. Each trigger fires as its own independent session, so **independent
+steps placed on different triggers run truly in parallel.** Treat the triggers
+as lanes; spread independent work across them and keep a dependent chain on
+whatever lane frees up first.
 
 Don't lay this out by hand — the repo ships a tested, deterministic packer,
 `planSchedule` in `js/schedule.js`. Give it your steps (with `dependsOn` for
@@ -185,7 +154,7 @@ console.log(JSON.stringify(planSchedule(tasks, lanes, { startMs, gapMin: 5 }), n
 '
 ```
 
-Then map each assignment straight onto a block in step 4:
+Then map each assignment straight onto a block in §4:
 `trigger_key = assignment.lane`, `scheduled_at = assignment.startIso`. Anything
 in the returned `unplaced` array has a missing/cyclic dependency — fix the
 `dependsOn` and re-run. Use this whenever a note decomposes into more than ~3
@@ -208,62 +177,67 @@ exact call. You stay the orchestrator; the cheap model is a tool.
 
 ---
 
-## 4. Schedule each block (write)
+## 4. Schedule the blocks (one `schedule` call)
 
-One POST per block. `scheduled_at` is ISO-8601 UTC. Set `user_id` explicitly
-(service-role has no `auth.uid()` to default it).
+Send all blocks for a project in a single call. The proxy fills NOT-NULL
+defaults (`model:auto`, `recurrence:none`, `task_type:general`,
+`complexity:medium`, `duration_min:30`), forces `status:scheduled`, and sets
+`user_id` server-side. You provide the rest:
 
 ```bash
-curl -s -X POST "$SUPABASE_URL/rest/v1/routiner_routines" "${H_KEY[@]}" \
-  -H "Content-Type: application/json" -H "Prefer: return=representation" \
-  -d '{
-    "user_id": "<owner-user-id>",
-    "account": "zparxmarketing",
-    "trigger_key": "<a trigger id from this account>",
-    "title": "[Q3 Launch] Draft landing copy",
-    "prompt": "Write first-draft landing page copy for the Q3 launch. Pull positioning from docs/positioning.md, write the draft to drafts/landing-{{date}}.md, and list 3 open questions at the end.",
-    "status": "scheduled",
-    "scheduled_at": "2026-07-01T14:00:00.000Z",
-    "recurrence": "none",
-    "model": "claude-sonnet-4-6"
-  }'
+curl -s "$ADMIN" "${A[@]}" -d '{
+  "action": "schedule",
+  "blocks": [
+    {
+      "account": "zparxmarketing",
+      "trigger_key": "A",
+      "title": "[Q3 Launch] Draft landing copy",
+      "prompt": "Write first-draft landing page copy for the Q3 launch. Pull positioning from docs/positioning.md, write the draft to drafts/landing-{{date}}.md, list 3 open questions at the end.",
+      "scheduled_at": "2026-07-01T14:00:00.000Z",
+      "recurrence": "none",
+      "model": "claude-sonnet-4-6",
+      "duration_min": 30
+    }
+  ]
+}'
 ```
 
-Field notes:
+Per-block fields:
 
 | field | value |
 |-------|-------|
-| `user_id` | the owner uuid from step 2 |
-| `account` | **your** account id (`sparks9679` or `zparxmarketing`, or any user-defined one) |
-| `trigger_key` | which trigger (instance) within that account fires it — an id from `routiner_settings.accounts[].triggers[].id`. Omit/null to use the account's first trigger. |
-| `title` | `[Project] Step` |
-| `prompt` | self-contained task for the future session |
-| `status` | `scheduled` (so it shows on the Calendar) |
+| `account` | **your** account id (`sparks9679` / `zparxmarketing`, or any user-defined one) — required |
+| `trigger_key` | which trigger (lane) fires it, from `accounts[].triggers[].id`. Omit/null → the account's first trigger |
+| `title` | `[Project] Step` — required |
+| `prompt` | self-contained task for the future session — required |
 | `scheduled_at` | ISO-8601 UTC, in the future |
 | `recurrence` | `none` / `daily` / `weekdays` / `weekly` |
-| `model` | `claude-opus-4-8` / `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` |
+| `model` | `claude-opus-4-8` / `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` / `auto` |
+| `duration_min` | block length in minutes (drives the calendar block height) |
 
-> **Accounts now hold multiple triggers.** Each account in `routiner_settings.accounts`
-> has a `triggers` list (A/B/C…), each its own Fire URL + token. Spreading a
-> project's steps across several triggers of one account lets them run truly in
-> parallel. Read the accounts structure first to pick valid `trigger_key`s.
+Then mark each note you turned into blocks so it isn't re-planned:
+
+```bash
+curl -s "$ADMIN" "${A[@]}" -d '{"action":"markNote","id":"<note-id>","status":"planned"}'
+# use "done" if you fully handled it on the spot
+```
 
 ---
 
 ## 5. Verify
 
-Re-read the schedule (step 2) and confirm your new blocks are present at the
-intended times and account. Then summarize the plan back to the human:
-project name, number of blocks, the span of dates, and any intentional overlaps
-with the other account. The blocks now appear on the Calendar tab in their
-account color.
+Re-read `context` and confirm your new blocks are present at the intended times
+and account, and that the notes you handled are no longer `active`. Then
+summarize the plan back to the human: project name, number of blocks, the span
+of dates, lanes used, and any intentional overlaps with the other account. The
+blocks now appear on the Calendar tab in their account color.
 
 ---
 
 ## Guardrails
 
 - Never schedule in the past, and never double-book your own account by accident.
-- Don't touch the other account's rows.
-- Don't echo, log, or embed `SUPABASE_SERVICE_ROLE_KEY` anywhere.
-- If anything required is missing (key, owner id), output the plan as a proposal
-  for the human and stop — don't partially apply.
+- Don't touch the other account's rows (only ever `schedule` under your account).
+- Only call `markNote` for notes you actually turned into blocks.
+- If `routiner-admin` is unreachable, output the plan as a proposal for the human
+  and stop — don't partially apply.
