@@ -133,8 +133,60 @@ supabase/migrations/                   # incremental migrations (schema + cron)
 assets/           # ZPARX lockup logo + favicon
 ```
 
+## Contributing
+
+Contributions are welcome. The app is intentionally small — a single-page ES
+module (`js/app.js`), a couple of Netlify functions, and a Supabase schema —
+so changes are easy to reason about.
+
+- **Open an issue first** for anything non-trivial, so we can agree on the
+  approach before you write code.
+- **Branch off `dev`** (not `main`) and open your pull request against `dev`.
+  `main` is the production branch that auto-deploys to Netlify.
+- **Keep PRs focused** — one logical change per PR, with a short description of
+  what and why.
+- **Never commit secrets.** Only the publishable (anon) Supabase key belongs in
+  the client; service-role keys and Claude tokens stay in Netlify / Supabase
+  env vars (see the Setup section). When in doubt, leave it out.
+- Match the surrounding style; there's no build step or linter to satisfy —
+  just plain, readable JS/CSS.
+
+## Make it yours (forking)
+
+Want to run your own instance? The app is built to be forked — everything
+specific to the original deployment is a small handful of values. Checklist:
+
+- [ ] **(a) Create a Supabase project** and, in its **SQL editor**, paste
+      [`supabase/schema.sql`](supabase/schema.sql) — that builds every table +
+      RLS policy in one go. (Then turn **off** *Authentication → Email →
+      "Confirm email"* if you want instant sign-ups.)
+- [ ] **(b) Set your own `SUPABASE_URL` / publishable key** in `js/config.js`
+      (the client reads them from there). _(The server function
+      [`netlify/functions/claude-trigger.mjs`](netlify/functions/claude-trigger.mjs)
+      keeps its own copy at the top — swap in your project's values there too,
+      and keep the two in sync.)_
+- [ ] **(c) Deploy to Netlify** — point a new site at your fork; it serves the
+      static app and the `netlify/functions/` trigger. Set any env vars from the
+      Setup section you need.
+- [ ] **(d) Add your Claude trigger** — sign in to your deployed app, open
+      **⚙ Settings**, and paste each account's **Fire URL + token** under
+      "Claude accounts" (or set `CLAUDE_TRIGGER` / `CLAUDE_TOKEN` as Netlify env
+      vars).
+
+> **Branding belongs to the original author.** The **ZPARX** name, the lockup
+> logo in [`assets/`](assets/), and the design tokens in
+> [`css/tokens.css`](css/tokens.css) are the original author's brand and are
+> **not** covered by the code license. If you fork this, please **rebrand** —
+> replace the logo and tokens with your own, and drop the ZPARX name from the
+> UI and copy.
+
 ## Brand
 
 Dark-mode-first ZPARX styling: electric lime and orange accents over deep navy,
 anchored by cobalt blue. The ZPARX lockup sits top-left; lime and yellow are
 dark-surface-only accents per the brand pairing rules.
+
+## License — MIT
+
+The code is released under the [MIT License](./LICENSE). (ZPARX branding is
+exempt — see the brand note above.)

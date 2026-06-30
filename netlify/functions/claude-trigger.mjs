@@ -42,6 +42,8 @@ const BETA = process.env.CLAUDE_ROUTINE_BETA || 'experimental-cc-routine-2026-04
 const VERSION = '2023-06-01';
 
 // Public Supabase project values (anon key is safe to expose).
+// FORKING? Replace these with your own Supabase project URL + publishable (anon) key
+// (Supabase > Project Settings > API) — keep them in sync with js/config.js.
 const SUPABASE_URL = 'https://vonfdzttupyemtomsojy.supabase.co';
 const SUPABASE_ANON = 'sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT';
 

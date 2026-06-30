@@ -26,7 +26,6 @@ a { color: var(--periwinkle); }
 .content {
   min-width: 0;
   padding: var(--sp-6) var(--sp-6) var(--sp-24);
-  max-width: 1180px;
 }
 
 /* ── Sidebar (navigation table) ────────────────── */
@@ -34,12 +33,13 @@ a { color: var(--periwinkle); }
   display: flex;
   flex-direction: column;
   gap: var(--sp-6);
-  padding: var(--sp-6) var(--sp-4);
+  padding: var(--sp-5) var(--sp-4) var(--sp-4);
   border-right: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
   position: sticky;
   top: 0;
   height: 100vh;
+  height: 100dvh; /* exclude mobile browser chrome so the Account group stays in view */
   overflow-y: auto;
 }
 .sidebar__group { display: flex; flex-direction: column; gap: var(--sp-2); }
@@ -63,8 +63,17 @@ a { color: var(--periwinkle); }
   padding: var(--sp-2) 0 var(--sp-6);
   flex-wrap: wrap;
 }
-.brand { display: flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-2); }
-.brand__logo { height: 30px; width: auto; display: block; }
+.brand { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; padding: 0 var(--sp-2); min-width: 0; }
+.brand__logo { height: 26px; width: auto; max-width: 100%; display: block; }
+.brand__wordmark {
+  font-family: var(--font-pixel);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--orange-bright);
+  line-height: 1;
+}
 .brand__divider {
   width: 1px; height: 30px; background: var(--hairline); margin: 0 var(--sp-1);
 }
@@ -553,8 +562,9 @@ a { color: var(--periwinkle); }
 .cal__day { position: relative; border-left: 1px solid #1f2740; background: repeating-linear-gradient(to bottom, rgba(42,52,84,0.30) 0 1px, transparent 1px 44px); cursor: pointer; transition: box-shadow .12s ease; }
 .cal__day:hover { box-shadow: inset 0 0 0 100vmax rgba(188,239,47,0.04); }
 
-.cal__ev { position: absolute; border-radius: 8px; padding: 4px 7px; overflow: hidden; cursor: pointer; box-sizing: border-box; border-left: 3px solid; transition: filter .12s ease, box-shadow .12s ease; }
+.cal__ev { position: absolute; border-radius: 8px; padding: 4px 7px; overflow: hidden; cursor: grab; box-sizing: border-box; border-left: 3px solid; touch-action: none; user-select: none; -webkit-user-select: none; transition: filter .12s ease, box-shadow .12s ease; }
 .cal__ev:hover { filter: brightness(1.07); z-index: 5; box-shadow: var(--shadow-md); }
+.cal__ev--dragging { z-index: 50; cursor: grabbing; opacity: 0.92; box-shadow: 0 10px 26px rgba(0,0,0,0.5); transition: none; filter: brightness(1.08); }
 .cal__ev--past { opacity: 0.5; }
 .cal__ev-title { font-family: var(--font-body); font-weight: 600; font-size: 11px; line-height: 1.1; overflow: hidden; text-overflow: ellipsis; }
 .cal__ev-time { font-family: var(--font-mono); font-weight: 600; font-size: 9px; margin-top: 2px; opacity: 0.72; }

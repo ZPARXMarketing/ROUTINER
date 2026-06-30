@@ -9,13 +9,12 @@
    ============================================================ */
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 import {
   MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
   effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel,
 } from './model-router.js';
 
-const SUPABASE_URL = 'https://vonfdzttupyemtomsojy.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT';
 const TRIGGER_FN = '/.netlify/functions/claude-trigger';
 /* The production site. Only this host defaults the master fire switch to live;
    preview/branch/dev deploys default to paused so they don't fire by accident. */
@@ -30,11 +29,11 @@ const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (
    The structure lives in Supabase routiner_settings.accounts and is editable
    in Settings; `accountsCfg` is the in-memory copy (secrets stripped) used to
    render. */
-const KNOWN_LABELS = { sparks9679: 'A. Sparks9679', zparxmarketing: 'Z. Zparx Marketing' };
+const KNOWN_LABELS = { sparks9679: 'Account A', zparxmarketing: 'Account B' };
 const DEFAULT_ACCOUNT = 'sparks9679';
 const DEFAULT_ACCOUNTS = () => [
-  { id: 'sparks9679', label: 'A. Sparks9679', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
-  { id: 'zparxmarketing', label: 'Z. Zparx Marketing', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'sparks9679', label: 'Account A', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'zparxmarketing', label: 'Account B', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
 ];
 let accountsCfg = DEFAULT_ACCOUNTS();
 
@@ -472,8 +471,9 @@ function bindCards() {
 /* ---------- Board (comment board / intake) ---------- */
 function noteActions(n) {
   const del = `<button class="btn btn--danger-ghost btn--sm" data-nact="delete">Delete</button>`;
-  if (n.status === 'brainstorm') return `<button class="btn btn--primary btn--sm" data-nact="activate">▶ Activate</button><button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>${del}`;
-  if (n.status === 'active') return `<button class="btn btn--secondary btn--sm" data-nact="brainstorm">⏸ Brainstorm</button><button class="btn btn--ghost btn--sm" data-nact="done">✓ Done</button>${del}`;
+  const sched = `<button class="btn btn--primary btn--sm" data-nact="schedule">⏰ Schedule</button>`;
+  if (n.status === 'brainstorm') return `<button class="btn btn--secondary btn--sm" data-nact="activate">▶ Activate</button>${sched}<button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>${del}`;
+  if (n.status === 'active') return `${sched}<button class="btn btn--secondary btn--sm" data-nact="brainstorm">⏸ Brainstorm</button><button class="btn btn--ghost btn--sm" data-nact="done">✓ Done</button>${del}`;
   return `<button class="btn btn--ghost btn--sm" data-nact="activate">↩ Reactivate</button><button class="btn btn--ghost btn--sm" data-nact="brainstorm">To brainstorm</button>${del}`;
 }
 function noteRow(n) {
@@ -521,6 +521,7 @@ function renderBoard() {
     const btn = e.target.closest('[data-nact]'); if (!btn) return;
     const id = el.dataset.id, act = btn.dataset.nact;
     if (act === 'delete') { if (await dbDeleteNote(id)) render(); return; }
+    if (act === 'schedule') { const n = notes.find((x) => x.id === id); if (n) scheduleFromNote(n); return; }
     const status = { activate: 'active', brainstorm: 'brainstorm', done: 'done', dismiss: 'dismissed' }[act];
     if (status && await dbUpdateNote(id, { status })) render();
   }));
@@ -675,10 +676,56 @@ function renderCalendar() {
     else calRef = addDays(calRef, a === 'next' ? 7 : -7);
     renderCalendar();
   }));
-  view.querySelectorAll('.cal__ev').forEach((el) => el.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const r = getRoutine(el.dataset.id); if (r) openDrawer(r);
-  }));
+  // Tap a block to open it; drag it (mouse / touch / pencil) to reschedule —
+  // slide to another time and/or day, snapping to 15 min, like Apple/Google Calendar.
+  const cols = Array.from(view.querySelectorAll('.cal__day'));
+  const colHpx = (CAL.endHour - CAL.startHour) * CAL.hourPx;
+  const step = CAL.hourPx / 4; // 15-minute grid
+  const colIndexAt = (clientX) => {
+    for (let i = 0; i < cols.length; i++) { const r = cols[i].getBoundingClientRect(); if (clientX >= r.left && clientX <= r.right) return i; }
+    return clientX < cols[0].getBoundingClientRect().left ? 0 : cols.length - 1; // clamp
+  };
+  view.querySelectorAll('.cal__ev').forEach((el) => {
+    el.addEventListener('pointerdown', (e) => {
+      if (!e.isPrimary) return;
+      const id = el.dataset.id;
+      const startX = e.clientX, startY = e.clientY;
+      const blockTop = parseFloat(el.style.top) || 0;
+      const grabOffsetY = startY - (el.parentElement.getBoundingClientRect().top + blockTop);
+      const height = el.offsetHeight;
+      let dragging = false, ti = 0, topPx = blockTop;
+      el.setPointerCapture(e.pointerId);
+
+      const onMove = (ev) => {
+        if (!dragging) { if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 6) return; dragging = true; el.classList.add('cal__ev--dragging'); }
+        ev.preventDefault();
+        ti = colIndexAt(ev.clientX);
+        const colRect = cols[ti].getBoundingClientRect();
+        topPx = Math.round((ev.clientY - grabOffsetY - colRect.top) / step) * step;
+        topPx = Math.max(0, Math.min(topPx, colHpx - height));
+        if (el.parentElement !== cols[ti]) cols[ti].appendChild(el);
+        el.style.top = `${topPx}px`; el.style.left = '3px'; el.style.width = 'calc(100% - 6px)';
+      };
+      const onUp = async (ev) => {
+        try { el.releasePointerCapture(e.pointerId); } catch { /* */ }
+        el.removeEventListener('pointermove', onMove);
+        el.removeEventListener('pointerup', onUp);
+        el.removeEventListener('pointercancel', onUp);
+        const r = getRoutine(id);
+        if (!dragging) { if (r) openDrawer(r); return; } // it was a tap
+        el.classList.remove('cal__ev--dragging');
+        const minutes = Math.round(CAL.startHour * 60 + (topPx / CAL.hourPx) * 60);
+        const day = days[ti];
+        const when = new Date(day); when.setHours(0, 0, 0, 0); when.setMinutes(minutes);
+        const iso = when.toISOString();
+        if (r && iso !== r.scheduledAt) { await dbUpdate(id, Object.assign({}, r, { scheduledAt: iso })); toast(`Moved to ${fmt(iso)}.`); }
+        renderCalendar();
+      };
+      el.addEventListener('pointermove', onMove);
+      el.addEventListener('pointerup', onUp);
+      el.addEventListener('pointercancel', onUp);
+    });
+  });
   // Click empty space in a day column to create a routine at that exact day + time.
   view.querySelectorAll('.cal__day').forEach((col, i) => col.addEventListener('click', (e) => {
     if (e.target.closest('.cal__ev')) return; // landed on an event — its own handler opens it
@@ -705,6 +752,16 @@ function nowLineHtml() {
 
 /* ---------- Drawer (create / edit) ---------- */
 let editingId = null;
+let schedulingNoteId = null; // set when the drawer was opened from a Board note
+
+/* Turn a Board note into a routine: open the create drawer prefilled with the
+   note's text, and remember the note so it's marked planned once it's scheduled. */
+function scheduleFromNote(n) {
+  schedulingNoteId = n.id;
+  const title = (n.body.split('\n').find((l) => l.trim()) || 'Untitled').trim().slice(0, 60);
+  openDrawer({ title, prompt: n.body, model: settings.model, account: settings.account || DEFAULT_ACCOUNT, triggerKey: null, recurrence: 'none', durationMin: DEFAULT_DURATION_MIN, scheduledAt: null }, { forceSchedule: true });
+  drawerTitle.textContent = 'Schedule from board';
+}
 function triggerOptions(accId, selectedKey) {
   const trigs = accountTriggers(accId);
   if (!trigs.length) return `<option value="">— none yet — add in Settings —</option>`;
@@ -800,9 +857,11 @@ async function submitDrawer(action) {
   const d = readDrawer();
   if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
   const base = { title: d.title, prompt: d.prompt, model: d.model, taskType: d.taskType, complexity: d.complexity, account: d.account, triggerKey: d.triggerKey, durationMin: d.durationMin, recurrence: d.recurrence };
+  const fromNote = schedulingNoteId; // if opened from a Board note, mark it planned once handled
 
   if (action === 'library') {
     await persist(Object.assign(base, { status: 'library', scheduledAt: null }));
+    if (fromNote) await dbUpdateNote(fromNote, { status: 'planned' });
     closeDrawer(); currentView = 'library'; syncTabs(); render(); toast('Saved to Library.'); return;
   }
   if (action === 'schedule') {
@@ -812,16 +871,18 @@ async function submitDrawer(action) {
     let scheduledAt = when.toISOString();
     if (when.getTime() <= Date.now()) scheduledAt = nextOccurrence(scheduledAt, d.recurrence);
     await persist(Object.assign(base, { status: 'scheduled', scheduledAt }));
+    if (fromNote) await dbUpdateNote(fromNote, { status: 'planned' });
     // Land on the calendar, on the week the routine was scheduled into, so it's visibly there.
     closeDrawer(); calRef = new Date(scheduledAt); currentView = 'calendar'; syncTabs(); render(); toast(`Scheduled — fires ${relative(scheduledAt)}. Added to the calendar.`); return;
   }
   if (action === 'now') {
     const r = await persist(Object.assign(base, { status: 'scheduled', scheduledAt: new Date().toISOString() }));
+    if (fromNote) await dbUpdateNote(fromNote, { status: 'planned' });
     closeDrawer(); calRef = new Date(); currentView = 'calendar'; syncTabs(); render();
     if (r) await fireTrigger(r);
   }
 }
-function closeDrawer() { overlay.classList.remove('is-open'); editingId = null; }
+function closeDrawer() { overlay.classList.remove('is-open'); editingId = null; schedulingNoteId = null; }
 
 /* ---------- Settings (accounts & triggers manager) ---------- */
 let cfgModel = null; // editable deep copy of accounts (with secrets)
