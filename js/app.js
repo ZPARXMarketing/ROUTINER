@@ -14,6 +14,7 @@ import {
   MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
   effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel,
 } from './model-router.js';
+import { nextOccurrence, nextOccurrences } from './schedule.js';
 
 const TRIGGER_FN = '/.netlify/functions/claude-trigger';
 /* The production site. Only this host defaults the master fire switch to live;
@@ -148,12 +149,7 @@ function relative(iso) {
 }
 function toLocalInput(d) { const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; }
 function defaultWhen() { const d = new Date(Date.now() + 36e5); d.setMinutes(0, 0, 0); return toLocalInput(d); }
-function nextOccurrence(iso, rec) {
-  if (!iso || rec === 'none') return null;
-  let d = new Date(iso); const now = Date.now();
-  do { d.setDate(d.getDate() + (rec === 'weekly' ? 7 : 1)); if (rec === 'weekdays') while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1); } while (d.getTime() <= now);
-  return d.toISOString();
-}
+/* nextOccurrence / nextOccurrences now live in ./schedule.js (shared, tested). */
 
 /* ---------- Toasts ---------- */
 function toast(msg, kind = '') {
@@ -413,7 +409,13 @@ function statusChip(r) {
   return `<span class="chip chip--${r.status}">${r.status}</span>`;
 }
 function card(r) {
-  const recur = r.recurrence && r.recurrence !== 'none' ? `<span class="chip chip--recurring">${esc(RECURRENCE[r.recurrence])}</span>` : '';
+  let recur = '';
+  if (r.recurrence && r.recurrence !== 'none') {
+    // Hover the recurrence chip to preview the next few fire times.
+    const upcoming = nextOccurrences(r.scheduledAt, r.recurrence, 3).map((iso) => fmt(iso)).join('\n');
+    const tip = upcoming ? ` title="Next runs:\n${esc(upcoming)}"` : '';
+    recur = `<span class="chip chip--recurring"${tip}>${esc(RECURRENCE[r.recurrence])}</span>`;
+  }
   const when = r.status === 'scheduled'
     ? `<span class="card__meta-item">⏰ <b>${fmt(r.scheduledAt)}</b> · ${relative(r.scheduledAt)}</span>`
     : (r.lastRun ? `<span class="card__meta-item">last run <b>${fmt(r.lastRun)}</b></span>` : '');
