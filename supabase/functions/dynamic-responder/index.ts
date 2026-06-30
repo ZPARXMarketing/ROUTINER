@@ -30,7 +30,9 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 // .replace strips stray angle brackets that some editors add when pasting URLs.
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions".replace(/[<>]/g, "");
-const DEFAULT_MODEL = "moonshotai/kimi-k2.7-code";
+// Coding-default model: matches CLAUDE.md so a routine that omits `model` gets
+// the documented cheap coding default instead of silently falling back to kimi.
+const DEFAULT_MODEL = "z-ai/glm-4.7";
 const MAX_TOKENS_CAP = 8192; // guardrail against runaway cost
 
 const cors = {
