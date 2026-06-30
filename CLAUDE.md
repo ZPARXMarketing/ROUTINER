@@ -11,6 +11,39 @@ All live state is in **Supabase** (RLS per user), *not* in this repo's files.
 (The `routines/` folder is a legacy file-based executor — see the note at the
 bottom; it is no longer used.)
 
+## Offloading cheap work to OpenRouter (optional, you decide)
+
+You are the orchestrator and you have the final say on everything that ships.
+But for **cheap, simple, high-volume sub-tasks** you may delegate to a cheaper
+model via **OpenRouter** to save cost/time, then review and use the output. This
+is opt-in per sub-task — never required.
+
+**Good things to offload:** bulk drafting, reformatting, first-pass summaries,
+boilerplate descriptions, outlines, mechanical text transforms — anything you'll
+read back and refine.
+**Never offload:** final judgment calls, anything committed/shipped without your
+review, security-sensitive reasoning, or work needing repo/tool context the
+cheap model won't have.
+
+**Requires** `OPENROUTER_API_KEY` in this session's environment (the Claude Code
+on the web environment vars — *not* the Netlify env, which only reaches the
+trigger forwarder). If the var is unset, just do the work yourself — don't fail.
+
+```bash
+# Delegate a sub-task; capture and then review the result before using it.
+[ -n "$OPENROUTER_API_KEY" ] && OUT=$(curl -s https://openrouter.ai/api/v1/chat/completions \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"moonshotai/kimi-k2.7-code",
+       "messages":[{"role":"user","content":"<the sub-task prompt>"}],
+       "max_tokens":4096}' | jq -r '.choices[0].message.content')
+# $OUT now holds the draft — you read it, fix/verify it, then fold it into the real work.
+```
+
+Model picks: `moonshotai/kimi-k2.7-code` (code-adjacent), `deepseek/deepseek-chat`
+(cheapest all-rounder), `meta-llama/llama-3.3-70b-instruct` (longer structured
+output). The OpenRouter result is raw material, not a finished deliverable — you
+own the final output.
+
 ## If you're a routine session, or asked to "process the board" / "plan" / "schedule work"
 
 A routine fires by resuming a Claude Code session in this repo with the
