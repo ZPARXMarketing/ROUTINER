@@ -25,7 +25,7 @@ a { color: var(--periwinkle); }
 }
 .content {
   min-width: 0;
-  padding: max(var(--sp-6), env(safe-area-inset-top)) var(--sp-6) var(--sp-24);
+  padding: calc(var(--sp-6) + env(safe-area-inset-top)) var(--sp-6) var(--sp-24);
 }
 
 /* ── Sidebar (navigation table) ────────────────── */
@@ -33,7 +33,7 @@ a { color: var(--periwinkle); }
   display: flex;
   flex-direction: column;
   gap: var(--sp-6);
-  padding: max(var(--sp-5), env(safe-area-inset-top)) var(--sp-4) var(--sp-4);
+  padding: calc(var(--sp-5) + env(safe-area-inset-top)) var(--sp-4) var(--sp-4);
   border-right: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
   position: sticky;
