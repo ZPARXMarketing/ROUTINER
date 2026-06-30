@@ -17,9 +17,14 @@
 // require the project's publishable key if you want a tighter gate.
 //
 // Request  (POST JSON): { prompt: string, model?: string, max_tokens?: number,
-//                         system?: string, temperature?: number }
-// Response (JSON):       { ok: true, content: string, model: string }
+//                         system?: string, temperature?: number,
+//                         account?: string, trigger_key?: string }  // optional attribution
+// Response (JSON):       { ok: true, content: string, model: string, usage?: {…} }
 //                   or   { ok: false, error: string }
+//
+// Every successful call is logged (best-effort) to routiner_openrouter_usage
+// with tokens + dollar cost, so the usage meter (openrouter-usage function +
+// scripts/usage-meter.mjs + usage.html) can show spend over time.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
@@ -55,6 +60,8 @@ Deno.serve(async (req: Request) => {
 
   const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
   const maxTokens = Math.min(Number(body.max_tokens) || 2048, MAX_TOKENS_CAP);
+  const account = typeof body.account === "string" ? body.account : null;     // optional attribution
+  const triggerKey = typeof body.trigger_key === "string" ? body.trigger_key : null;
   const messages: { role: string; content: string }[] = [];
   if (typeof body.system === "string" && body.system.trim()) messages.push({ role: "system", content: body.system });
   messages.push({ role: "user", content: prompt });
@@ -72,6 +79,9 @@ Deno.serve(async (req: Request) => {
         model,
         max_tokens: maxTokens,
         ...(body.temperature != null ? { temperature: Number(body.temperature) } : {}),
+        // Ask OpenRouter to return token counts AND the dollar cost of this call,
+        // so the usage meter can track spend without guessing per-model prices.
+        usage: { include: true },
         messages,
       }),
     });
@@ -80,8 +90,51 @@ Deno.serve(async (req: Request) => {
       return json({ ok: false, error: data?.error?.message || `OpenRouter HTTP ${resp.status}` }, 502);
     }
     const content = (data?.choices?.[0]?.message?.content || "").trim();
-    return json({ ok: true, content: content || "(empty)", model: data?.model || model });
+    const servedModel = data?.model || model;
+    const usage = data?.usage || null;
+
+    // Best-effort: log this call to the usage ledger. Never let logging failure
+    // break the actual response the routine is waiting on.
+    logUsage(servedModel, usage, account, triggerKey).catch(() => {});
+
+    return json({ ok: true, content: content || "(empty)", model: servedModel, usage });
   } catch (e) {
     return json({ ok: false, error: "Request to OpenRouter failed: " + (e as Error).message }, 502);
   }
 });
+
+// Insert one row into routiner_openrouter_usage via the Supabase REST API using
+// the service-role key (both are auto-injected into the edge runtime). Fire and
+// forget — callers don't await the result and errors are swallowed upstream.
+async function logUsage(
+  model: string,
+  usage: Record<string, unknown> | null,
+  account: string | null,
+  triggerKey: string | null,
+) {
+  const url = Deno.env.get("SUPABASE_URL");
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!url || !serviceKey) return; // not configured to log; skip silently
+
+  const row = {
+    model,
+    prompt_tokens: Number(usage?.prompt_tokens) || 0,
+    completion_tokens: Number(usage?.completion_tokens) || 0,
+    total_tokens: Number(usage?.total_tokens) || 0,
+    cost: Number(usage?.cost) || 0,
+    account,
+    trigger_key: triggerKey,
+    source: "dynamic-responder",
+  };
+
+  await fetch(`${url}/rest/v1/routiner_openrouter_usage`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      apikey: serviceKey,
+      authorization: `Bearer ${serviceKey}`,
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify(row),
+  });
+}

@@ -19,11 +19,19 @@ model via **OpenRouter** to save cost/time, then review and use the output. This
 is opt-in per sub-task — never required.
 
 **Good things to offload:** bulk drafting, reformatting, first-pass summaries,
-boilerplate descriptions, outlines, mechanical text transforms — anything you'll
-read back and refine.
+boilerplate descriptions, outlines, mechanical text transforms — and **coding
+sub-tasks** (a focused function, a regex, a unit test, a small refactor, a
+config block) — anything you'll read back and refine.
 **Never offload:** final judgment calls, anything committed/shipped without your
 review, security-sensitive reasoning, or work needing repo/tool context the
 cheap model won't have.
+
+**Coding sub-tasks → use GLM.** For code-shaped offloads, prefer
+**`z-ai/glm-4.7`** (fast, cheap — the default for routine coding help) and reach
+for **`z-ai/glm-5`** when the sub-task is genuinely hard. This applies to *every*
+scheduled routine session: you have no key in your env, but the proxy below
+does, so any fired instance can lean on GLM for grunt coding and keep your own
+turns for judgment. You still own and review every line before it ships.
 
 **How to call it (no key needed in your session).** A routine session has no
 `OPENROUTER_API_KEY` in its environment — and it shouldn't. The key lives in
@@ -33,21 +41,42 @@ Supabase **edge secrets** and is used only by the OpenRouter proxy edge function
 You POST a prompt to that function and get the model's text back:
 
 ```bash
-# Delegate a sub-task via the Supabase edge proxy; review the result before using it.
+# Delegate a coding sub-task via the Supabase edge proxy; review before using it.
 SUPA="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/dynamic-responder"
 OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
-  -d '{"model":"moonshotai/kimi-k2.7-code","max_tokens":1024,
+  -d '{"model":"z-ai/glm-4.7","max_tokens":1024,
+       "account":"sparks9679","trigger_key":"A",
        "prompt":"<the sub-task prompt>"}' | jq -r '.content')
+# `account`/`trigger_key` are optional — they just attribute the spend in the
+# usage meter (see below). Every call is logged with its token + dollar cost.
 # $OUT now holds the draft — you read it, fix/verify it, then fold it into the real work.
 # Errors come back as {"ok":false,"error":"…"}; if it fails, just do the work yourself.
 # If .content is "(empty)", the model spent the budget before emitting text —
 # raise max_tokens (>=512) and/or add "Output only the answer." to the prompt.
 ```
 
-Model picks (pass as `"model"`): `moonshotai/kimi-k2.7-code` (code-adjacent),
-`deepseek/deepseek-chat` (cheapest all-rounder), `meta-llama/llama-3.3-70b-instruct`
-(longer structured output). The OpenRouter result is raw material, not a finished
-deliverable — you own the final output.
+Model picks (pass as `"model"`): `z-ai/glm-4.7` (**coding default** — fast &
+cheap), `z-ai/glm-5` (harder coding / most capable), `moonshotai/kimi-k2.7-code`
+(code-adjacent), `deepseek/deepseek-chat` (cheapest all-rounder),
+`meta-llama/llama-3.3-70b-instruct` (longer structured output). The OpenRouter
+result is raw material, not a finished deliverable — you own the final output.
+
+### Tracking spend — the usage meter
+
+Every proxied call is logged (tokens + dollar cost) to
+`routiner_openrouter_usage`. Two read-only surfaces, both fed by the
+**`openrouter-usage`** edge function (which also reads OpenRouter's live credit
+balance via `/api/v1/key`, key-side so it never leaves Supabase):
+
+- **CLI:** `node scripts/usage-meter.mjs` — neon terminal meter (credit bar,
+  today/month/lifetime spend, by-model, recent calls). `--watch 30` to live-poll,
+  `--plain` for logs, `--demo` to see it with sample data and no network.
+- **Web:** open **`usage.html`** (also linked from the app sidebar → *◆ Usage*) —
+  the same numbers as a cyberpunk dashboard that auto-refreshes.
+
+> Setup adds one table (migration `0008_openrouter_usage.sql`) and one function
+> (`supabase functions deploy openrouter-usage`); `dynamic-responder` does the
+> logging itself once redeployed.
 
 > Setup (one-time, human): put the key in Supabase edge secrets as
 > `OPENROUTER_API_KEY` and deploy the `dynamic-responder` function (Supabase →
