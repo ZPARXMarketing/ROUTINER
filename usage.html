@@ -23,9 +23,27 @@
         var(--bg-void);
       color: var(--text-hi);
       min-height: 100vh;
-      padding: max(var(--sp-8), env(safe-area-inset-top)) var(--sp-4) var(--sp-4);
+      padding: calc(var(--sp-8) + env(safe-area-inset-top)) var(--sp-4) var(--sp-4);
     }
     .wrap { max-width: 920px; margin: 0 auto; }
+
+    /* Clickable brand → back to the app, matching the main sidebar lockup. */
+    .brand {
+      display: inline-flex; flex-direction: column; align-items: flex-start; gap: 7px;
+      margin-bottom: var(--sp-6); text-decoration: none;
+      transition: opacity .15s ease, transform .15s ease;
+    }
+    .brand:hover { opacity: .82; transform: translateY(-1px); }
+    .brand__logo { height: 26px; width: auto; max-width: 100%; display: block; }
+    .brand__wordmark {
+      font-family: var(--font-pixel, monospace); font-size: 13px; font-weight: 700;
+      letter-spacing: .22em; text-transform: uppercase; color: var(--orange-bright); line-height: 1;
+    }
+    .brand__back {
+      font-family: var(--font-pixel, monospace); font-size: 10px; letter-spacing: .12em;
+      text-transform: uppercase; color: var(--text-low);
+    }
+
     .head { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-6); }
     .eyebrow {
       font-family: var(--font-pixel, monospace); font-size: 11px; letter-spacing: .12em;
@@ -76,6 +94,11 @@
 </head>
 <body>
   <div class="wrap">
+    <a class="brand" href="index.html" title="Back to Routiner">
+      <img class="brand__logo" src="assets/zparx-lockup.svg" alt="ZPARX" />
+      <span class="brand__wordmark">Routiner</span>
+      <span class="brand__back">← Back to app</span>
+    </a>
     <div class="head">
       <div>
         <div class="eyebrow">Routiner · OpenRouter</div>
