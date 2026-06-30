@@ -97,6 +97,23 @@ a { color: var(--periwinkle); }
 .btn--ghost { background: transparent; color: var(--text-mid); border-color: var(--hairline); }
 .btn--ghost:hover { color: var(--text-hi); border-color: var(--grey-700); }
 .btn--sm { padding: var(--sp-2) var(--sp-3); font-size: 12px; font-weight: 600; }
+
+/* ── Master fire switch (top bar) ──────────────── */
+.fire-switch {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: var(--r-pill);
+  padding: var(--sp-2) var(--sp-4);
+  cursor: pointer;
+  white-space: nowrap;
+  border: 1px solid var(--hairline);
+  transition: background .15s ease, border-color .15s ease, box-shadow .15s ease, color .15s ease;
+}
+.fire-switch.is-on { background: rgba(134, 224, 30, .12); color: var(--lime); border-color: rgba(134, 224, 30, .5); }
+.fire-switch.is-on:hover { box-shadow: var(--glow-lime); }
+.fire-switch.is-off { background: rgba(124, 135, 158, .12); color: var(--text-mid); border-color: var(--hairline); }
+.fire-switch.is-off:hover { color: var(--text-hi); border-color: var(--grey-700); }
 .btn--danger-ghost { background: transparent; color: var(--danger); border-color: transparent; }
 .btn--danger-ghost:hover { background: rgba(255,77,94,0.12); }
 .btn[disabled] { opacity: .5; cursor: not-allowed; }
@@ -210,6 +227,7 @@ a { color: var(--periwinkle); }
 .chip--success { background: rgba(188,239,47,0.12); color: var(--lime); border-color: rgba(188,239,47,0.35); }
 .chip--error { background: rgba(255,77,94,0.14); color: var(--danger); border-color: rgba(255,77,94,0.4); }
 .chip--dryrun { background: rgba(245,211,59,0.14); color: var(--yellow); border-color: rgba(245,211,59,0.4); }
+.chip--ran { background: rgba(124,135,158,0.14); color: var(--grey-300); border-color: var(--grey-700); }
 
 /* ── Empty state ───────────────────────────────── */
 .empty {
@@ -440,7 +458,8 @@ a { color: var(--periwinkle); }
 .cal__body { display: grid; grid-template-columns: 56px repeat(7, 1fr); position: relative; padding-top: 8px; }
 .cal__gutter { position: relative; }
 .cal__hr { position: absolute; right: 7px; font-family: var(--font-mono); font-size: 9px; color: var(--text-low); transform: translateY(-50%); white-space: nowrap; }
-.cal__day { position: relative; border-left: 1px solid #1f2740; background: repeating-linear-gradient(to bottom, rgba(42,52,84,0.30) 0 1px, transparent 1px 44px); }
+.cal__day { position: relative; border-left: 1px solid #1f2740; background: repeating-linear-gradient(to bottom, rgba(42,52,84,0.30) 0 1px, transparent 1px 44px); cursor: pointer; transition: box-shadow .12s ease; }
+.cal__day:hover { box-shadow: inset 0 0 0 100vmax rgba(188,239,47,0.04); }
 
 .cal__ev { position: absolute; border-radius: 8px; padding: 4px 7px; overflow: hidden; cursor: grab; box-sizing: border-box; border-left: 3px solid; touch-action: none; user-select: none; -webkit-user-select: none; transition: filter .12s ease, box-shadow .12s ease; }
 .cal__ev:hover { filter: brightness(1.07); z-index: 5; box-shadow: var(--shadow-md); }
