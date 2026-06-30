@@ -48,7 +48,7 @@ function normalizeAccounts(raw, keepSecrets) {
     trigger: keepSecrets ? (t.trigger || '') : '', token: keepSecrets ? (t.token || '') : '' });
   if (Array.isArray(raw) && raw.length) {
     return raw.map((a) => ({ id: a.id || genId('acc'), label: a.label || KNOWN_LABELS[a.id] || a.id,
-      triggers: (a.triggers || []).map(trig) }));
+      enabled: a.enabled !== false, triggers: (a.triggers || []).map(trig) }));
   }
   if (raw && typeof raw === 'object' && Object.keys(raw).length) { // old map shape
     return Object.entries(raw).map(([id, v]) => ({ id, label: KNOWN_LABELS[id] || id,
@@ -637,10 +637,11 @@ function renderCalendar() {
   const rangeLabel = `${weekStart.toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${weekEnd.toLocaleDateString([], { month: weekStart.getMonth() === weekEnd.getMonth() ? undefined : 'short', day: 'numeric' })}`;
 
   const legend = listAccounts().map((a) => {
+    const off = a.enabled === false;
     const swatches = (a.triggers && a.triggers.length)
-      ? a.triggers.map((t) => `<span class="cal__sw" title="${esc(t.label)}" style="background:${triggerColor(a.id, t.id).solid}"></span>`).join('')
+      ? a.triggers.map((t) => `<span class="cal__sw" title="${esc(a.label)} · ${esc(t.label)}" style="background:${triggerColor(a.id, t.id).solid}">${esc(t.label)}</span>`).join('')
       : `<span class="cal__sw" style="background:${accountColor(a.id).solid}"></span>`;
-    return `<span class="cal__leg">${swatches}<span>${esc(a.label)}</span></span>`;
+    return `<span class="cal__leg${off ? ' cal__leg--off' : ''}">${swatches}<span class="cal__legname">${esc(a.label)}</span></span>`;
   }).join('');
 
   const dayHeaders = days.map((d) => {
@@ -904,10 +905,11 @@ function syncCfgFromDom() {
 function renderCfgAccounts() {
   const host = $('#cfg-accounts'); if (!host) return;
   host.innerHTML = cfgModel.map((a, ai) => `
-    <div class="acct-cfg">
+    <div class="acct-cfg${a.enabled === false ? ' acct-cfg--off' : ''}">
       <div class="acct-cfg__head">
         <span class="acct-dot" style="background:${cfgColor(ai, -1)}"></span>
         <input class="input cfg-aname" data-ai="${ai}" value="${esc(a.label)}" placeholder="Account name" />
+        <button class="acct-switch${a.enabled === false ? '' : ' is-on'}" data-act="toggle-acct" data-ai="${ai}" role="switch" aria-checked="${a.enabled === false ? 'false' : 'true'}" title="${a.enabled === false ? 'Account off — click to enable' : 'Account on — click to disable'}"><span class="acct-switch__knob"></span></button>
         <button class="iconbtn" title="Remove account" data-act="del-acct" data-ai="${ai}">🗑</button>
       </div>
       <div class="trig-list">${a.triggers.map((t, ti) => `
@@ -928,7 +930,8 @@ function renderCfgAccounts() {
     syncCfgFromDom();
     const ai = +b.dataset.ai, ti = +b.dataset.ti, act = b.dataset.act;
     if (act === 'test-trig') return testTrigger(ai, ti); // no re-render — keep typed values + show status
-    if (act === 'add-acct') cfgModel.push({ id: genId('acc'), label: 'New account', triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '' }] });
+    if (act === 'toggle-acct') cfgModel[ai].enabled = (cfgModel[ai].enabled === false);
+    else if (act === 'add-acct') cfgModel.push({ id: genId('acc'), label: 'New account', enabled: true, triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '' }] });
     else if (act === 'del-acct') cfgModel.splice(ai, 1);
     else if (act === 'add-trig') cfgModel[ai].triggers.push({ id: genId('t'), label: nextTrigLabel(cfgModel[ai]), trigger: '', token: '' });
     else if (act === 'del-trig') cfgModel[ai].triggers.splice(ti, 1);

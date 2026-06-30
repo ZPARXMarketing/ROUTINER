@@ -546,7 +546,16 @@ a { color: var(--periwinkle); }
 .cal__count { font-family: var(--font-pixel); font-size: 10px; letter-spacing: 0.06em; color: var(--text-low); text-transform: uppercase; }
 .cal__legend { margin-left: auto; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 .cal__leg { display: flex; align-items: center; gap: 7px; font-family: var(--font-body); font-weight: 500; font-size: 12px; color: var(--text-mid); }
-.cal__sw { width: 13px; height: 13px; border-radius: 4px; flex: 0 0 auto; }
+.cal__sw {
+  width: 16px; height: 16px; border-radius: 4px; flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--font-pixel); font-size: 9px; font-weight: 700;
+  color: rgba(7,10,20,0.78); line-height: 1; text-transform: uppercase;
+}
+/* Disabled account: struck through in the calendar key. */
+.cal__leg--off { opacity: 0.5; }
+.cal__leg--off .cal__legname { text-decoration: line-through; }
+.cal__leg--off .cal__sw { filter: grayscale(0.7); }
 
 .cal__head { display: grid; grid-template-columns: 56px repeat(7, 1fr); border-bottom: 1px solid var(--hairline); }
 .cal__dh { padding: 8px 0; text-align: center; border-left: 1px solid #1f2740; }
@@ -592,6 +601,21 @@ a { color: var(--periwinkle); }
 /* ── Settings: accounts & triggers manager ─────── */
 .acct-cfg__head { gap: var(--sp-2); }
 .acct-cfg__head .cfg-aname { flex: 1; font-weight: 700; font-family: var(--font-body); }
+
+/* Account on/off switch (Settings) + disabled-account dimming. */
+.acct-switch {
+  position: relative; width: 38px; height: 22px; flex: 0 0 auto; cursor: pointer; padding: 0;
+  border-radius: var(--r-pill); background: rgba(124,135,158,0.20); border: 1px solid var(--hairline);
+  transition: background .15s ease, border-color .15s ease, box-shadow .15s ease;
+}
+.acct-switch__knob {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--text-mid); transition: transform .16s ease, background .15s ease;
+}
+.acct-switch.is-on { background: rgba(188,239,47,0.22); border-color: rgba(188,239,47,0.5); box-shadow: var(--glow-lime); }
+.acct-switch.is-on .acct-switch__knob { transform: translateX(16px); background: var(--lime); }
+.acct-cfg--off { opacity: 0.62; }
+.acct-cfg--off .cfg-aname { text-decoration: line-through; }
 .iconbtn { background: transparent; border: 1px solid var(--hairline); color: var(--text-mid); border-radius: var(--r-sm); width: 28px; height: 28px; flex: 0 0 auto; cursor: pointer; font-size: 13px; line-height: 1; }
 .iconbtn:hover { color: var(--danger); border-color: var(--danger); }
 .trig-list { display: flex; flex-direction: column; gap: var(--sp-2); margin: var(--sp-2) 0; }
