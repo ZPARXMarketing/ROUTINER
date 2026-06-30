@@ -26,7 +26,6 @@ a { color: var(--periwinkle); }
 .content {
   min-width: 0;
   padding: var(--sp-6) var(--sp-6) var(--sp-24);
-  max-width: 1180px;
 }
 
 /* ── Sidebar (navigation table) ────────────────── */
@@ -34,12 +33,13 @@ a { color: var(--periwinkle); }
   display: flex;
   flex-direction: column;
   gap: var(--sp-6);
-  padding: var(--sp-6) var(--sp-4);
+  padding: var(--sp-5) var(--sp-4) var(--sp-4);
   border-right: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
   position: sticky;
   top: 0;
   height: 100vh;
+  height: 100dvh; /* exclude mobile browser chrome so the Account group stays in view */
   overflow-y: auto;
 }
 .sidebar__group { display: flex; flex-direction: column; gap: var(--sp-2); }
@@ -63,8 +63,17 @@ a { color: var(--periwinkle); }
   padding: var(--sp-2) 0 var(--sp-6);
   flex-wrap: wrap;
 }
-.brand { display: flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-2); }
-.brand__logo { height: 30px; width: auto; display: block; }
+.brand { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; padding: 0 var(--sp-2); min-width: 0; }
+.brand__logo { height: 26px; width: auto; max-width: 100%; display: block; }
+.brand__wordmark {
+  font-family: var(--font-pixel);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--orange-bright);
+  line-height: 1;
+}
 .brand__divider {
   width: 1px; height: 30px; background: var(--hairline); margin: 0 var(--sp-1);
 }
