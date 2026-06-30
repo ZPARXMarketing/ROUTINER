@@ -32,6 +32,8 @@ export const MODELS = [
   { id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat — cheap (OpenRouter)' },
   { id: 'moonshotai/kimi-k2.7-code', label: 'Kimi K2.7 Code (OpenRouter)' },
   { id: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B (OpenRouter)' },
+  { id: 'z-ai/glm-4.7', label: 'GLM 4.7 — fast, cheap coding (OpenRouter)' },
+  { id: 'z-ai/glm-5', label: 'GLM 5 — most capable (OpenRouter)' },
 ];
 
 export const TASK_TYPES = [
