@@ -538,6 +538,8 @@ a { color: var(--periwinkle); }
 .cal__legend { margin-left: auto; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 .cal__leg { display: flex; align-items: center; gap: 7px; font-family: var(--font-body); font-weight: 500; font-size: 12px; color: var(--text-mid); }
 .cal__sw { width: 13px; height: 13px; border-radius: 4px; flex: 0 0 auto; }
+.cal__sw-grp { display: flex; align-items: center; gap: 3px; }
+.cal__sw-key { font-family: var(--font-pixel); font-size: 9px; letter-spacing: 0.04em; color: var(--text-low); }
 
 .cal__head { display: grid; grid-template-columns: 56px repeat(7, 1fr); border-bottom: 1px solid var(--hairline); }
 .cal__dh { padding: 8px 0; text-align: center; border-left: 1px solid #1f2740; }

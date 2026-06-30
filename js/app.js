@@ -635,7 +635,7 @@ function renderCalendar() {
 
   const legend = listAccounts().map((a) => {
     const swatches = (a.triggers && a.triggers.length)
-      ? a.triggers.map((t) => `<span class="cal__sw" title="${esc(t.label)}" style="background:${triggerColor(a.id, t.id).solid}"></span>`).join('')
+      ? a.triggers.map((t) => `<span class="cal__sw-grp"><span class="cal__sw" style="background:${triggerColor(a.id, t.id).solid}"></span><span class="cal__sw-key">${esc(t.label)}</span></span>`).join('')
       : `<span class="cal__sw" style="background:${accountColor(a.id).solid}"></span>`;
     return `<span class="cal__leg">${swatches}<span>${esc(a.label)}</span></span>`;
   }).join('');
