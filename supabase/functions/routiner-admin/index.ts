@@ -99,8 +99,8 @@ Deno.serve(async (req: Request) => {
       // tokens or URLs (this endpoint is reachable with the public key).
       const raw = settings?.[0]?.accounts ?? [];
       const accounts = Array.isArray(raw) ? raw.map((a: Record<string, unknown>) => ({
-        id: a.id, label: a.label,
-        triggers: Array.isArray(a.triggers) ? a.triggers.map((t: Record<string, unknown>) => ({ id: t.id, label: t.label })) : [],
+        id: a["id"], label: a.label,
+        triggers: Array.isArray(a.triggers) ? a.triggers.map((t: Record<string, unknown>) => ({ id: t["id"], label: t.label })) : [],
       })) : [];
       return json({ ok: true, ownerUserId, activeNotes, scheduled, accounts });
     }
