@@ -1,0 +1,4 @@
+RESULT: FAIL
+REASON: OPENROUTER_API_KEY not set in environment
+MODEL: (no call made)
+TIMESTAMP: 2026-06-30T04:00:08Z
