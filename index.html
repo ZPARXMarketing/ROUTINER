@@ -17,38 +17,52 @@
 </head>
 <body>
   <div class="app">
-    <!-- ── Top bar: logo top-left ── -->
-    <header class="topbar">
+    <!-- ── Sidebar: brand + navigation table ── -->
+    <aside class="sidebar" id="sidebar" style="display:none">
       <div class="brand">
         <img class="brand__logo" src="assets/zparx-lockup.svg" alt="ZPARX" />
-        <span class="brand__divider"></span>
         <span>
           <span class="brand__eyebrow">Routine Planner</span>
-          <span class="brand__title">Claude <b>Routine</b> Planner</span>
+          <span class="brand__title">Claude <b>Routine</b></span>
         </span>
       </div>
-      <div class="topbar__spacer"></div>
-      <div class="topbar__actions">
-        <span class="clock" id="clock">—</span>
-        <span class="clock" id="userChip" title="Signed in" style="display:none"></span>
-        <button class="fire-switch" id="fireSwitch" title="Master control: whether this site is allowed to fire routines" style="display:none"></button>
-        <button class="btn btn--ghost btn--sm" id="settingsBtn" title="Trigger &amp; model" style="display:none">⚙ Settings</button>
-        <button class="btn btn--ghost btn--sm" id="signOutBtn" style="display:none">Sign out</button>
-        <button class="btn btn--primary" id="newBtn" style="display:none"><span class="btn__icon">＋</span> New routine</button>
+
+      <div class="sidebar__group">
+        <span class="sidebar__label">Navigation</span>
+        <nav class="tabs" id="tabs">
+          <button class="tab is-active" data-view="calendar"><span class="tab__ico">▦</span> Calendar</button>
+          <button class="tab" data-view="board"><span class="tab__ico">✎</span> Board <span class="tab__count" data-count="board">0</span></button>
+          <button class="tab" data-view="scheduled"><span class="tab__ico">◷</span> Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
+          <button class="tab" data-view="library"><span class="tab__ico">▤</span> Library <span class="tab__count" data-count="library">0</span></button>
+          <button class="tab" data-view="archived"><span class="tab__ico">▢</span> Archived <span class="tab__count" data-count="archived">0</span></button>
+          <button class="tab" data-view="history"><span class="tab__ico">↻</span> History <span class="tab__count" data-count="history">0</span></button>
+        </nav>
       </div>
-    </header>
 
-    <!-- ── Tabs ── -->
-    <nav class="tabs" id="tabs" style="display:none">
-      <button class="tab is-active" data-view="calendar">Calendar</button>
-      <button class="tab" data-view="board">Board <span class="tab__count" data-count="board">0</span></button>
-      <button class="tab" data-view="scheduled">Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
-      <button class="tab" data-view="library">Library <span class="tab__count" data-count="library">0</span></button>
-      <button class="tab" data-view="archived">Archived <span class="tab__count" data-count="archived">0</span></button>
-      <button class="tab" data-view="history">History <span class="tab__count" data-count="history">0</span></button>
-    </nav>
+      <div class="sidebar__group sidebar__group--foot">
+        <span class="sidebar__label">Account</span>
+        <span class="clock clock--block" id="userChip" title="Signed in"></span>
+        <button class="btn btn--ghost btn--sm sidebar__btn" id="settingsBtn" title="Trigger &amp; model">⚙ Settings</button>
+        <button class="btn btn--ghost btn--sm sidebar__btn" id="signOutBtn">Sign out</button>
+      </div>
+    </aside>
 
-    <main id="view"></main>
+    <!-- ── Main column ── -->
+    <div class="content">
+      <header class="topbar" id="topbar" style="display:none">
+        <div class="topbar__spacer"></div>
+        <div class="topbar__actions">
+          <span class="clock" id="clock">—</span>
+          <button class="btn btn--primary" id="newBtn"><span class="btn__icon">＋</span> New routine</button>
+          <label class="fire-toggle" id="fireSwitch" title="Master control: whether this site is allowed to fire routines">
+            <span class="fire-toggle__label" id="fireLabel">Inactive</span>
+            <span class="fire-toggle__track"><span class="fire-toggle__knob"></span></span>
+          </label>
+        </div>
+      </header>
+
+      <main id="view"></main>
+    </div>
   </div>
 
   <!-- ── Drawer (new / edit routine) ── -->
