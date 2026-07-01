@@ -22,13 +22,18 @@
 // Flags:
 //   --ping                 send a fixed health-check prompt and assert PONG
 //   --model <id>           model id (default z-ai/glm-4.7 — the coding default)
-//   --max-tokens <n>       token budget (default 1024; --ping uses 64)
+//   --max-tokens <n>       token budget (default 1024; --ping uses 512)
 //   --account <a>          spend-attribution account (default sparks9679)
-//   --trigger-key <k>      spend-attribution trigger  (default A)
+//   --trigger-key <k>      spend-attribution trigger  (default t_a)
 //   --stdin                read the prompt body from stdin, appended to argv text
 //   --url <u>              override the proxy endpoint
 //   --json                 print the raw proxy JSON response, then exit
 //   --quiet                print only the model's text (or nothing on error)
+//
+// Attribution defaults come from the environment so a per-account Claude env can
+// set them once: $ROUTINER_ACCOUNT / $ROUTINER_TRIGGER (with $ROUTINER_GLM_ACCOUNT
+// / $ROUTINER_GLM_TRIGGER accepted as fallbacks). Set ROUTINER_ACCOUNT=zparxmarketing
+// in the zparx environment so its calls show up under the right account.
 //
 // Endpoint resolution (first that is set):
 //   --url <u>  |  $ROUTINER_GLM_URL  |  $ROUTINER_PROXY_URL  |  the default below.
@@ -70,8 +75,17 @@ const opts = {
   // the whole budget on hidden reasoning tokens, returning "(empty)" (see
   // CLAUDE.md's ">=512" note). Too low a cap makes the health check flap.
   maxTokens: Number(val("--max-tokens", has("--ping") ? "512" : "1024")) || 1024,
-  account: val("--account", process.env.ROUTINER_GLM_ACCOUNT || "sparks9679"),
-  triggerKey: val("--trigger-key", process.env.ROUTINER_GLM_TRIGGER || "A"),
+  // Attribution: honor the deployed ROUTINER_ACCOUNT/ROUTINER_TRIGGER contract
+  // (the zparx env sets ROUTINER_ACCOUNT), with the older ROUTINER_GLM_* names
+  // kept as fallbacks. Default trigger t_a matches the routines in the DB.
+  account: val(
+    "--account",
+    process.env.ROUTINER_ACCOUNT || process.env.ROUTINER_GLM_ACCOUNT || "sparks9679",
+  ),
+  triggerKey: val(
+    "--trigger-key",
+    process.env.ROUTINER_TRIGGER || process.env.ROUTINER_GLM_TRIGGER || "t_a",
+  ),
   stdin: has("--stdin"),
   url: val(
     "--url",

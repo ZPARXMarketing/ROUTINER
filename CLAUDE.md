@@ -38,14 +38,30 @@ turns for judgment. You still own and review every line before it ships.
 Supabase **edge secrets** and is used only by the OpenRouter proxy edge function
 (`supabase/functions/dynamic-responder/index.ts`; deployed **slug** is
 `dynamic-responder`), which proxies the call so the key never leaves Supabase.
-You POST a prompt to that function and get the model's text back:
+You POST a prompt to that function and get the model's text back.
+
+**Easiest — the one-line helper (preferred).** `scripts/glm.mjs` wraps the call:
+it defaults to `z-ai/glm-4.7`, attributes spend (`ROUTINER_ACCOUNT`/`ROUTINER_TRIGGER`,
+defaulting to `sparks9679`/`t_a`), prints **only** the model's text, and gives a
+clear error if the host is unreachable. Verify the whole path end-to-end (and that
+a usage row lands) with `--ping`.
+
+```bash
+# One coding sub-task → just the answer on stdout. Review before using it.
+OUT=$(node scripts/glm.mjs "Write a regex for E.164 phone numbers. Output only it.")
+node scripts/glm.mjs --model z-ai/glm-5 "<a genuinely hard sub-task>"   # harder
+echo "<long prompt>" | node scripts/glm.mjs                            # via stdin
+node scripts/glm.mjs --ping   # end-to-end self-test: proxy reachable + logging works
+```
+
+**Raw curl (fallback / non-Node contexts).**
 
 ```bash
 # Delegate a coding sub-task via the Supabase edge proxy; review before using it.
 SUPA="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/dynamic-responder"
 OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
   -d '{"model":"z-ai/glm-4.7","max_tokens":1024,
-       "account":"sparks9679","trigger_key":"A",
+       "account":"sparks9679","trigger_key":"t_a",
        "prompt":"<the sub-task prompt>"}' | jq -r '.content')
 # `account`/`trigger_key` are optional — they just attribute the spend in the
 # usage meter (see below). Every call is logged with its token + dollar cost.
@@ -55,21 +71,16 @@ OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
 # raise max_tokens (>=512) and/or add "Output only the answer." to the prompt.
 ```
 
-Or use the zero-dependency CLI wrapper `scripts/glm.mjs` (same proxy, no key
-needed) — handy for one-shots and for a scheduled **health check**:
+> **Heads-up (network policy):** the proxy only works if the routine session is
+> allowed to reach `*.supabase.co`. If `--ping`/curl fails with a connection/403
+> error, the offload silently no-ops and the session just does the work itself —
+> allow that host in the environment's egress settings and re-run `--ping`.
 
-```bash
-node scripts/glm.mjs --ping                        # health check → "✓ GLM proxy alive … PONG"
-node scripts/glm.mjs "summarize this in one line"  # one-shot prompt (text on stdout)
-node scripts/glm.mjs --model z-ai/glm-5 "hard one" # pick a model
-echo "long text" | node scripts/glm.mjs --stdin "summarize:"
-node scripts/glm.mjs --json --ping                 # raw proxy JSON
-```
-
-`--ping` exits `0` only when the proxy answers `PONG` (edge function up, key
-present, OpenRouter reachable, credits not spent); `1` on proxy/network error,
-`2` if it answers but the assertion fails. It uses a 512-token budget so GLM's
-reasoning tokens don't starve the reply into "(empty)".
+More `glm.mjs` flags: `--stdin` (append piped text), `--json` (raw proxy
+response), `--quiet` (only the model's text), `--account`/`--trigger-key`
+(override attribution). `--ping` exits `0` only when the proxy answers `PONG`,
+`1` on proxy/network error, `2` if it answers but the assertion fails — using a
+512-token budget so GLM's reasoning tokens don't starve the reply into "(empty)".
 
 Model picks (pass as `"model"`): `z-ai/glm-4.7` (**coding default** — fast &
 cheap), `z-ai/glm-5` (harder coding / most capable), `moonshotai/kimi-k2.7-code`
