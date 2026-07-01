@@ -25,6 +25,39 @@ Netlify function, passing the prompt straight into the routine's session.
 - **⚡ Test live** — optional instant preview via the Messages API (needs an
   Anthropic key).
 
+## Agents that delegate their own work
+
+Routiner isn't one assistant — it's a **swarm of scheduled Claude agents that
+split the work between them.**
+
+- **Parallel routines.** Each account can have several triggers (A/B/C…) that
+  fire as **independent, simultaneous sessions**. A week's worth of work gets
+  laid out as timed Calendar blocks and executed across accounts without anyone
+  babysitting it — one Claude planning, many Claudes doing.
+- **Decomposition.** Hand a routine a big ask and it breaks it into an ordered
+  sequence of smaller blocks across the right horizon (an hour → a week), so
+  multi-step projects finish in order, on schedule.
+- **Cheap-work offload.** Inside each session the agent acts as an
+  *orchestrator*: it keeps the judgment calls and **delegates the grunt work** —
+  boilerplate, first drafts, focused coding sub-tasks — to a faster, cheaper
+  model (**GLM via OpenRouter**), reviews every line, then ships. Cheap where it
+  can be, careful where it matters.
+- **Every call metered.** Delegated calls are logged with token + dollar cost to
+  a live usage dashboard (`usage.html` / `scripts/usage-meter.mjs`), so you can
+  see exactly what your agents did and what it cost.
+
+The OpenRouter path runs through a Supabase edge proxy (`dynamic-responder`) that
+holds the key server-side, so a fired session never needs a key of its own — it
+just calls the one-line helper:
+
+```bash
+node scripts/glm.mjs "Write a regex for E.164 phone numbers. Output only it."
+node scripts/glm.mjs --ping   # health check: proxy alive + spend logging works
+```
+
+You set the intent; the swarm plans, splits, executes, and reports back. See
+[`CLAUDE.md`](CLAUDE.md) for the full delegation playbook.
+
 ## Setup
 
 ### 1. Supabase (storage + login) — already wired
@@ -126,9 +159,14 @@ index.html        # planner UI + ZPARX brand fonts
 css/tokens.css    # vendored ZPARX design tokens
 css/app.css       # application + auth styling
 js/app.js         # Supabase auth + storage, UI, calendar, trigger (ES module)
+usage.html        # OpenRouter spend dashboard (credits, by-model, recent calls)
 netlify/functions/claude-trigger.mjs   # server-side routine fire
+supabase/functions/dynamic-responder/  # OpenRouter proxy (holds the key server-side)
+supabase/functions/openrouter-usage/   # usage/credit reader for the meter
 supabase/schema.sql                    # full DB schema — one paste for a fresh project
-supabase/migrations/                   # incremental migrations (schema + cron)
+supabase/migrations/                   # incremental migrations (schema + cron + usage)
+scripts/glm.mjs                        # one-line GLM offload helper (+ --ping health check)
+scripts/usage-meter.mjs                # terminal OpenRouter spend meter
 .claude/skills/plan-routines/          # skill: plan a project into scheduled routines
 assets/           # ZPARX lockup logo + favicon
 ```
