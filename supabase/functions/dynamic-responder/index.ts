@@ -162,7 +162,10 @@ Deno.serve(async (req: Request) => {
     });
     const data = await resp.json();
     if (!resp.ok) {
-      return json({ ok: false, error: data?.error?.message || `OpenRouter HTTP ${resp.status}` }, 502);
+      const msg = data?.error?.message || `OpenRouter HTTP ${resp.status}`;
+      // Log the failure too (cost 0) so the meter can show failure rates.
+      logUsage(model, null, account, triggerKey, false, msg).catch(() => {});
+      return json({ ok: false, error: msg }, 502);
     }
     const content = (data?.choices?.[0]?.message?.content || "").trim();
     const servedModel = data?.model || model;
@@ -174,7 +177,9 @@ Deno.serve(async (req: Request) => {
 
     return json({ ok: true, content: content || "(empty)", model: servedModel, usage });
   } catch (e) {
-    return json({ ok: false, error: "Request to OpenRouter failed: " + (e as Error).message }, 502);
+    const msg = "Request to OpenRouter failed: " + (e as Error).message;
+    logUsage(model, null, account, triggerKey, false, msg).catch(() => {});
+    return json({ ok: false, error: msg }, 502);
   }
 });
 
@@ -215,6 +220,8 @@ async function logUsage(
   usage: Record<string, unknown> | null,
   account: string | null,
   triggerKey: string | null,
+  ok = true,
+  error: string | null = null,
 ) {
   const url = Deno.env.get("SUPABASE_URL");
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -229,6 +236,8 @@ async function logUsage(
     account,
     trigger_key: triggerKey,
     source: "dynamic-responder",
+    ok,
+    error: error ? String(error).slice(0, 500) : null,
   };
 
   await fetch(`${url}/rest/v1/routiner_openrouter_usage`, {

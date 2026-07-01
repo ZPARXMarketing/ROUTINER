@@ -54,7 +54,13 @@ export const FALLBACK_MODEL = 'claude-sonnet-4-6';
 
 /* The routing table — the get_model_for_task() decision, as data. Routes to
    Claude models because that's what executes scheduled routines today. Swap a
-   row to an OpenRouter id once you wire an OpenRouter execution path. */
+   row to an OpenRouter id once you wire an OpenRouter execution path.
+
+   ⚠ DUPLICATED: supabase/functions/routiner-scheduler/index.ts has a byte-for-byte
+   copy of this table so scheduled fires pick the same model. Edit both together.
+   (A single DB-backed, Settings-editable policy is the intended follow-up.)
+   ⚠ Verify these ids are still accepted by the routine /fire endpoint before a
+   release — model ids get retired; keep MODELS above in sync with any change. */
 export const ROUTING_POLICY = {
   planning: {
     low: 'claude-sonnet-4-6',

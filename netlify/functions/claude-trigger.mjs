@@ -41,6 +41,11 @@
 const BETA = process.env.CLAUDE_ROUTINE_BETA || 'experimental-cc-routine-2026-04-01';
 const VERSION = '2023-06-01';
 
+// Don't let a hung upstream stall the function: cap the auth/creds lookups and
+// the fire itself. (Overridable via env for slow networks.)
+const LOOKUP_TIMEOUT_MS = Number(process.env.ROUTINER_LOOKUP_TIMEOUT_MS) || 8000;
+const FIRE_TIMEOUT_MS = Number(process.env.ROUTINER_FIRE_TIMEOUT_MS) || 20000;
+
 // Public Supabase project values (anon key is safe to expose).
 // FORKING? Replace these with your own Supabase project URL + publishable (anon) key
 // (Supabase > Project Settings > API) — keep them in sync with js/config.js.
@@ -86,6 +91,7 @@ async function verifyUser(token) {
   try {
     const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
       headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
     });
     if (!r.ok) return null;
     return await r.json(); // { id, email, ... }
@@ -118,6 +124,7 @@ async function loadUserCreds(accessToken, account, triggerKey) {
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/routiner_settings?select=accounts`, {
       headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
     });
     if (!r.ok) return null;
     const rows = await r.json();
@@ -194,6 +201,7 @@ export default async (req) => {
         'content-type': 'application/json',
       },
       body: JSON.stringify({ ...(text ? { text } : {}), ...(model ? { model } : {}) }),
+      signal: AbortSignal.timeout(FIRE_TIMEOUT_MS),
     });
     const body = await resp.text();
     return new Response(body || JSON.stringify({ ok: resp.ok, status: resp.status }), {

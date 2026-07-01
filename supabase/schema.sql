@@ -78,7 +78,9 @@ create table if not exists public.routiner_openrouter_usage (
   cost              numeric(12,6) not null default 0,   -- USD, from usage.cost
   account           text,
   trigger_key       text,
-  source            text not null default 'dynamic-responder'
+  source            text not null default 'dynamic-responder',
+  ok                boolean not null default true,       -- false = failed call (see 0010); cost 0
+  error             text                                 -- error message when ok=false
 );
 
 create index if not exists routiner_routines_user_idx on public.routiner_routines(user_id);

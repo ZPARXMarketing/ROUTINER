@@ -45,7 +45,9 @@ const dbHeaders: Record<string, string> = {
 };
 
 // Mirror of js/model-router.js ROUTING_POLICY so scheduled fires pick the same
-// model the app would. Keep these two in sync if the policy changes.
+// model the app would. ⚠ DUPLICATED — edit both copies together; verify the ids
+// are still accepted by the /fire endpoint before a release. (A single
+// DB-backed, Settings-editable policy is the intended follow-up.)
 const ROUTING_POLICY: Record<string, Record<string, string>> = {
   planning: {
     low: "claude-sonnet-4-6",

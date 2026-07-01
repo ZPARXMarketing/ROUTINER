@@ -112,21 +112,13 @@ function readStdin() {
   });
 }
 
-async function callProxy(prompt) {
-  const body = {
-    model: opts.model,
-    max_tokens: opts.maxTokens,
-    account: opts.account,
-    trigger_key: opts.triggerKey,
-    prompt,
-  };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// One attempt. Returns { json } on a parseable response, or { retryable, error }
+// / { fatal, error } so the caller can decide whether to retry.
+async function callProxyOnce(body, headers) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 45_000);
-  const headers = { "Content-Type": "application/json" };
-  // Forward the proxy's shared secret when the env provides one. Harmless when
-  // the proxy is ungated (RESPONDER_SECRET unset there); required once it's on.
-  const secret = process.env.RESPONDER_SECRET || process.env.ROUTINER_RESPONDER_SECRET;
-  if (secret) headers["x-responder-secret"] = secret;
   try {
     const res = await fetch(opts.url, {
       method: "POST",
@@ -139,16 +131,51 @@ async function callProxy(prompt) {
     try {
       json = JSON.parse(text);
     } catch {
-      return { ok: false, error: `non-JSON response (HTTP ${res.status}): ${text.slice(0, 300)}` };
+      // Non-JSON (proxy/gateway hiccup): retry on 429/5xx, otherwise give up.
+      const retryable = res.status === 429 || res.status >= 500;
+      return { retryable, error: `non-JSON response (HTTP ${res.status}): ${text.slice(0, 300)}` };
     }
     if (!res.ok && json.ok === undefined) json.ok = false;
-    return json;
+    // A well-formed JSON body is authoritative even on 5xx — return it as-is,
+    // but flag transient HTTP statuses so the caller can retry a bare error.
+    return { json, retryable: res.status === 429 || res.status >= 500 };
   } catch (e) {
     const msg = e.name === "AbortError" ? "request timed out after 45s" : String(e.message || e);
-    return { ok: false, error: msg };
+    return { retryable: true, error: msg }; // network/timeout → retry
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function callProxy(prompt) {
+  const body = {
+    model: opts.model,
+    max_tokens: opts.maxTokens,
+    account: opts.account,
+    trigger_key: opts.triggerKey,
+    prompt,
+  };
+  const headers = { "Content-Type": "application/json" };
+  // Forward the proxy's shared secret when the env provides one. Harmless when
+  // the proxy is ungated (RESPONDER_SECRET unset there); required once it's on.
+  const secret = process.env.RESPONDER_SECRET || process.env.ROUTINER_RESPONDER_SECRET;
+  if (secret) headers["x-responder-secret"] = secret;
+
+  // One retry with a short backoff to ride out transient rate limits / blips.
+  const MAX_ATTEMPTS = 2;
+  let last = { ok: false, error: "unknown" };
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const r = await callProxyOnce(body, headers);
+    if (r.json) {
+      if (r.json.ok !== false || !r.retryable || attempt === MAX_ATTEMPTS) return r.json;
+      last = r.json; // retryable error body → try once more
+    } else {
+      last = { ok: false, error: r.error };
+      if (!r.retryable || attempt === MAX_ATTEMPTS) return last;
+    }
+    await sleep(1000 * attempt); // 1s, then 2s
+  }
+  return last;
 }
 
 async function main() {

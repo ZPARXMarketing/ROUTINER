@@ -133,6 +133,19 @@ with your tools. If it asks you to **process the board / plan / schedule**, use
 the **[`plan-routines`](.claude/skills/plan-routines/SKILL.md)** skill — it has
 the exact Supabase REST recipes. The loop:
 
+> **Report back when you finish.** So the human can see what a fired routine
+> actually did (not just that it fired), POST a one-paragraph summary to the
+> `routiner-admin` edge function at the end of your run — it lands in the app's
+> **History**. If the session env has your `routineId` (the scheduler passes it
+> in the fire body), include it so the run inherits the right owner + title:
+> ```bash
+> ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
+> curl -s "$ADMIN" -H "Content-Type: application/json" \
+>   -d '{"action":"report","routineId":"<id-or-omit>","status":"success",
+>        "summary":"<what you did, 1 short paragraph>"}' >/dev/null
+> ```
+> `status` is `success | error | missed`. Omit `routineId` for ad-hoc runs.
+
 1. **Read the Board** (`routiner_notes`; statuses `active | brainstorm | planned
    | done | dismissed`). **Act only on `active` notes.** Never touch
    `brainstorm` notes — those are still being thought through; the human
