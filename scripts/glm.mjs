@@ -38,6 +38,10 @@
 // Endpoint resolution (first that is set):
 //   --url <u>  |  $ROUTINER_GLM_URL  |  $ROUTINER_PROXY_URL  |  the default below.
 //
+// Auth: if the proxy is gated (its RESPONDER_SECRET edge secret is set), set the
+// same value here as $RESPONDER_SECRET and it's forwarded automatically. When the
+// proxy is ungated, no secret is needed and any value here is harmless.
+//
 // Exit codes: 0 ok · 1 proxy/network error · 2 ping assertion failed · 3 bad usage.
 
 const DEFAULT_URL =
@@ -118,10 +122,15 @@ async function callProxy(prompt) {
   };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 45_000);
+  const headers = { "Content-Type": "application/json" };
+  // Forward the proxy's shared secret when the env provides one. Harmless when
+  // the proxy is ungated (RESPONDER_SECRET unset there); required once it's on.
+  const secret = process.env.RESPONDER_SECRET || process.env.ROUTINER_RESPONDER_SECRET;
+  if (secret) headers["x-responder-secret"] = secret;
   try {
     const res = await fetch(opts.url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });

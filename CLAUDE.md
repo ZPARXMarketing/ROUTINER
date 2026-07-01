@@ -60,11 +60,14 @@ node scripts/glm.mjs --ping   # end-to-end self-test: proxy reachable + logging 
 # Delegate a coding sub-task via the Supabase edge proxy; review before using it.
 SUPA="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/dynamic-responder"
 OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
+  ${RESPONDER_SECRET:+-H "x-responder-secret: $RESPONDER_SECRET"} \
   -d '{"model":"z-ai/glm-4.7","max_tokens":1024,
        "account":"sparks9679","trigger_key":"t_a",
        "prompt":"<the sub-task prompt>"}' | jq -r '.content')
 # `account`/`trigger_key` are optional — they just attribute the spend in the
 # usage meter (see below). Every call is logged with its token + dollar cost.
+# The x-responder-secret header is only needed if the proxy is gated
+# (RESPONDER_SECRET edge secret set); the ${VAR:+…} expansion omits it otherwise.
 # $OUT now holds the draft — you read it, fix/verify it, then fold it into the real work.
 # Errors come back as {"ok":false,"error":"…"}; if it fails, just do the work yourself.
 # If .content is "(empty)", the model spent the budget before emitting text —
@@ -108,9 +111,19 @@ balance via `/api/v1/key`, key-side so it never leaves Supabase):
 > Setup (one-time, human): put the key in Supabase edge secrets as
 > `OPENROUTER_API_KEY` and deploy the `dynamic-responder` function (Supabase →
 > Edge Functions → editor, or `supabase functions deploy dynamic-responder`).
-> The proxy currently runs with JWT verification off, so no auth header is
+> The proxy runs with JWT verification off, so no Supabase auth header is
 > needed. Rotating the key never touches this repo or any session — just update
 > the edge secret.
+>
+> **Hardening the proxy (recommended — all optional edge secrets):**
+> - `RESPONDER_SECRET` — shared secret. When set, every proxy call must present
+>   it (`x-responder-secret: <secret>`); `scripts/glm.mjs` forwards it from its
+>   own `$RESPONDER_SECRET`. Without this the endpoint is world-callable.
+> - `MAX_DAILY_SPEND` — daily USD cap (e.g. `5`). The proxy sums today's cost
+>   from `routiner_openrouter_usage` and refuses (429) once the cap is hit.
+> - `ALLOWED_MODELS` — comma-separated allowlist that replaces the built-in one
+>   (the documented GLM/DeepSeek/Kimi/Llama set + `openrouter/auto`). Requests
+>   for any other model are rejected 400.
 
 ## If you're a routine session, or asked to "process the board" / "plan" / "schedule work"
 

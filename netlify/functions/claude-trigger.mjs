@@ -51,6 +51,7 @@ const cors = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'POST, OPTIONS',
   'access-control-allow-headers': 'content-type, authorization',
+  'access-control-expose-headers': 'x-routiner-warning',
 };
 
 function resolveFireUrl(trigger) {
@@ -125,10 +126,20 @@ async function loadUserCreds(accessToken, account, triggerKey) {
   } catch { return null; }
 }
 
+// True when no gating secret is configured, so anyone who can reach this
+// function can fire routines using the fallback env-var creds. Surfaced as a
+// server-side warning + an x-routiner-warning response header so the
+// misconfiguration is visible instead of silent.
+const UNGATED = !process.env.ROUTINER_FIRE_SECRET;
+
 // Returns null if authorized, otherwise a Response to short-circuit with.
 async function authorize(req) {
   const secret = process.env.ROUTINER_FIRE_SECRET;
-  if (!secret) return null; // gating not configured → open (back-compat)
+  if (!secret) {
+    // gating not configured → open (back-compat), but make it loud.
+    console.warn('[claude-trigger] UNGATED: ROUTINER_FIRE_SECRET is not set — anyone who can reach this endpoint can fire routines. Set it to require a signed-in user.');
+    return null;
+  }
 
   const tok = bearer(req);
   if (tok && tok === secret) return null; // the scheduler
@@ -187,7 +198,11 @@ export default async (req) => {
     const body = await resp.text();
     return new Response(body || JSON.stringify({ ok: resp.ok, status: resp.status }), {
       status: resp.ok ? 200 : resp.status,
-      headers: { 'content-type': resp.headers.get('content-type') || 'application/json', ...cors },
+      headers: {
+        'content-type': resp.headers.get('content-type') || 'application/json',
+        ...(UNGATED ? { 'x-routiner-warning': 'ungated: ROUTINER_FIRE_SECRET not set' } : {}),
+        ...cors,
+      },
     });
   } catch (err) {
     // Never surface the raw error: it can embed the fire URL / token. Log it
