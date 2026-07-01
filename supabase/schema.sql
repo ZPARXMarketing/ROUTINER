@@ -23,6 +23,8 @@ create table if not exists public.routiner_routines (
   duration_min integer not null default 45,          -- calendar block length
   scheduled_at timestamptz,
   last_run     timestamptz,
+  retry_count  integer not null default 0,           -- scheduler: failed-fire retries for one-offs (see 0009)
+  tz           text,                                  -- IANA tz anchoring local time for DST-correct recurrence; null = UTC arithmetic
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );

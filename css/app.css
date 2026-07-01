@@ -311,6 +311,7 @@ a { color: var(--periwinkle); }
 .chip--due { background: var(--lime); color: var(--ink); }
 .chip--success { background: rgba(188,239,47,0.12); color: var(--lime); border-color: rgba(188,239,47,0.35); }
 .chip--error { background: rgba(255,77,94,0.14); color: var(--danger); border-color: rgba(255,77,94,0.4); }
+.chip--missed { background: rgba(245,211,59,0.10); color: var(--yellow); border-color: rgba(245,211,59,0.3); }
 .chip--dryrun { background: rgba(245,211,59,0.14); color: var(--yellow); border-color: rgba(245,211,59,0.4); }
 .chip--ran { background: rgba(124,135,158,0.14); color: var(--grey-300); border-color: var(--grey-700); }
 

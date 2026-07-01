@@ -168,6 +168,7 @@ const fromRow = (r) => ({
   triggerKey: r.trigger_key || null,
   recurrence: r.recurrence, status: r.status, scheduledAt: r.scheduled_at, lastRun: r.last_run,
   durationMin: r.duration_min || DEFAULT_DURATION_MIN,
+  tz: r.tz || null, retryCount: r.retry_count || 0,
   createdAt: r.created_at, updatedAt: r.updated_at,
 });
 const toRow = (o) => ({
@@ -177,7 +178,13 @@ const toRow = (o) => ({
   recurrence: o.recurrence || 'none', status: o.status || 'library',
   duration_min: o.durationMin || DEFAULT_DURATION_MIN,
   scheduled_at: o.scheduledAt || null, last_run: o.lastRun || null,
+  // Only send tz when we have one, so an edit that doesn't carry it never nulls
+  // the column (the scheduler owns retry_count, so it's never written here).
+  ...(o.tz ? { tz: o.tz } : {}),
 });
+// The browser's IANA timezone, stamped onto new routines so recurrence stays
+// DST-correct (see the scheduler's nextOccurrence). Falls back to null.
+const localTz = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch { return null; } };
 
 /* ---------- Data layer ---------- */
 async function loadAll() {
@@ -192,10 +199,26 @@ async function loadAll() {
   runs = (runRes.data || []).map((x) => ({ id: x.id, routineId: x.routine_id, title: x.title, status: x.status, output: x.output, firedAt: x.fired_at }));
   await dbLoadNotes();
   render();
+  warnRecentFailures();
+}
+// Nudge (once per session) when routines failed or were missed in the last 24h,
+// so scheduler problems don't stay buried in History.
+let _failuresWarned = false;
+function warnRecentFailures() {
+  if (_failuresWarned) return;
+  const dayAgo = Date.now() - 24 * 3600 * 1000;
+  const bad = runs.filter((r) => (r.status === 'error' || r.status === 'missed') &&
+    r.firedAt && new Date(r.firedAt).getTime() >= dayAgo);
+  if (!bad.length) return;
+  _failuresWarned = true;
+  const n = bad.length;
+  const kinds = bad.some((b) => b.status === 'missed') ? 'failed/missed' : 'failed';
+  toast(`${n} routine run${n > 1 ? 's' : ''} ${kinds} in the last 24h — see History`, 'error');
 }
 const getRoutine = (id) => routines.find((r) => r.id === id);
 
 async function dbCreate(obj) {
+  if (!obj.tz) obj = { ...obj, tz: localTz() }; // stamp the creator's tz for DST-correct recurrence
   const { data, error } = await sb.from('routiner_routines').insert(toRow(obj)).select().single();
   if (error) { toast('Save failed: ' + error.message, 'error'); return null; }
   const r = fromRow(data); routines.unshift(r); return r;
