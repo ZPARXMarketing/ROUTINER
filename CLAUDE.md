@@ -76,6 +76,12 @@ OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
 > error, the offload silently no-ops and the session just does the work itself —
 > allow that host in the environment's egress settings and re-run `--ping`.
 
+More `glm.mjs` flags: `--stdin` (append piped text), `--json` (raw proxy
+response), `--quiet` (only the model's text), `--account`/`--trigger-key`
+(override attribution). `--ping` exits `0` only when the proxy answers `PONG`,
+`1` on proxy/network error, `2` if it answers but the assertion fails — using a
+512-token budget so GLM's reasoning tokens don't starve the reply into "(empty)".
+
 Model picks (pass as `"model"`): `z-ai/glm-4.7` (**coding default** — fast &
 cheap), `z-ai/glm-5` (harder coding / most capable), `moonshotai/kimi-k2.7-code`
 (code-adjacent), `deepseek/deepseek-chat` (cheapest all-rounder),

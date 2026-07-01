@@ -1,147 +1,213 @@
 #!/usr/bin/env node
-// Routiner — GLM / OpenRouter offload helper (one command, zero deps).
+// Routiner — GLM proxy CLI.
 //
-// A routine session has NO OpenRouter key in its env; the key lives in Supabase
-// edge secrets and is used only by the `dynamic-responder` proxy. This wraps the
-// proxy call so a routine can offload a cheap coding sub-task in ONE line instead
-// of pasting a multi-line curl + jq each time — with consistent model defaults
-// and spend attribution, and clear diagnostics when the call can't get through.
+// A thin, zero-dependency wrapper around the OpenRouter proxy edge function
+// (`dynamic-responder`), the same endpoint documented in CLAUDE.md. A routine
+// session has no OPENROUTER_API_KEY in its env — and shouldn't. The key lives
+// in Supabase edge secrets and never leaves Supabase; this script just POSTs a
+// prompt to the proxy and prints the model's text back.
+//
+// The `--ping` mode is a health check: it sends a tiny prompt and verifies the
+// proxy answers, so a scheduled routine can confirm the GLM path is alive
+// (edge function up, key present, OpenRouter reachable, credits not exhausted)
+// without any human watching.
 //
 // Usage:
-//   node scripts/glm.mjs "Write a regex for E.164 phone numbers. Output only it."
-//   echo "<long prompt>" | node scripts/glm.mjs            # prompt from stdin
-//   node scripts/glm.mjs --model z-ai/glm-5 "<hard sub-task>"
-//   node scripts/glm.mjs --max-tokens 2048 --system "You are terse." "<prompt>"
-//   node scripts/glm.mjs --ping                            # end-to-end self-test
-//   node scripts/glm.mjs --json "<prompt>"                 # raw proxy envelope
+//   node scripts/glm.mjs --ping                        # health check → PONG
+//   node scripts/glm.mjs "summarize this in one line"  # one-shot prompt
+//   node scripts/glm.mjs --model z-ai/glm-5 "hard task"
+//   echo "long text" | node scripts/glm.mjs --stdin "summarize:"
+//   node scripts/glm.mjs --json --ping                 # raw JSON, then exit
 //
-// On success it prints ONLY the model's text to stdout (so it composes in a
-// pipeline). Diagnostics go to stderr. Exit code is non-zero on any failure.
+// Flags:
+//   --ping                 send a fixed health-check prompt and assert PONG
+//   --model <id>           model id (default z-ai/glm-4.7 — the coding default)
+//   --max-tokens <n>       token budget (default 1024; --ping uses 512)
+//   --account <a>          spend-attribution account (default sparks9679)
+//   --trigger-key <k>      spend-attribution trigger  (default t_a)
+//   --stdin                read the prompt body from stdin, appended to argv text
+//   --url <u>              override the proxy endpoint
+//   --json                 print the raw proxy JSON response, then exit
+//   --quiet                print only the model's text (or nothing on error)
 //
-// Env (all optional):
-//   ROUTINER_PROXY_URL   override the dynamic-responder endpoint
-//   ROUTINER_ACCOUNT     spend attribution (default: sparks9679)
-//   ROUTINER_TRIGGER     spend attribution (default: t_a)
+// Attribution defaults come from the environment so a per-account Claude env can
+// set them once: $ROUTINER_ACCOUNT / $ROUTINER_TRIGGER (with $ROUTINER_GLM_ACCOUNT
+// / $ROUTINER_GLM_TRIGGER accepted as fallbacks). Set ROUTINER_ACCOUNT=zparxmarketing
+// in the zparx environment so its calls show up under the right account.
+//
+// Endpoint resolution (first that is set):
+//   --url <u>  |  $ROUTINER_GLM_URL  |  $ROUTINER_PROXY_URL  |  the default below.
+//
+// Exit codes: 0 ok · 1 proxy/network error · 2 ping assertion failed · 3 bad usage.
 
-const PROXY_URL = process.env.ROUTINER_PROXY_URL ||
+const DEFAULT_URL =
   "https://vonfdzttupyemtomsojy.supabase.co/functions/v1/dynamic-responder";
-const USAGE_URL = process.env.ROUTINER_USAGE_URL ||
-  "https://vonfdzttupyemtomsojy.supabase.co/functions/v1/openrouter-usage";
-const ACCOUNT = process.env.ROUTINER_ACCOUNT || "sparks9679";
-const TRIGGER = process.env.ROUTINER_TRIGGER || "t_a";
-const DEFAULT_MODEL = "z-ai/glm-4.7"; // the documented coding default (fast & cheap)
 
-// ── args ──────────────────────────────────────────────────────────────────────
+// ── args ─────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);
-const val = (f, d) => { const i = argv.indexOf(f); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
-const flagsWithValue = new Set(["--model", "--max-tokens", "--system"]);
-// Everything that isn't a known flag (or a known flag's value) is the prompt.
+const val = (f, d) => {
+  const i = argv.indexOf(f);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : d;
+};
+// Positional prompt text = every arg that isn't a flag or a flag's value.
+const FLAGS_WITH_VALUE = new Set([
+  "--model",
+  "--max-tokens",
+  "--account",
+  "--trigger-key",
+  "--url",
+]);
 const positional = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
-  if (a === "--ping" || a === "--json") continue;
-  if (flagsWithValue.has(a)) { i++; continue; }
-  if (a.startsWith("--")) continue;
+  if (a.startsWith("--")) {
+    if (FLAGS_WITH_VALUE.has(a)) i++; // skip its value
+    continue;
+  }
   positional.push(a);
 }
 
-async function readStdin() {
-  if (process.stdin.isTTY) return "";
-  const chunks = [];
-  for await (const c of process.stdin) chunks.push(c);
-  return Buffer.concat(chunks).toString("utf8").trim();
+const opts = {
+  ping: has("--ping"),
+  model: val("--model", "z-ai/glm-4.7"),
+  // --ping uses a comfortable floor: GLM-4.7 is a reasoning model and can burn
+  // the whole budget on hidden reasoning tokens, returning "(empty)" (see
+  // CLAUDE.md's ">=512" note). Too low a cap makes the health check flap.
+  maxTokens: Number(val("--max-tokens", has("--ping") ? "512" : "1024")) || 1024,
+  // Attribution: honor the deployed ROUTINER_ACCOUNT/ROUTINER_TRIGGER contract
+  // (the zparx env sets ROUTINER_ACCOUNT), with the older ROUTINER_GLM_* names
+  // kept as fallbacks. Default trigger t_a matches the routines in the DB.
+  account: val(
+    "--account",
+    process.env.ROUTINER_ACCOUNT || process.env.ROUTINER_GLM_ACCOUNT || "sparks9679",
+  ),
+  triggerKey: val(
+    "--trigger-key",
+    process.env.ROUTINER_TRIGGER || process.env.ROUTINER_GLM_TRIGGER || "t_a",
+  ),
+  stdin: has("--stdin"),
+  url: val(
+    "--url",
+    process.env.ROUTINER_GLM_URL || process.env.ROUTINER_PROXY_URL || DEFAULT_URL,
+  ),
+  jsonOut: has("--json"),
+  quiet: has("--quiet"),
+};
+
+const PING_PROMPT = "Reply with exactly: PONG. Output only the answer.";
+
+function readStdin() {
+  return new Promise((resolve) => {
+    let data = "";
+    if (process.stdin.isTTY) return resolve("");
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (c) => (data += c));
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", () => resolve(data));
+  });
 }
 
-// A POST to the proxy. Returns the parsed envelope, or throws with a message that
-// distinguishes "couldn't reach the host" (the usual egress block) from API errors.
-async function callProxy(body) {
-  let resp;
-  try {
-    resp = await fetch(PROXY_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    throw new Error(
-      `could not reach the proxy at ${PROXY_URL}\n` +
-      `  (${e.cause?.code || e.message}) — this is almost always the routine ` +
-      `environment's network policy blocking supabase.co.\n` +
-      `  Allow that host in the environment's egress settings, then retry.`,
-    );
-  }
-  const text = await resp.text();
-  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-  if (!resp.ok || data?.ok === false) {
-    throw new Error(`proxy returned HTTP ${resp.status}: ${data?.error || text}`);
-  }
-  return data;
-}
-
-async function runPrompt() {
-  const argPrompt = positional.join(" ").trim();
-  const prompt = argPrompt || (await readStdin());
-  if (!prompt) {
-    process.stderr.write("error: no prompt (pass it as an argument or on stdin)\n");
-    process.exit(2);
-  }
+async function callProxy(prompt) {
   const body = {
+    model: opts.model,
+    max_tokens: opts.maxTokens,
+    account: opts.account,
+    trigger_key: opts.triggerKey,
     prompt,
-    model: val("--model", DEFAULT_MODEL),
-    max_tokens: Math.max(Number(val("--max-tokens", "1024")) || 1024, 256),
-    account: ACCOUNT,
-    trigger_key: TRIGGER,
   };
-  if (has("--system")) body.system = val("--system", "");
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 45_000);
+  try {
+    const res = await fetch(opts.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      return { ok: false, error: `non-JSON response (HTTP ${res.status}): ${text.slice(0, 300)}` };
+    }
+    if (!res.ok && json.ok === undefined) json.ok = false;
+    return json;
+  } catch (e) {
+    const msg = e.name === "AbortError" ? "request timed out after 45s" : String(e.message || e);
+    return { ok: false, error: msg };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-  const data = await callProxy(body);
-  if (has("--json")) { process.stdout.write(JSON.stringify(data, null, 2) + "\n"); return; }
-  const content = (data.content || "").trim();
-  if (!content || content === "(empty)") {
-    process.stderr.write(
-      "warning: model returned no text (budget spent before output). " +
-      "Raise --max-tokens (>=512) and/or add 'Output only the answer.' to the prompt.\n",
-    );
+async function main() {
+  // Build the prompt.
+  let prompt;
+  if (opts.ping) {
+    prompt = PING_PROMPT;
+  } else {
+    let text = positional.join(" ").trim();
+    if (opts.stdin) {
+      const piped = (await readStdin()).trim();
+      text = [text, piped].filter(Boolean).join("\n\n");
+    }
+    if (!text) {
+      process.stderr.write(
+        "glm.mjs: no prompt given. Pass text, use --stdin, or --ping.\n",
+      );
+      process.exit(3);
+    }
+    prompt = text;
+  }
+
+  const started = Date.now();
+  const resp = await callProxy(prompt);
+  const ms = Date.now() - started;
+
+  if (opts.jsonOut) {
+    process.stdout.write(JSON.stringify(resp) + "\n");
+    process.exit(resp.ok ? 0 : 1);
+  }
+
+  if (!resp.ok) {
+    if (!opts.quiet) process.stderr.write(`GLM proxy error: ${resp.error || "unknown"}\n`);
     process.exit(1);
   }
-  process.stdout.write(content + "\n");
-  process.stderr.write(`\n[ok] ${data.model} · ${data.usage?.total_tokens ?? "?"} tok` +
-    (data.usage?.cost != null ? ` · $${Number(data.usage.cost).toFixed(5)}` : "") + "\n");
-}
 
-// End-to-end self-test: make a trivial call, then confirm a usage row actually
-// landed in the ledger. This is the on-demand green-light the setup was missing.
-async function ping() {
-  const stamp = `ping ${Date.now()}`;
-  process.stderr.write(`[ping] POST ${PROXY_URL}\n`);
-  const data = await callProxy({
-    prompt: `Reply with exactly: pong (${stamp}). Output only that.`,
-    model: DEFAULT_MODEL, max_tokens: 256, account: ACCOUNT, trigger_key: TRIGGER,
-  });
-  process.stderr.write(`[ping] proxy ok — model=${data.model} content=${JSON.stringify(data.content)}\n`);
+  const content = (resp.content ?? "").trim();
 
-  // Give the best-effort logging a moment, then check the ledger moved.
-  await new Promise((r) => setTimeout(r, 1500));
-  try {
-    const u = await (await fetch(USAGE_URL, { headers: { accept: "application/json" } })).json();
-    const calls = u?.totals?.today?.calls ?? u?.totals?.lifetime?.calls ?? null;
-    process.stderr.write(
-      `[ping] usage meter reachable — today.calls=${u?.totals?.today?.calls ?? "?"}, ` +
-      `credit_remaining=${u?.key?.limit_remaining ?? "?"}\n`,
-    );
-    process.stderr.write(
-      calls
-        ? `[ping] PASS — proxy works and the usage ledger is recording calls.\n`
-        : `[ping] PARTIAL — proxy answered but no usage rows yet; check that ` +
-          `dynamic-responder has SUPABASE_SERVICE_ROLE_KEY and was redeployed.\n`,
-    );
-  } catch {
-    process.stderr.write(`[ping] proxy works, but couldn't read the usage meter to confirm logging.\n`);
+  if (opts.ping) {
+    const pass = /\bPONG\b/i.test(content);
+    if (opts.quiet) {
+      process.stdout.write(content + "\n");
+    } else {
+      const cost = resp.usage?.cost;
+      const model = resp.model || opts.model;
+      const costStr = typeof cost === "number" ? ` · $${cost.toFixed(6)}` : "";
+      process.stdout.write(
+        `${pass ? "✓ GLM proxy alive" : "✗ GLM proxy responded but assertion failed"}` +
+          ` — "${content || "(empty)"}" via ${model} in ${ms}ms${costStr}\n`,
+      );
+    }
+    process.exit(pass ? 0 : 2);
   }
+
+  // Normal one-shot: print the model text.
+  if (opts.quiet) {
+    process.stdout.write(content + "\n");
+  } else {
+    const model = resp.model || opts.model;
+    const cost = resp.usage?.cost;
+    const costStr = typeof cost === "number" ? ` ($${cost.toFixed(6)})` : "";
+    process.stdout.write(content + "\n");
+    process.stderr.write(`— ${model} · ${ms}ms${costStr}\n`);
+  }
+  process.exit(0);
 }
 
-(has("--ping") ? ping() : runPrompt()).catch((e) => {
-  process.stderr.write(`error: ${e.message}\n`);
+main().catch((e) => {
+  process.stderr.write(`glm.mjs: ${String(e.stack || e)}\n`);
   process.exit(1);
 });
