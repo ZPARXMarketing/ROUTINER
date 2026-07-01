@@ -55,6 +55,22 @@ OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
 # raise max_tokens (>=512) and/or add "Output only the answer." to the prompt.
 ```
 
+Or use the zero-dependency CLI wrapper `scripts/glm.mjs` (same proxy, no key
+needed) — handy for one-shots and for a scheduled **health check**:
+
+```bash
+node scripts/glm.mjs --ping                        # health check → "✓ GLM proxy alive … PONG"
+node scripts/glm.mjs "summarize this in one line"  # one-shot prompt (text on stdout)
+node scripts/glm.mjs --model z-ai/glm-5 "hard one" # pick a model
+echo "long text" | node scripts/glm.mjs --stdin "summarize:"
+node scripts/glm.mjs --json --ping                 # raw proxy JSON
+```
+
+`--ping` exits `0` only when the proxy answers `PONG` (edge function up, key
+present, OpenRouter reachable, credits not spent); `1` on proxy/network error,
+`2` if it answers but the assertion fails. It uses a 512-token budget so GLM's
+reasoning tokens don't starve the reply into "(empty)".
+
 Model picks (pass as `"model"`): `z-ai/glm-4.7` (**coding default** — fast &
 cheap), `z-ai/glm-5` (harder coding / most capable), `moonshotai/kimi-k2.7-code`
 (code-adjacent), `deepseek/deepseek-chat` (cheapest all-rounder),
