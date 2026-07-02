@@ -1099,6 +1099,8 @@ function syncTabs() { $$('.tab').forEach((t) => t.classList.toggle('is-active', 
 /* ---------- Auth UI ---------- */
 function showAuth(mode = 'signin') {
   ['#sidebar', '#topbar'].forEach((s) => { const e = $(s); if (e) e.style.display = 'none'; });
+  $('.app')?.classList.add('is-auth'); // sidebar is hidden → collapse the grid so the card centers
+
   const signup = mode === 'signup';
   view.innerHTML = `<div class="auth">
     <h2>${signup ? 'Create your account' : 'Sign in'}</h2>
@@ -1132,6 +1134,8 @@ function showAuth(mode = 'signin') {
 
 function showApp() {
   ['#sidebar', '#topbar'].forEach((s) => { const e = $(s); if (e) e.style.display = ''; });
+  $('.app')?.classList.remove('is-auth'); // restore the sidebar + content grid
+
   paintFireSwitch();
   const chip = $('#userChip');
   if (chip) { chip.innerHTML = `☁ <b>${esc(session.user.email)}</b>`; }

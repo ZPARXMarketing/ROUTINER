@@ -23,6 +23,10 @@ a { color: var(--periwinkle); }
   grid-template-columns: 248px minmax(0, 1fr);
   min-height: 100vh;
 }
+/* Signed out the sidebar is display:none, so the lone .content child would land
+   in the 248px sidebar track and leave the rest of the viewport empty. Collapse
+   to a single column while the auth screen is up so the card centers. */
+.app.is-auth { grid-template-columns: 1fr; }
 .content {
   min-width: 0;
   padding: max(var(--sp-6), env(safe-area-inset-top)) var(--sp-6) var(--sp-24);
