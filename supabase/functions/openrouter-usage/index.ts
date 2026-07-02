@@ -49,6 +49,8 @@ type Row = {
   cost: number;
   account: string | null;
   trigger_key: string | null;
+  ok?: boolean;
+  error?: string | null;
 };
 
 Deno.serve(async (req: Request) => {
@@ -88,7 +90,7 @@ Deno.serve(async (req: Request) => {
       since.setUTCDate(1);
       since.setUTCHours(0, 0, 0, 0); // start of this UTC month
       const q = new URL(`${supaUrl}/rest/v1/routiner_openrouter_usage`);
-      q.searchParams.set("select", "created_at,model,prompt_tokens,completion_tokens,total_tokens,cost,account,trigger_key");
+      q.searchParams.set("select", "created_at,model,prompt_tokens,completion_tokens,total_tokens,cost,account,trigger_key,ok,error");
       q.searchParams.set("created_at", `gte.${since.toISOString()}`);
       q.searchParams.set("order", "created_at.desc");
       q.searchParams.set("limit", "5000");
@@ -101,15 +103,24 @@ Deno.serve(async (req: Request) => {
 
   const now = new Date();
   const startOfDay = new Date(now); startOfDay.setUTCHours(0, 0, 0, 0);
-  const dayBucket = { cost: 0, tokens: 0, calls: 0 };
-  const monthBucket = { cost: 0, tokens: 0, calls: 0 };
+  const dayBucket = { cost: 0, tokens: 0, calls: 0, errors: 0 };
+  const monthBucket = { cost: 0, tokens: 0, calls: 0, errors: 0 };
   const byModel: Record<string, { model: string; cost: number; tokens: number; calls: number }> = {};
 
   for (const row of rows) {
+    const failed = row.ok === false;
+    const inDay = new Date(row.created_at) >= startOfDay;
+    if (failed) {
+      // Failed calls carry no cost/tokens — count them as errors only, so spend
+      // and call totals stay clean while failure rates are still visible.
+      monthBucket.errors += 1;
+      if (inDay) dayBucket.errors += 1;
+      continue;
+    }
     const cost = Number(row.cost) || 0;
     const tokens = Number(row.total_tokens) || 0;
     monthBucket.cost += cost; monthBucket.tokens += tokens; monthBucket.calls += 1; // window = this month
-    if (new Date(row.created_at) >= startOfDay) {
+    if (inDay) {
       dayBucket.cost += cost; dayBucket.tokens += tokens; dayBucket.calls += 1;
     }
     const m = (byModel[row.model] ||= { model: row.model || "(unknown)", cost: 0, tokens: 0, calls: 0 });
@@ -117,7 +128,8 @@ Deno.serve(async (req: Request) => {
   }
 
   const round = (n: number) => Math.round(n * 1e6) / 1e6;
-  const tidy = (b: { cost: number; tokens: number; calls: number }) => ({ cost: round(b.cost), tokens: b.tokens, calls: b.calls });
+  const tidy = (b: { cost: number; tokens: number; calls: number; errors: number }) =>
+    ({ cost: round(b.cost), tokens: b.tokens, calls: b.calls, errors: b.errors });
 
   return json({
     ok: true,
@@ -131,6 +143,8 @@ Deno.serve(async (req: Request) => {
       cost: round(Number(r.cost) || 0),
       account: r.account,
       trigger_key: r.trigger_key,
+      ok: r.ok !== false,
+      error: r.error ?? null,
     })),
   });
 });

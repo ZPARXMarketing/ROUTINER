@@ -13,6 +13,7 @@ import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 import {
   MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
   effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel,
+  ROUTING_POLICY, setActivePolicy, getActivePolicy, normalizePolicy,
 } from './model-router.js';
 import { nextOccurrence, nextOccurrences } from './schedule.js';
 
@@ -37,6 +38,7 @@ const DEFAULT_ACCOUNTS = () => [
   { id: 'zparxmarketing', label: 'Account B', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
 ];
 let accountsCfg = DEFAULT_ACCOUNTS();
+let settingsPolicy = null; // the user's saved auto-routing policy (null = built-in default)
 
 const genId = (p) => `${p}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -168,6 +170,7 @@ const fromRow = (r) => ({
   triggerKey: r.trigger_key || null,
   recurrence: r.recurrence, status: r.status, scheduledAt: r.scheduled_at, lastRun: r.last_run,
   durationMin: r.duration_min || DEFAULT_DURATION_MIN,
+  tz: r.tz || null, retryCount: r.retry_count || 0,
   createdAt: r.created_at, updatedAt: r.updated_at,
 });
 const toRow = (o) => ({
@@ -177,25 +180,51 @@ const toRow = (o) => ({
   recurrence: o.recurrence || 'none', status: o.status || 'library',
   duration_min: o.durationMin || DEFAULT_DURATION_MIN,
   scheduled_at: o.scheduledAt || null, last_run: o.lastRun || null,
+  // Only send tz when we have one, so an edit that doesn't carry it never nulls
+  // the column (the scheduler owns retry_count, so it's never written here).
+  ...(o.tz ? { tz: o.tz } : {}),
 });
+// The browser's IANA timezone, stamped onto new routines so recurrence stays
+// DST-correct (see the scheduler's nextOccurrence). Falls back to null.
+const localTz = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch { return null; } };
 
 /* ---------- Data layer ---------- */
 async function loadAll() {
   const [rRes, runRes, setRes] = await Promise.all([
     sb.from('routiner_routines').select('*').order('updated_at', { ascending: false }),
     sb.from('routiner_runs').select('*').order('fired_at', { ascending: false }).limit(200),
-    sb.from('routiner_settings').select('accounts').maybeSingle(),
+    sb.from('routiner_settings').select('*').maybeSingle(),
   ]);
   accountsCfg = normalizeAccounts(setRes && setRes.data && setRes.data.accounts, false);
+  // Apply the user's saved auto-routing policy so previews/cards match what the
+  // scheduler will fire (null/invalid → built-in default).
+  settingsPolicy = normalizePolicy(setRes && setRes.data && setRes.data.model_policy);
+  setActivePolicy(settingsPolicy);
   if (rRes.error) { toast('Load failed: ' + rRes.error.message, 'error'); return; }
   routines = (rRes.data || []).map(fromRow);
   runs = (runRes.data || []).map((x) => ({ id: x.id, routineId: x.routine_id, title: x.title, status: x.status, output: x.output, firedAt: x.fired_at }));
   await dbLoadNotes();
   render();
+  warnRecentFailures();
+}
+// Nudge (once per session) when routines failed or were missed in the last 24h,
+// so scheduler problems don't stay buried in History.
+let _failuresWarned = false;
+function warnRecentFailures() {
+  if (_failuresWarned) return;
+  const dayAgo = Date.now() - 24 * 3600 * 1000;
+  const bad = runs.filter((r) => (r.status === 'error' || r.status === 'missed') &&
+    r.firedAt && new Date(r.firedAt).getTime() >= dayAgo);
+  if (!bad.length) return;
+  _failuresWarned = true;
+  const n = bad.length;
+  const kinds = bad.some((b) => b.status === 'missed') ? 'failed/missed' : 'failed';
+  toast(`${n} routine run${n > 1 ? 's' : ''} ${kinds} in the last 24h — see History`, 'error');
 }
 const getRoutine = (id) => routines.find((r) => r.id === id);
 
 async function dbCreate(obj) {
+  if (!obj.tz) obj = { ...obj, tz: localTz() }; // stamp the creator's tz for DST-correct recurrence
   const { data, error } = await sb.from('routiner_routines').insert(toRow(obj)).select().single();
   if (error) { toast('Save failed: ' + error.message, 'error'); return null; }
   const r = fromRow(data); routines.unshift(r); return r;
@@ -215,15 +244,21 @@ async function dbDelete(id) {
    server-side using your session, so you can set everything in-app —
    no Netlify env vars required. */
 async function dbLoadAccountCreds() {
-  const { data, error } = await sb.from('routiner_settings').select('accounts').maybeSingle();
+  const { data, error } = await sb.from('routiner_settings').select('*').maybeSingle();
   if (error) { toast('Couldn’t load account settings: ' + error.message, 'error'); return {}; }
+  settingsPolicy = normalizePolicy(data && data.model_policy); // keep the editor's copy fresh (undefined pre-migration → null)
   return (data && data.accounts) || {};
 }
-async function dbSaveAccountCreds(accounts) {
+// Persist accounts, and — when `modelPolicy` is explicitly passed (an object to
+// set, or null to clear) — the auto-routing policy too. Omitting the arg leaves
+// model_policy untouched.
+async function dbSaveAccountCreds(accounts, modelPolicy) {
   const { data: { user } } = await sb.auth.getUser();
   if (!user) { toast('Sign in to save settings.', 'error'); return false; }
+  const row = { user_id: user.id, accounts, updated_at: new Date().toISOString() };
+  if (modelPolicy !== undefined) row.model_policy = modelPolicy;
   const { error } = await sb.from('routiner_settings')
-    .upsert({ user_id: user.id, accounts, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+    .upsert(row, { onConflict: 'user_id' });
   if (error) { toast('Save failed: ' + error.message, 'error'); return false; }
   return true;
 }
@@ -965,6 +1000,35 @@ async function testTrigger(ai, ti) {
   statusEl.textContent = res.ok ? '✓ Reached your Claude routine — it’s live.' : `✕ ${res.msg}`;
   statusEl.className = 'trig-status ' + (res.ok ? 'is-ok' : 'is-err');
 }
+/* Auto-routing policy editor — a task_type × complexity grid of model pickers.
+   Prefilled from the live policy (the user's saved one, else the built-in
+   default). Routing targets are concrete models, so 'auto' is excluded. */
+const POLICY_MODELS = MODELS.filter((m) => m.id !== 'auto');
+function policyEditorHtml() {
+  const pol = getActivePolicy();
+  const opts = (sel) => POLICY_MODELS.map((m) => `<option value="${m.id}" ${sel === m.id ? 'selected' : ''}>${esc(m.label.split(' — ')[0])}</option>`).join('');
+  const rows = TASK_TYPES.map((tt) => `
+    <tr><th class="pol-th">${esc(tt.label)}</th>${COMPLEXITIES.map((cx) => {
+      const cur = (pol[tt.id] && pol[tt.id][cx.id]) || '';
+      return `<td><select class="select select--sm pol-cell" data-tt="${tt.id}" data-cx="${cx.id}">${opts(cur)}</select></td>`;
+    }).join('')}</tr>`).join('');
+  return `<table class="pol-grid"><thead><tr><th></th>${COMPLEXITIES.map((c) => `<th>${esc(c.label)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+function readPolicyFromDom() {
+  const pol = {};
+  $$('.pol-cell').forEach((el) => {
+    const tt = el.dataset.tt, cx = el.dataset.cx;
+    (pol[tt] ||= {})[cx] = el.value;
+  });
+  return normalizePolicy(pol); // null if somehow empty → clears back to default
+}
+/* True when a policy matches the built-in default cell-for-cell (so we store
+   null instead of a redundant copy). */
+function policyIsDefault(pol) {
+  return TASK_TYPES.every((tt) => COMPLEXITIES.every((cx) =>
+    (pol[tt.id] || {})[cx.id] === ROUTING_POLICY[tt.id][cx.id]));
+}
+
 async function openSettings() {
   editingId = null;
   drawerTitle.textContent = 'Settings';
@@ -985,6 +1049,11 @@ async function openSettings() {
     </div>
     <div class="cfg-sep">Accounts &amp; triggers</div>
     <div id="cfg-accounts"></div>
+    <details class="cfg-adv"><summary>Auto-routing policy</summary>
+      <div class="notice">Which model <b>Auto</b> picks per task type &amp; complexity. Both the app and the scheduler read this — leave it to use Routiner's defaults.</div>
+      ${policyEditorHtml()}
+      <div class="pol-actions"><button class="btn btn--ghost btn--sm" id="pol-reset" type="button">Reset to defaults</button></div>
+    </details>
     <details class="cfg-adv"><summary>Advanced (optional)</summary>
       <div class="field"><label class="label" for="s-trigger">Trigger URL override</label>
         <input class="input" id="s-trigger" placeholder="leave blank to use the built-in function" value="${esc(settings.triggerUrl)}" />
@@ -999,11 +1068,21 @@ async function openSettings() {
   drawerFoot.innerHTML = `<button class="btn btn--primary" id="s-save">Save settings</button>`;
   renderCfgAccounts();
 
+  // Reset the policy grid's selects to the built-in defaults (saved on Save).
+  const resetBtn = $('#pol-reset');
+  if (resetBtn) resetBtn.addEventListener('click', () => {
+    $$('.pol-cell').forEach((el) => { el.value = ROUTING_POLICY[el.dataset.tt][el.dataset.cx]; });
+  });
+
   $('#s-save').addEventListener('click', async () => {
     syncCfgFromDom();
     const btn = $('#s-save'); btn.disabled = true; btn.textContent = 'Saving…';
-    const ok = await dbSaveAccountCreds(cfgModel);
+    // A policy identical to the built-in default is stored as null (use defaults).
+    const pol = readPolicyFromDom();
+    const toStore = (!pol || policyIsDefault(pol)) ? null : pol;
+    const ok = await dbSaveAccountCreds(cfgModel, toStore);
     accountsCfg = normalizeAccounts(cfgModel, false);
+    if (ok) { settingsPolicy = toStore; setActivePolicy(toStore); }
     settings.account = $('#s-account').value;
     if (!getAccountCfg(settings.account)) settings.account = (accountsCfg[0] || {}).id || DEFAULT_ACCOUNT;
     settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim();

@@ -25,7 +25,7 @@ export const MODELS = [
   { id: 'auto', label: '✨ Auto — let Routiner choose', auto: true },
   // Claude — these actually fire your scheduled routines.
   { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 — most capable' },
-  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 — balanced' },
+  { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 — balanced' },
   { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 — fast & cheap' },
   // OpenRouter — selectable; used by the live test (needs an OpenRouter key).
   { id: 'openrouter/auto', label: 'OpenRouter Auto — provider routes it' },
@@ -50,41 +50,78 @@ export const COMPLEXITIES = [
 export const DEFAULT_MODEL = 'auto';
 export const DEFAULT_TASK_TYPE = 'general';
 export const DEFAULT_COMPLEXITY = 'medium';
-export const FALLBACK_MODEL = 'claude-sonnet-4-6';
+export const FALLBACK_MODEL = 'claude-sonnet-5';
 
 /* The routing table — the get_model_for_task() decision, as data. Routes to
    Claude models because that's what executes scheduled routines today. Swap a
-   row to an OpenRouter id once you wire an OpenRouter execution path. */
+   row to an OpenRouter id once you wire an OpenRouter execution path.
+
+   This is the DEFAULT/fallback. The live policy is per-user, stored in
+   routiner_settings.model_policy and edited in Settings; setActivePolicy()
+   applies it here and the scheduler reads the same row, so the two stay in sync
+   without hand-editing. routiner-scheduler keeps an identical copy of this
+   default as its own fallback — update both when the default changes.
+   ⚠ Verify these ids are still accepted by the routine /fire endpoint before a
+   release — model ids get retired; keep MODELS above in sync with any change. */
 export const ROUTING_POLICY = {
   planning: {
-    low: 'claude-sonnet-4-6',
-    medium: 'claude-sonnet-4-6',
+    low: 'claude-sonnet-5',
+    medium: 'claude-sonnet-5',
     high: 'claude-opus-4-8',        // hard planning → most capable
   },
   execution: {
     low: 'claude-haiku-4-5-20251001',
     medium: 'claude-haiku-4-5-20251001', // execution → fast & cheap
-    high: 'claude-sonnet-4-6',
+    high: 'claude-sonnet-5',
   },
   general: {
     low: 'claude-haiku-4-5-20251001',
-    medium: 'claude-sonnet-4-6',
+    medium: 'claude-sonnet-5',
     high: 'claude-opus-4-8',
   },
 };
+
+/* Validate a stored/loaded policy into the ROUTING_POLICY shape. Returns a
+   normalized copy, or null if it isn't usable (so callers fall back to the
+   built-in default). Every task_type × complexity cell must be a non-empty
+   string; missing cells are filled from ROUTING_POLICY so a partial policy is
+   still safe. */
+export function normalizePolicy(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const out = {};
+  let anyValid = false;
+  for (const tt of TASK_TYPES.map((t) => t.id)) {
+    const src = raw[tt] && typeof raw[tt] === 'object' ? raw[tt] : {};
+    out[tt] = {};
+    for (const cx of COMPLEXITIES.map((c) => c.id)) {
+      const v = typeof src[cx] === 'string' && src[cx].trim() ? src[cx].trim() : ROUTING_POLICY[tt][cx];
+      if (typeof src[cx] === 'string' && src[cx].trim()) anyValid = true;
+      out[tt][cx] = v;
+    }
+  }
+  return anyValid ? out : null;
+}
+
+/* The policy currently in effect for auto-routing. Defaults to the built-in
+   ROUTING_POLICY; the app calls setActivePolicy() with the user's saved policy
+   (routiner_settings.model_policy) on load so previews/cards match what the
+   scheduler will fire. */
+let activePolicy = ROUTING_POLICY;
+export function setActivePolicy(raw) { activePolicy = normalizePolicy(raw) || ROUTING_POLICY; }
+export function getActivePolicy() { return activePolicy; }
 
 /* Is this an Anthropic/Claude model (vs. an OpenRouter id)? */
 export const isClaudeModel = (id) => /^claude-/i.test(id || '');
 
 /* The prototype's get_model_for_task(), data-driven. */
-export function getModelForTask(taskType = DEFAULT_TASK_TYPE, complexity = DEFAULT_COMPLEXITY, policy = ROUTING_POLICY) {
+export function getModelForTask(taskType = DEFAULT_TASK_TYPE, complexity = DEFAULT_COMPLEXITY, policy = activePolicy) {
   const row = policy[taskType] || policy[DEFAULT_TASK_TYPE] || {};
   return row[complexity] || row[DEFAULT_COMPLEXITY] || FALLBACK_MODEL;
 }
 
 /* A routine's *effective* model: an explicit pick wins; otherwise auto-route
    from its task type + complexity. Accepts camelCase or snake_case. */
-export function effectiveModel(routine = {}, policy = ROUTING_POLICY) {
+export function effectiveModel(routine = {}, policy = activePolicy) {
   const m = routine.model || DEFAULT_MODEL;
   if (m && m !== 'auto') return m;
   return getModelForTask(
@@ -101,7 +138,7 @@ export function modelLabel(id) {
 }
 
 /* What the card/preview shows: the resolved model, flagged when auto-chosen. */
-export function displayModel(routine = {}, policy = ROUTING_POLICY) {
+export function displayModel(routine = {}, policy = activePolicy) {
   const eff = effectiveModel(routine, policy);
   const isAuto = !routine.model || routine.model === 'auto';
   return isAuto ? `✨ ${modelLabel(eff)}` : modelLabel(eff);

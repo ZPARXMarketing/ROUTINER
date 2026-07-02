@@ -23,6 +23,8 @@ create table if not exists public.routiner_routines (
   duration_min integer not null default 45,          -- calendar block length
   scheduled_at timestamptz,
   last_run     timestamptz,
+  retry_count  integer not null default 0,           -- scheduler: failed-fire retries for one-offs (see 0009)
+  tz           text,                                  -- IANA tz anchoring local time for DST-correct recurrence; null = UTC arithmetic
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );
@@ -47,9 +49,10 @@ create table if not exists public.routiner_runs (
 -- to one trigger and fires it, server-side via the caller's own access token —
 -- so users configure everything in the app with no environment variables.
 create table if not exists public.routiner_settings (
-  user_id    uuid primary key default auth.uid() references auth.users(id) on delete cascade,
-  accounts   jsonb not null default '{}'::jsonb,
-  updated_at timestamptz not null default now()
+  user_id      uuid primary key default auth.uid() references auth.users(id) on delete cascade,
+  accounts     jsonb not null default '{}'::jsonb,
+  model_policy jsonb,                                  -- optional auto-routing policy shared by app + scheduler (0011); null = built-in default
+  updated_at   timestamptz not null default now()
 );
 
 -- ── Board: the intake the human drops notes into for Claude to plan from ──
@@ -76,7 +79,9 @@ create table if not exists public.routiner_openrouter_usage (
   cost              numeric(12,6) not null default 0,   -- USD, from usage.cost
   account           text,
   trigger_key       text,
-  source            text not null default 'dynamic-responder'
+  source            text not null default 'dynamic-responder',
+  ok                boolean not null default true,       -- false = failed call (see 0010); cost 0
+  error             text                                 -- error message when ok=false
 );
 
 create index if not exists routiner_routines_user_idx on public.routiner_routines(user_id);

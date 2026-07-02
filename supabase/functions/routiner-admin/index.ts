@@ -13,6 +13,8 @@
 //   GET/POST  action=context           → { ownerUserId, activeNotes, scheduled, accounts }
 //   POST      action=schedule  blocks[] → inserts routine rows (status forced 'scheduled')
 //   POST      action=markNote  id,status → sets a note to planned|done|dismissed
+//   POST      action=report  routineId,summary,status? → logs a run row so a fired
+//                                        session can report back what it did (shows in History)
 //
 // Auth: deployed with verify_jwt=false (like dynamic-responder); the public
 // publishable key gates it at the gateway. Writes are constrained to the
@@ -36,6 +38,7 @@ const rest = (path: string) => `${SUPABASE_URL}/rest/v1/${path}`;
 
 const RECURRENCES = new Set(["none", "daily", "weekdays", "weekly"]);
 const NOTE_STATUSES = new Set(["planned", "done", "dismissed"]);
+const RUN_STATUSES = new Set(["success", "error", "missed", "ran"]);
 
 // Whitelist + NOT-NULL defaults for an inserted routine block.
 function cleanBlock(b: Record<string, unknown>, ownerUserId: string) {
@@ -143,7 +146,50 @@ Deno.serve(async (req: Request) => {
       return json({ ok: true, updated: data });
     }
 
-    return json({ ok: false, error: `Unknown action '${action}'. Use context | schedule | markNote.` }, 400);
+    if (action === "report") {
+      // A fired session reports back what it did; we log it as a run row so it
+      // surfaces in the app's History. Keyed by routineId (to inherit user_id +
+      // title); routineId may be null for a free-standing note.
+      const routineId = String(body.routineId || body["routine_id"] || "").trim();
+      const summary = typeof body.summary === "string" ? body.summary
+        : (typeof body.output === "string" ? body.output : "");
+      const statusRaw = String(body.status || "success");
+      const status = RUN_STATUSES.has(statusRaw) ? statusRaw : "success";
+      if (!summary.trim()) return json({ ok: false, error: "Missing 'summary'." }, 400);
+
+      let userId: string | null = null;
+      let title = typeof body.title === "string" ? body.title.trim() : "";
+      if (routineId) {
+        const rr = await fetch(
+          rest(`routiner_routines?id=eq.${encodeURIComponent(routineId)}&select=user_id,title&limit=1`),
+          { headers: H() },
+        );
+        const rows = rr.ok ? await rr.json() : [];
+        if (!rows?.[0]) return json({ ok: false, error: "Routine not found for routineId." }, 404);
+        userId = rows[0].user_id;
+        title = title || rows[0].title || "";
+      } else {
+        userId = await resolveOwner();
+      }
+      if (!userId) return json({ ok: false, error: "Could not resolve owner user_id." }, 500);
+
+      const r = await fetch(rest("routiner_runs"), {
+        method: "POST",
+        headers: { ...H(), Prefer: "return=representation" },
+        body: JSON.stringify({
+          user_id: userId,
+          routine_id: routineId || null,
+          title,
+          status,
+          output: String(summary).slice(0, 4000),
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) return json({ ok: false, error: data?.message || `Insert failed (HTTP ${r.status})` }, 502);
+      return json({ ok: true, run: Array.isArray(data) ? data[0] : data });
+    }
+
+    return json({ ok: false, error: `Unknown action '${action}'. Use context | schedule | markNote | report.` }, 400);
   } catch (e) {
     return json({ ok: false, error: "routiner-admin failed: " + (e as Error).message }, 500);
   }

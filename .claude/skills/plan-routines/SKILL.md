@@ -195,7 +195,7 @@ curl -s "$ADMIN" "${A[@]}" -d '{
       "prompt": "Write first-draft landing page copy for the Q3 launch. Pull positioning from docs/positioning.md, write the draft to drafts/landing-{{date}}.md, list 3 open questions at the end.",
       "scheduled_at": "2026-07-01T14:00:00.000Z",
       "recurrence": "none",
-      "model": "claude-sonnet-4-6",
+      "model": "claude-sonnet-5",
       "duration_min": 30
     }
   ]
@@ -212,7 +212,7 @@ Per-block fields:
 | `prompt` | self-contained task for the future session — required |
 | `scheduled_at` | ISO-8601 UTC, in the future |
 | `recurrence` | `none` / `daily` / `weekdays` / `weekly` |
-| `model` | `claude-opus-4-8` / `claude-sonnet-4-6` / `claude-haiku-4-5-20251001` / `auto` |
+| `model` | `claude-opus-4-8` / `claude-sonnet-5` / `claude-haiku-4-5-20251001` / `auto` |
 | `duration_min` | block length in minutes (drives the calendar block height) |
 
 Then mark each note you turned into blocks so it isn't re-planned:

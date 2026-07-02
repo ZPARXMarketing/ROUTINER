@@ -60,11 +60,14 @@ node scripts/glm.mjs --ping   # end-to-end self-test: proxy reachable + logging 
 # Delegate a coding sub-task via the Supabase edge proxy; review before using it.
 SUPA="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/dynamic-responder"
 OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
+  ${RESPONDER_SECRET:+-H "x-responder-secret: $RESPONDER_SECRET"} \
   -d '{"model":"z-ai/glm-4.7","max_tokens":1024,
        "account":"sparks9679","trigger_key":"t_a",
        "prompt":"<the sub-task prompt>"}' | jq -r '.content')
 # `account`/`trigger_key` are optional — they just attribute the spend in the
 # usage meter (see below). Every call is logged with its token + dollar cost.
+# The x-responder-secret header is only needed if the proxy is gated
+# (RESPONDER_SECRET edge secret set); the ${VAR:+…} expansion omits it otherwise.
 # $OUT now holds the draft — you read it, fix/verify it, then fold it into the real work.
 # Errors come back as {"ok":false,"error":"…"}; if it fails, just do the work yourself.
 # If .content is "(empty)", the model spent the budget before emitting text —
@@ -108,9 +111,19 @@ balance via `/api/v1/key`, key-side so it never leaves Supabase):
 > Setup (one-time, human): put the key in Supabase edge secrets as
 > `OPENROUTER_API_KEY` and deploy the `dynamic-responder` function (Supabase →
 > Edge Functions → editor, or `supabase functions deploy dynamic-responder`).
-> The proxy currently runs with JWT verification off, so no auth header is
+> The proxy runs with JWT verification off, so no Supabase auth header is
 > needed. Rotating the key never touches this repo or any session — just update
 > the edge secret.
+>
+> **Hardening the proxy (recommended — all optional edge secrets):**
+> - `RESPONDER_SECRET` — shared secret. When set, every proxy call must present
+>   it (`x-responder-secret: <secret>`); `scripts/glm.mjs` forwards it from its
+>   own `$RESPONDER_SECRET`. Without this the endpoint is world-callable.
+> - `MAX_DAILY_SPEND` — daily USD cap (e.g. `5`). The proxy sums today's cost
+>   from `routiner_openrouter_usage` and refuses (429) once the cap is hit.
+> - `ALLOWED_MODELS` — comma-separated allowlist that replaces the built-in one
+>   (the documented GLM/DeepSeek/Kimi/Llama set + `openrouter/auto`). Requests
+>   for any other model are rejected 400.
 
 ## If you're a routine session, or asked to "process the board" / "plan" / "schedule work"
 
@@ -119,6 +132,19 @@ routine's prompt as a turn. If that prompt is a **specific task**, just do it
 with your tools. If it asks you to **process the board / plan / schedule**, use
 the **[`plan-routines`](.claude/skills/plan-routines/SKILL.md)** skill — it has
 the exact Supabase REST recipes. The loop:
+
+> **Report back when you finish.** So the human can see what a fired routine
+> actually did (not just that it fired), POST a one-paragraph summary to the
+> `routiner-admin` edge function at the end of your run — it lands in the app's
+> **History**. If the session env has your `routineId` (the scheduler passes it
+> in the fire body), include it so the run inherits the right owner + title:
+> ```bash
+> ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
+> curl -s "$ADMIN" -H "Content-Type: application/json" \
+>   -d '{"action":"report","routineId":"<id-or-omit>","status":"success",
+>        "summary":"<what you did, 1 short paragraph>"}' >/dev/null
+> ```
+> `status` is `success | error | missed`. Omit `routineId` for ad-hoc runs.
 
 1. **Read the Board** (`routiner_notes`; statuses `active | brainstorm | planned
    | done | dismissed`). **Act only on `active` notes.** Never touch
@@ -148,7 +174,10 @@ the exact Supabase REST recipes. The loop:
 - **`routiner_settings`** — per user, `accounts` jsonb: a **list of accounts**,
   each with a **list of triggers** `{ id, label, trigger (Fire URL or trig_…),
   token }`. Accounts are user-managed; each can have several triggers (A/B/C…)
-  that fire as independent, parallel sessions.
+  that fire as independent, parallel sessions. Also `model_policy` jsonb — the
+  optional auto-routing table (`task_type → complexity → model`) edited in
+  Settings and read by **both** the app and the scheduler; null = built-in
+  default (`js/model-router.js`).
 - **`routiner_runs`** — run log (one row per fire).
 
 ## How a routine fires
