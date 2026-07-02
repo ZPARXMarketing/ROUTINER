@@ -91,6 +91,31 @@ cheap), `z-ai/glm-5` (harder coding / most capable), `moonshotai/kimi-k2.7-code`
 `meta-llama/llama-3.3-70b-instruct` (longer structured output). The OpenRouter
 result is raw material, not a finished deliverable — you own the final output.
 
+**Field notes (measured through this proxy — trust these over the labels above
+for short offloads):** the proxy has a **hard ~45s timeout**, and `z-ai/glm-4.7`
+/ `z-ai/glm-5` are *reasoning* models whose thinking tokens consume the budget
+before any answer — on a small task with `--max-tokens 800` **both returned
+`(empty)`**, and raising the budget to fix that pushes latency toward/over the
+45s cap. So despite being the nominal "coding default", GLM is a poor fit for
+quick offloads here. A benchmark on one small coding sub-task (`isValidHexColor`):
+
+| model | latency | cost | result |
+|-------|---------|------|--------|
+| `meta-llama/llama-3.3-70b-instruct` | ~2.2s | ~$0.00002 | ✅ correct, cleanest |
+| `deepseek/deepseek-chat` | ~4s | ~$0.00004 | ✅ correct (wraps in ``` fences — strip them) |
+| `moonshotai/kimi-k2.7-code` | ~12s | ~$0.0016 | ✅ correct, clean |
+| `z-ai/glm-4.7` | ~13s | ~$0.0014 | ✗ `(empty)` at 800 tok |
+| `z-ai/glm-5` | ~28s | ~$0.0026 | ✗ `(empty)` at 800 tok |
+
+**Practical default: reach for `deepseek/deepseek-chat` or
+`meta-llama/llama-3.3-70b-instruct` for fast, cheap, mechanical offloads.** Keep
+GLM only for sub-tasks where quality clearly justifies a large `--max-tokens`
+budget and the timeout risk. And **always review the output** — offloaded drafts
+have shipped subtle bugs (e.g. an HTML-escaper that omitted `&`); you own every
+line before it ships. (Numbers are one run; re-benchmark if models change —
+`scripts/glm.mjs --model <id> --max-tokens 800 "<task>"` and watch the stderr
+`latency ($cost)` line.)
+
 ### Tracking spend — the usage meter
 
 Every proxied call is logged (tokens + dollar cost) to

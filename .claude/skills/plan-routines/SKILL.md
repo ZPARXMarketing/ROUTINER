@@ -168,6 +168,14 @@ through the `dynamic-responder` edge proxy, then review and use the output. See
 the **"Offloading cheap work to OpenRouter"** section of `CLAUDE.md` for the
 exact call. You stay the orchestrator; the cheap model is a tool.
 
+> **Model pick (measured):** the proxy times out at ~45s, and the GLM models
+> (`z-ai/glm-4.7`, `z-ai/glm-5`) are *reasoning* models that often return
+> `(empty)` on short offloads because thinking tokens eat the budget. For fast,
+> cheap, mechanical offloads prefer **`deepseek/deepseek-chat`** or
+> **`meta-llama/llama-3.3-70b-instruct`** (~2–4s, ~$0.00002–0.00004). Reserve
+> GLM for sub-tasks that clearly need it. Always review the draft — see the
+> "Field notes" table in `CLAUDE.md`.
+
 > The routine's own `model` field stays a **Claude id** (or `auto`) — scheduled
 > routines execute as Claude Code sessions and the fire endpoint ignores
 > non-Claude ids. Offload happens *inside* the session via the proxy, not by
