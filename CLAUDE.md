@@ -133,18 +133,32 @@ with your tools. If it asks you to **process the board / plan / schedule**, use
 the **[`plan-routines`](.claude/skills/plan-routines/SKILL.md)** skill — it has
 the exact Supabase REST recipes. The loop:
 
-> **Report back when you finish.** So the human can see what a fired routine
-> actually did (not just that it fired), POST a one-paragraph summary to the
+> **Report back when you finish — with detail.** So the human can see what a
+> fired routine actually did (not just that it fired), POST a report to the
 > `routiner-admin` edge function at the end of your run — it lands in the app's
-> **History**. If the session env has your `routineId` (the scheduler passes it
-> in the fire body), include it so the run inherits the right owner + title:
+> **History**. `summary` is the only required field (a one-paragraph headline),
+> but prefer a *detailed* report: pass any of the optional structured fields and
+> the function composes them into a rich Markdown entry (URLs and `**bold**`
+> render in History). If the session env has your `routineId` (the scheduler
+> passes it in the fire body), include it so the run inherits the right owner +
+> title:
 > ```bash
 > ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
-> curl -s "$ADMIN" -H "Content-Type: application/json" \
->   -d '{"action":"report","routineId":"<id-or-omit>","status":"success",
->        "summary":"<what you did, 1 short paragraph>"}' >/dev/null
+> curl -s "$ADMIN" -H "Content-Type: application/json" -d '{
+>   "action": "report",
+>   "routineId": "<id-or-omit>",
+>   "status": "success",
+>   "summary": "<one-paragraph headline of what you did>",
+>   "details": "<optional: longer narrative / context / what you found>",
+>   "steps":   ["what you did first", "then this", "then that"],
+>   "artifacts": [ {"label":"PR #123","url":"https://github.com/.../pull/123"},
+>                  "path/to/file/you/changed.ts" ],
+>   "models":  ["z-ai/glm-4.7 for the first-pass draft ($0.004)"],
+>   "followups": ["anything left for next time / open questions"]
+> }' >/dev/null
 > ```
-> `status` is `success | error | missed`. Omit `routineId` for ad-hoc runs.
+> `status` is `success | error | missed`. All fields except `summary` are
+> optional — omit any you don't need. Omit `routineId` for ad-hoc runs.
 
 1. **Read the Board** (`routiner_notes`; statuses `active | brainstorm | planned
    | done | dismissed`). **Act only on `active` notes.** Never touch
