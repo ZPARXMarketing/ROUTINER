@@ -14,7 +14,10 @@
 //   POST      action=schedule  blocks[] → inserts routine rows (status forced 'scheduled')
 //   POST      action=markNote  id,status → sets a note to planned|done|dismissed
 //   POST      action=report  routineId,summary,status? → logs a run row so a fired
-//                                        session can report back what it did (shows in History)
+//                                        session can report back what it did (shows in History).
+//                                        Optional structured fields (details, steps[],
+//                                        artifacts[], models[], followups[]) are composed
+//                                        into a richer Markdown summary — see composeReport.
 //
 // Auth: deployed with verify_jwt=false (like dynamic-responder); the public
 // publishable key gates it at the gateway. Writes are constrained to the
@@ -39,6 +42,60 @@ const rest = (path: string) => `${SUPABASE_URL}/rest/v1/${path}`;
 const RECURRENCES = new Set(["none", "daily", "weekdays", "weekly"]);
 const NOTE_STATUSES = new Set(["planned", "done", "dismissed"]);
 const RUN_STATUSES = new Set(["success", "error", "missed", "ran"]);
+
+// Compose a rich Markdown run report from a report body. Every field is
+// optional except that the caller guarantees a non-empty `summary`; missing or
+// empty sections are skipped so a bare {summary} still reads as one paragraph.
+// The result is stored in routiner_runs.output and rendered in the app History.
+function composeReport(body: Record<string, unknown>): string {
+  const sections: string[] = [];
+
+  if (typeof body.summary === "string") {
+    const summary = body.summary.trim();
+    if (summary) sections.push(summary);
+  }
+
+  if (typeof body.details === "string") {
+    const details = body.details.trim();
+    if (details) sections.push(details);
+  }
+
+  if (Array.isArray(body.steps)) {
+    const steps = body.steps
+      .filter((s) => typeof s === "string").map((s) => (s as string).trim()).filter(Boolean);
+    if (steps.length) sections.push("**Steps**\n\n" + steps.map((s, i) => `${i + 1}. ${s}`).join("\n"));
+  }
+
+  if (Array.isArray(body.artifacts)) {
+    const artifacts = body.artifacts
+      .map((a) => {
+        if (typeof a === "string") return a.trim() || null;
+        if (a && typeof a === "object" && "url" in a) {
+          const url = typeof (a as { url: unknown }).url === "string" ? (a as { url: string }).url.trim() : "";
+          if (!url) return null;
+          const label = typeof (a as { label?: unknown }).label === "string" ? (a as { label: string }).label.trim() : "";
+          return label ? `[${label}](${url})` : url;
+        }
+        return null;
+      })
+      .filter((a): a is string => a !== null);
+    if (artifacts.length) sections.push("**Artifacts**\n\n" + artifacts.map((a) => `- ${a}`).join("\n"));
+  }
+
+  if (Array.isArray(body.models)) {
+    const models = body.models
+      .filter((m) => typeof m === "string").map((m) => (m as string).trim()).filter(Boolean);
+    if (models.length) sections.push("**Models used**\n\n" + models.map((m) => `- ${m}`).join("\n"));
+  }
+
+  if (Array.isArray(body.followups)) {
+    const followups = body.followups
+      .filter((f) => typeof f === "string").map((f) => (f as string).trim()).filter(Boolean);
+    if (followups.length) sections.push("**Follow-ups**\n\n" + followups.map((f) => `- ${f}`).join("\n"));
+  }
+
+  return sections.join("\n\n").trim();
+}
 
 // Whitelist + NOT-NULL defaults for an inserted routine block.
 function cleanBlock(b: Record<string, unknown>, ownerUserId: string) {
@@ -156,6 +213,8 @@ Deno.serve(async (req: Request) => {
       const statusRaw = String(body.status || "success");
       const status = RUN_STATUSES.has(statusRaw) ? statusRaw : "success";
       if (!summary.trim()) return json({ ok: false, error: "Missing 'summary'." }, 400);
+      // Compose summary + any optional structured fields into one Markdown report.
+      const output = composeReport({ ...body, summary });
 
       let userId: string | null = null;
       let title = typeof body.title === "string" ? body.title.trim() : "";
@@ -181,7 +240,7 @@ Deno.serve(async (req: Request) => {
           routine_id: routineId || null,
           title,
           status,
-          output: String(summary).slice(0, 4000),
+          output: output.slice(0, 4000),
         }),
       });
       const data = await r.json();

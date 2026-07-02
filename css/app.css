@@ -485,6 +485,8 @@ a { color: var(--periwinkle); }
   max-height: 240px;
   overflow: auto;
 }
+.run__body a { color: var(--accent); text-decoration: underline; word-break: break-all; }
+.run__body strong { color: var(--text-high); font-weight: 600; }
 
 /* ── Settings note ─────────────────────────────── */
 .notice {

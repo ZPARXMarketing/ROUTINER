@@ -573,8 +573,19 @@ function renderHistory() {
   view.innerHTML = `<div class="section-head"><h2>History</h2><span class="hint">Past &amp; completed routines</span></div>
     <div class="history">${items.map(runRow).join('')}</div>`;
 }
+/* Render a run summary as light, safe Markdown: escape everything first, then
+   linkify http(s) URLs and bold **text**. The .run__body container uses
+   white-space:pre-wrap, so newlines and bullet/number prefixes from
+   composeReport render as authored — no <ul> building needed. */
+function renderRunBody(text) {
+  let s = esc(text);                                          // escape first (handles & < > " ')
+  s = s.replace(/https?:\/\/[^\s<]+[^\s<.,;:!?)\]]/g,         // linkify, excluding trailing punctuation
+    (u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>'); // bold, single-line
+  return s;
+}
 function runRow(it) {
-  const body = it.output ? `<div class="run__body">${esc(it.output)}</div>` : '';
+  const body = it.output ? `<div class="run__body">${renderRunBody(it.output)}</div>` : '';
   return `<div class="run"><div class="run__head">
       <span class="chip chip--${it.status}">${esc(it.status)}</span>
       <span class="run__title">${esc(it.title)}</span>
