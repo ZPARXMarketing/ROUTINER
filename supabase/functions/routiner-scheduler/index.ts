@@ -44,10 +44,11 @@ const dbHeaders: Record<string, string> = {
   "Content-Type": "application/json",
 };
 
-// Mirror of js/model-router.js ROUTING_POLICY so scheduled fires pick the same
-// model the app would. ⚠ DUPLICATED — edit both copies together; verify the ids
-// are still accepted by the /fire endpoint before a release. (A single
-// DB-backed, Settings-editable policy is the intended follow-up.)
+// Built-in DEFAULT auto-routing policy — the fallback when a user hasn't saved
+// their own. The live policy is per-user in routiner_settings.model_policy
+// (edited in the app's Settings and read below), so app + scheduler share one
+// source. This default mirrors js/model-router.js ROUTING_POLICY — update both
+// when the default changes; verify the ids against the /fire endpoint.
 const ROUTING_POLICY: Record<string, Record<string, string>> = {
   planning: {
     low: "claude-sonnet-5",
@@ -66,17 +67,38 @@ const ROUTING_POLICY: Record<string, Record<string, string>> = {
   },
 };
 const FALLBACK_MODEL = "claude-sonnet-5";
+const COMPLEXITY_KEYS = ["low", "medium", "high"];
+
+// Validate a per-user policy (routiner_settings.model_policy) into the
+// ROUTING_POLICY shape, filling any missing cell from the built-in default.
+// Returns null when there's nothing usable, so the caller falls back to default.
+// Mirrors normalizePolicy in js/model-router.js — both read the same stored row.
+function normalizePolicy(raw: unknown): Record<string, Record<string, string>> | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, Record<string, string>>;
+  const out: Record<string, Record<string, string>> = {};
+  let any = false;
+  for (const tt of Object.keys(ROUTING_POLICY)) {
+    const src = r[tt] && typeof r[tt] === "object" ? r[tt] : {};
+    out[tt] = {};
+    for (const cx of COMPLEXITY_KEYS) {
+      const v = typeof src[cx] === "string" && src[cx].trim() ? src[cx].trim() : ROUTING_POLICY[tt][cx];
+      if (typeof src[cx] === "string" && src[cx].trim()) any = true;
+      out[tt][cx] = v;
+    }
+  }
+  return any ? out : null;
+}
 
 // A routine's effective model: an explicit pick wins; "auto" routes from
-// task_type + complexity.
-function effectiveModel(r: {
-  model?: string;
-  task_type?: string;
-  complexity?: string;
-}): string {
+// task_type + complexity via the given policy (the owner's, else the default).
+function effectiveModel(
+  r: { model?: string; task_type?: string; complexity?: string },
+  policy: Record<string, Record<string, string>> = ROUTING_POLICY,
+): string {
   const m = r.model || "auto";
   if (m && m !== "auto") return m;
-  const row = ROUTING_POLICY[r.task_type || "general"] || ROUTING_POLICY.general;
+  const row = policy[r.task_type || "general"] || policy.general || ROUTING_POLICY.general;
   return row[r.complexity || "medium"] || row.medium || FALLBACK_MODEL;
 }
 
@@ -170,7 +192,11 @@ async function logRun(r: Record<string, unknown>, status: string, output: string
 
 // Process a single due routine end to end: claim, then fire (or mark missed),
 // then retry/log. Independent per routine, so callers run these in parallel.
-async function processOne(r: Record<string, any>, nowIso: string): Promise<string> {
+async function processOne(
+  r: Record<string, any>,
+  nowIso: string,
+  policy: Record<string, Record<string, string>> = ROUTING_POLICY,
+): Promise<string> {
   const orig = r.scheduled_at as string;
   const next = nextOccurrence(orig, r.recurrence, r.tz);
   const claimPatch = next
@@ -219,7 +245,7 @@ async function processOne(r: Record<string, any>, nowIso: string): Promise<strin
         text: r.prompt,
         account: r.account,
         triggerKey: r.trigger_key,
-        model: effectiveModel(r),
+        model: effectiveModel(r, policy),
         source: "routiner-scheduler",
         routineId: r.id,
         title: r.title,
@@ -274,10 +300,31 @@ Deno.serve(async () => {
   }
   const due = await dueRes.json();
 
+  // Load each owner's auto-routing policy once (shared with the app via
+  // routiner_settings.model_policy), so `auto` fires pick the model the user
+  // configured. Missing/invalid → the built-in default.
+  const policyByUser: Record<string, Record<string, Record<string, string>>> = {};
+  const userIds = [...new Set(due.map((r: Record<string, any>) => r.user_id).filter(Boolean))];
+  if (userIds.length) {
+    try {
+      const inList = userIds.map((u) => encodeURIComponent(String(u))).join(",");
+      const pr = await fetch(
+        rest(`routiner_settings?select=user_id,model_policy&user_id=in.(${inList})`),
+        { headers: dbHeaders },
+      );
+      if (pr.ok) {
+        for (const row of await pr.json()) {
+          const np = normalizePolicy(row.model_policy);
+          if (np) policyByUser[row.user_id] = np;
+        }
+      }
+    } catch { /* fall back to the default policy per routine */ }
+  }
+
   // Process independently and in parallel; one slow/failed routine can't block
   // the others, and the batch limit keeps this within the function's wall clock.
   const settled = await Promise.allSettled(
-    due.map((r: Record<string, any>) => processOne(r, nowIso)),
+    due.map((r: Record<string, any>) => processOne(r, nowIso, policyByUser[r.user_id] || ROUTING_POLICY)),
   );
 
   const results = settled.map((s, i) => ({

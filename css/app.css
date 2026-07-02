@@ -315,6 +315,14 @@ a { color: var(--periwinkle); }
 .chip--dryrun { background: rgba(245,211,59,0.14); color: var(--yellow); border-color: rgba(245,211,59,0.4); }
 .chip--ran { background: rgba(124,135,158,0.14); color: var(--grey-300); border-color: var(--grey-700); }
 
+/* ── Auto-routing policy grid (Settings) ───────────── */
+.pol-grid { width: 100%; border-collapse: collapse; margin: 8px 0; }
+.pol-grid th, .pol-grid td { padding: 4px 6px; text-align: left; font-size: 12px; }
+.pol-grid thead th { color: var(--grey-300); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.pol-grid .pol-th { color: var(--grey-200); font-weight: 600; white-space: nowrap; }
+.select--sm { padding: 4px 6px; font-size: 12px; width: 100%; }
+.pol-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
+
 /* ── Empty state ───────────────────────────────── */
 .empty {
   grid-column: 1 / -1;

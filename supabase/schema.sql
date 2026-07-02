@@ -49,9 +49,10 @@ create table if not exists public.routiner_runs (
 -- to one trigger and fires it, server-side via the caller's own access token —
 -- so users configure everything in the app with no environment variables.
 create table if not exists public.routiner_settings (
-  user_id    uuid primary key default auth.uid() references auth.users(id) on delete cascade,
-  accounts   jsonb not null default '{}'::jsonb,
-  updated_at timestamptz not null default now()
+  user_id      uuid primary key default auth.uid() references auth.users(id) on delete cascade,
+  accounts     jsonb not null default '{}'::jsonb,
+  model_policy jsonb,                                  -- optional auto-routing policy shared by app + scheduler (0011); null = built-in default
+  updated_at   timestamptz not null default now()
 );
 
 -- ── Board: the intake the human drops notes into for Claude to plan from ──

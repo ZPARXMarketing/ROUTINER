@@ -174,7 +174,10 @@ the exact Supabase REST recipes. The loop:
 - **`routiner_settings`** — per user, `accounts` jsonb: a **list of accounts**,
   each with a **list of triggers** `{ id, label, trigger (Fire URL or trig_…),
   token }`. Accounts are user-managed; each can have several triggers (A/B/C…)
-  that fire as independent, parallel sessions.
+  that fire as independent, parallel sessions. Also `model_policy` jsonb — the
+  optional auto-routing table (`task_type → complexity → model`) edited in
+  Settings and read by **both** the app and the scheduler; null = built-in
+  default (`js/model-router.js`).
 - **`routiner_runs`** — run log (one row per fire).
 
 ## How a routine fires
