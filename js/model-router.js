@@ -25,7 +25,7 @@ export const MODELS = [
   { id: 'auto', label: '✨ Auto — let Routiner choose', auto: true },
   // Claude — these actually fire your scheduled routines.
   { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 — most capable' },
-  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 — balanced' },
+  { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 — balanced' },
   { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 — fast & cheap' },
   // OpenRouter — selectable; used by the live test (needs an OpenRouter key).
   { id: 'openrouter/auto', label: 'OpenRouter Auto — provider routes it' },
@@ -50,7 +50,7 @@ export const COMPLEXITIES = [
 export const DEFAULT_MODEL = 'auto';
 export const DEFAULT_TASK_TYPE = 'general';
 export const DEFAULT_COMPLEXITY = 'medium';
-export const FALLBACK_MODEL = 'claude-sonnet-4-6';
+export const FALLBACK_MODEL = 'claude-sonnet-5';
 
 /* The routing table — the get_model_for_task() decision, as data. Routes to
    Claude models because that's what executes scheduled routines today. Swap a
@@ -63,18 +63,18 @@ export const FALLBACK_MODEL = 'claude-sonnet-4-6';
    release — model ids get retired; keep MODELS above in sync with any change. */
 export const ROUTING_POLICY = {
   planning: {
-    low: 'claude-sonnet-4-6',
-    medium: 'claude-sonnet-4-6',
+    low: 'claude-sonnet-5',
+    medium: 'claude-sonnet-5',
     high: 'claude-opus-4-8',        // hard planning → most capable
   },
   execution: {
     low: 'claude-haiku-4-5-20251001',
     medium: 'claude-haiku-4-5-20251001', // execution → fast & cheap
-    high: 'claude-sonnet-4-6',
+    high: 'claude-sonnet-5',
   },
   general: {
     low: 'claude-haiku-4-5-20251001',
-    medium: 'claude-sonnet-4-6',
+    medium: 'claude-sonnet-5',
     high: 'claude-opus-4-8',
   },
 };

@@ -50,22 +50,22 @@ const dbHeaders: Record<string, string> = {
 // DB-backed, Settings-editable policy is the intended follow-up.)
 const ROUTING_POLICY: Record<string, Record<string, string>> = {
   planning: {
-    low: "claude-sonnet-4-6",
-    medium: "claude-sonnet-4-6",
+    low: "claude-sonnet-5",
+    medium: "claude-sonnet-5",
     high: "claude-opus-4-8",
   },
   execution: {
     low: "claude-haiku-4-5-20251001",
     medium: "claude-haiku-4-5-20251001",
-    high: "claude-sonnet-4-6",
+    high: "claude-sonnet-5",
   },
   general: {
     low: "claude-haiku-4-5-20251001",
-    medium: "claude-sonnet-4-6",
+    medium: "claude-sonnet-5",
     high: "claude-opus-4-8",
   },
 };
-const FALLBACK_MODEL = "claude-sonnet-4-6";
+const FALLBACK_MODEL = "claude-sonnet-5";
 
 // A routine's effective model: an explicit pick wins; "auto" routes from
 // task_type + complexity.
