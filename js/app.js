@@ -31,11 +31,19 @@ const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (
    The structure lives in Supabase routiner_settings.accounts and is editable
    in Settings; `accountsCfg` is the in-memory copy (secrets stripped) used to
    render. */
-const KNOWN_LABELS = { sparks9679: 'Sparks', zparxmarketing: 'ZYx' };
+const KNOWN_LABELS = { sparks9679: 'Sparks', zparxmarketing: 'Zparx' };
 const DEFAULT_ACCOUNT = 'sparks9679';
 const DEFAULT_ACCOUNTS = () => [
-  { id: 'sparks9679', label: 'Sparks', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
-  { id: 'zparxmarketing', label: 'ZYx', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'sparks9679', label: 'Sparks', triggers: [
+    { id: 't_a', label: 'A', trigger: '', token: '' },
+    { id: 't_b', label: 'B', trigger: '', token: '' },
+    { id: 't_c', label: 'C', trigger: '', token: '' },
+  ] },
+  { id: 'zparxmarketing', label: 'Zparx', triggers: [
+    { id: 't_x', label: 'X', trigger: '', token: '' },
+    { id: 't_y', label: 'Y', trigger: '', token: '' },
+    { id: 't_z', label: 'Z', trigger: '', token: '' },
+  ] },
 ];
 let accountsCfg = DEFAULT_ACCOUNTS();
 let settingsPolicy = null; // the user's saved auto-routing policy (null = built-in default)
@@ -726,10 +734,10 @@ function renderCalendar() {
 
   const legend = Array.from(legendGroups().entries()).map(([accId, g]) => {
     const trigs = Array.from(g.triggers.entries());
-    const swatches = trigs.length
-      ? trigs.map(([tId, tLabel]) => `<span class="cal__sw" title="${esc(g.label)} · ${esc(tLabel)}" style="background:${triggerColor(accId, tId || null).solid}"></span>`).join('')
-      : `<span class="cal__sw" style="background:${accountColor(accId).solid}"></span>`;
-    return `<span class="cal__leg">${swatches}<span>${esc(g.label)}</span></span>`;
+    const items = trigs.length
+      ? trigs.map(([tId, tLabel]) => `<span class="cal__legtrig" title="${esc(g.label)} · ${esc(tLabel)}"><span class="cal__sw" style="background:${triggerColor(accId, tId || null).solid}"></span>${esc(tLabel)}</span>`).join('')
+      : `<span class="cal__legtrig"><span class="cal__sw" style="background:${accountColor(accId).solid}"></span></span>`;
+    return `<span class="cal__leg"><span class="cal__leg-name">${esc(g.label)}</span>${items}</span>`;
   }).join('');
 
   const dayHeaders = days.map((d) => {
