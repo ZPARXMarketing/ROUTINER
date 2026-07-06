@@ -31,11 +31,19 @@ const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (
    The structure lives in Supabase routiner_settings.accounts and is editable
    in Settings; `accountsCfg` is the in-memory copy (secrets stripped) used to
    render. */
-const KNOWN_LABELS = { sparks9679: 'Account A', zparxmarketing: 'Account B' };
+const KNOWN_LABELS = { sparks9679: 'Sparks', zparxmarketing: 'Zparx' };
 const DEFAULT_ACCOUNT = 'sparks9679';
 const DEFAULT_ACCOUNTS = () => [
-  { id: 'sparks9679', label: 'Account A', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
-  { id: 'zparxmarketing', label: 'Account B', triggers: [{ id: 't_a', label: 'A', trigger: '', token: '' }] },
+  { id: 'sparks9679', label: 'Sparks', triggers: [
+    { id: 't_a', label: 'A', trigger: '', token: '' },
+    { id: 't_b', label: 'B', trigger: '', token: '' },
+    { id: 't_c', label: 'C', trigger: '', token: '' },
+  ] },
+  { id: 'zparxmarketing', label: 'Zparx', triggers: [
+    { id: 't_x', label: 'X', trigger: '', token: '' },
+    { id: 't_y', label: 'Y', trigger: '', token: '' },
+    { id: 't_z', label: 'Z', trigger: '', token: '' },
+  ] },
 ];
 let accountsCfg = DEFAULT_ACCOUNTS();
 let settingsPolicy = null; // the user's saved auto-routing policy (null = built-in default)
@@ -67,12 +75,13 @@ const accountTriggers = (id) => (getAccountCfg(id) || {}).triggers || [];
 const triggerCfg = (accId, tId) => accountTriggers(accId).find((t) => t.id === tId);
 const triggerLabel = (accId, tId) => { const t = triggerCfg(accId, tId); return t ? t.label : ''; };
 
-/* Color engine: each account is a hue family; each trigger a distinct shade
-   within it — so A/B/C read as the same account, told apart by shade, and the
-   whole thing stays on-brand against the dark UI. */
+/* Color engine: each account gets a themed set of DISTINCT hues (not just
+   shades), so its triggers A/B/C are easy to tell apart at a glance while the
+   set still reads as one account (warm for the first, cool for the second) and
+   stays on-brand against the dark UI. */
 const HUE_FAMILIES = [
-  ['#BCEF2F', '#86E01E', '#C8FF45', '#9FD630', '#6FBF2A'], // lime / green
-  ['#4D6BFF', '#4DA6FF', '#22D3EE', '#7C9CFF', '#3D5AF1'], // blue / cyan
+  ['#BCEF2F', '#F5D33B', '#FF7A33', '#86E01E', '#E8631C'], // Sparks: green / yellow / orange / …
+  ['#4D6BFF', '#22D3EE', '#B57BFF', '#4DA6FF', '#7C9CFF'], // Zparx: blue / cyan / violet / …
   ['#FF7A33', '#FF9E2C', '#F5D33B', '#FFB066', '#E8631C'], // orange / amber
   ['#B57BFF', '#9B5DE5', '#C77DFF', '#8A5CF6', '#7A3FF0'], // purple
   ['#FF4D8D', '#FF7AA8', '#F15BB5', '#FF9EC4', '#E8327C'], // pink
@@ -84,6 +93,7 @@ const inkFor = (hex) => lum(hexToRgb(hex)) > 0.55 ? '#0C111F' : '#FFFFFF';
 const darken = (hex, amt) => { const d = (v) => Math.round(v * (1 - amt)).toString(16).padStart(2, '0'); return '#' + hexToRgb(hex).map(d).join(''); };
 const swatch = (hex) => ({ solid: hex, ink: inkFor(hex), edge: darken(hex, 0.3) });
 const GREY = { solid: '#7C879E', ink: '#0C111F', edge: '#5A6377' };
+const hashStr = (s) => { let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) >>> 0; return h; };
 
 function triggerColor(accId, tId) {
   const ai = accountIndex(accId);
@@ -91,7 +101,10 @@ function triggerColor(accId, tId) {
   const fam = HUE_FAMILIES[ai % HUE_FAMILIES.length];
   const trigs = accountTriggers(accId);
   let ti = trigs.findIndex((t) => t.id === tId);
-  if (ti < 0) ti = 0; // routine with no/unknown trigger → account's base shade
+  // No trigger → account's base shade. Unknown/removed trigger → a stable shade
+  // derived from its key, so distinct triggers stay visually distinct on the
+  // calendar (and each earns its own legend swatch) instead of collapsing.
+  if (ti < 0) ti = tId ? (1 + hashStr(String(tId)) % Math.max(1, fam.length - 1)) : 0;
   return swatch(fam[ti % fam.length]);
 }
 const accountColor = (accId) => triggerColor(accId, null); // base shade for the account
@@ -101,8 +114,24 @@ const DEFAULT_DURATION_MIN = 45;
 const DURATIONS = [15, 30, 45, 60, 90, 120, 180, 240];
 const fmtDuration = (m) => m < 60 ? `${m} min` : (m % 60 === 0 ? `${m / 60} hr` : `${(m / 60).toFixed(1)} hr`);
 
-/* Week-calendar layout knobs — full 24h day (routines can fire overnight) */
-const CAL = { startHour: 0, endHour: 24, hourPx: 44, defaultDurationMin: DEFAULT_DURATION_MIN };
+/* Week-calendar layout knobs — full 24h day (routines can fire overnight).
+   hourPx is the vertical scale and is pinch-zoomable (see wireCalendarZoom),
+   persisted per browser so the chosen zoom sticks. */
+const CAL_HOURPX_MIN = 22, CAL_HOURPX_MAX = 240, CAL_HOURPX_DEFAULT = 44;
+const CAL_ZOOM_LS = 'routiner.cal.hourpx.v1';
+const clampHourPx = (v) => Math.max(CAL_HOURPX_MIN, Math.min(CAL_HOURPX_MAX, Math.round(v)));
+const loadCalHourPx = () => { const n = parseFloat(localStorage.getItem(CAL_ZOOM_LS)); return Number.isFinite(n) ? clampHourPx(n) : CAL_HOURPX_DEFAULT; };
+const CAL = { startHour: 0, endHour: 24, hourPx: loadCalHourPx(), defaultDurationMin: DEFAULT_DURATION_MIN };
+/* Set the timeline zoom. Returns true if it actually changed. */
+function setCalHourPx(v, persist = true) {
+  const c = clampHourPx(v);
+  if (c === CAL.hourPx) return false;
+  CAL.hourPx = c;
+  if (persist) { try { localStorage.setItem(CAL_ZOOM_LS, String(c)); } catch { /* */ } }
+  return true;
+}
+let activeTouches = 0; // live count of fingers on the calendar (pinch vs drag guard)
+let lastCalDragEnd = 0; // timestamp a block-drag ended — suppresses the synthetic click that follows
 let calRef = new Date(); // any day inside the week currently shown
 
 /* settings (default model / default account / optional trigger override /
@@ -673,6 +702,29 @@ function calEventHtml(ev) {
   </div>`;
 }
 
+/* Legend groups: each account with the union of its configured triggers AND any
+   trigger keys that actually appear on scheduled routines (so a routine pointing
+   at a removed/legacy trigger still gets a labeled swatch — the key shows a color
+   per trigger in use, not just the ones currently in Settings). */
+function legendGroups() {
+  const groups = new Map(); // accId → { label, triggers: Map(tId → label) }
+  const ensure = (accId) => {
+    if (!groups.has(accId)) groups.set(accId, { label: accountLabel(accId), triggers: new Map() });
+    return groups.get(accId);
+  };
+  listAccounts().forEach((a) => {
+    const g = ensure(a.id);
+    (a.triggers || []).forEach((t) => g.triggers.set(t.id, t.label || '(unnamed)'));
+  });
+  routines.forEach((r) => {
+    const accId = r.account || DEFAULT_ACCOUNT;
+    const g = ensure(accId);
+    const key = r.triggerKey || '';
+    if (!g.triggers.has(key)) g.triggers.set(key, triggerLabel(accId, r.triggerKey) || '(other)');
+  });
+  return groups;
+}
+
 function renderCalendar() {
   const weekStart = startOfWeek(calRef), weekEnd = addDays(weekStart, 6);
   const { days, perDay } = weekEvents(weekStart);
@@ -682,11 +734,12 @@ function renderCalendar() {
 
   const rangeLabel = `${weekStart.toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${weekEnd.toLocaleDateString([], { month: weekStart.getMonth() === weekEnd.getMonth() ? undefined : 'short', day: 'numeric' })}`;
 
-  const legend = listAccounts().map((a) => {
-    const swatches = (a.triggers && a.triggers.length)
-      ? a.triggers.map((t) => `<span class="cal__sw" title="${esc(t.label)}" style="background:${triggerColor(a.id, t.id).solid}"></span>`).join('')
-      : `<span class="cal__sw" style="background:${accountColor(a.id).solid}"></span>`;
-    return `<span class="cal__leg">${swatches}<span>${esc(a.label)}</span></span>`;
+  const legend = Array.from(legendGroups().entries()).map(([accId, g]) => {
+    const trigs = Array.from(g.triggers.entries());
+    const items = trigs.length
+      ? trigs.map(([tId, tLabel]) => `<span class="cal__legtrig" title="${esc(g.label)} · ${esc(tLabel)}"><span class="cal__sw" style="background:${triggerColor(accId, tId || null).solid}"></span>${esc(tLabel)}</span>`).join('')
+      : `<span class="cal__legtrig"><span class="cal__sw" style="background:${accountColor(accId).solid}"></span></span>`;
+    return `<span class="cal__leg"><span class="cal__leg-name">${esc(g.label)}</span>${items}</span>`;
   }).join('');
 
   const dayHeaders = days.map((d) => {
@@ -710,6 +763,7 @@ function renderCalendar() {
       <span class="cal__range">${rangeLabel}</span>
       <div class="cal__nav"><button class="cal__navbtn" data-cal="prev">‹</button><button class="cal__navbtn" data-cal="next">›</button></div>
       <button class="cal__today" data-cal="today">Today</button>
+      <div class="cal__nav cal__zoom" title="Zoom the timeline — or pinch on a touch screen"><button class="cal__navbtn" data-cal="zoomout" aria-label="Zoom out" ${CAL.hourPx <= CAL_HOURPX_MIN ? 'disabled' : ''}>−</button><button class="cal__navbtn" data-cal="zoomin" aria-label="Zoom in" ${CAL.hourPx >= CAL_HOURPX_MAX ? 'disabled' : ''}>＋</button></div>
       <span class="cal__count">${total} event${total === 1 ? '' : 's'} this week</span>
       <div class="cal__legend">${legend}</div>
     </div>
@@ -721,6 +775,8 @@ function renderCalendar() {
   view.querySelectorAll('[data-cal]').forEach((b) => b.addEventListener('click', () => {
     const a = b.dataset.cal;
     if (a === 'today') calRef = new Date();
+    else if (a === 'zoomin') setCalHourPx(CAL.hourPx * 1.4);
+    else if (a === 'zoomout') setCalHourPx(CAL.hourPx / 1.4);
     else calRef = addDays(calRef, a === 'next' ? 7 : -7);
     renderCalendar();
   }));
@@ -745,6 +801,9 @@ function renderCalendar() {
       el.setPointerCapture(e.pointerId);
 
       const onMove = (ev) => {
+        // A second finger means a pinch-zoom, not a drag; and a re-render (e.g.
+        // from a zoom) detaches this element — bail either way, don't move.
+        if (activeTouches > 1 || !el.isConnected) return;
         if (!dragging) { if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 6) return; dragging = true; el.classList.add('cal__ev--dragging'); }
         ev.preventDefault();
         ti = colIndexAt(ev.clientX);
@@ -759,8 +818,12 @@ function renderCalendar() {
         el.removeEventListener('pointermove', onMove);
         el.removeEventListener('pointerup', onUp);
         el.removeEventListener('pointercancel', onUp);
+        if (!el.isConnected) return; // element was replaced by a re-render (zoom) — ignore
         const r = getRoutine(id);
         if (!dragging) { if (r) openDrawer(r); return; } // it was a tap
+        // A real move just happened — mark it so the synthetic click the browser
+        // fires next on the day column doesn't open a blank "new routine" drawer.
+        lastCalDragEnd = Date.now();
         el.classList.remove('cal__ev--dragging');
         const minutes = Math.round(CAL.startHour * 60 + (topPx / CAL.hourPx) * 60);
         const day = days[ti];
@@ -776,6 +839,7 @@ function renderCalendar() {
   });
   // Click empty space in a day column to create a routine at that exact day + time.
   view.querySelectorAll('.cal__day').forEach((col, i) => col.addEventListener('click', (e) => {
+    if (Date.now() - lastCalDragEnd < 400) return; // just dropped a dragged block — ignore the trailing click
     if (e.target.closest('.cal__ev')) return; // landed on an event — its own handler opens it
     const day = days[i]; if (!day) return;
     const rect = col.getBoundingClientRect();
@@ -789,6 +853,78 @@ function renderCalendar() {
   // Open scrolled to ~an hour before now so the day's in view (but night is a scroll up).
   const scrollEl = $('.cal__scroll', view);
   if (scrollEl) scrollEl.scrollTop = Math.max(0, (new Date().getHours() - 1 - CAL.startHour) * CAL.hourPx);
+}
+
+/* Pinch-to-zoom the daily timeline (two fingers, like Apple/Google Calendar),
+   plus ctrl/⌘ + wheel on desktop. Attached once to the persistent #view element
+   so it survives the calendar's re-renders.
+
+   On iPadOS/Safari a two-finger pinch is delivered as native gesture events
+   (which otherwise page-zoom the whole tab), so we handle those directly — they
+   give an absolute `scale` — and only fall back to raw touch math on engines
+   without GestureEvent. PINCH_GAIN amplifies the response so a modest spread
+   produces a satisfying zoom rather than a barely-perceptible nudge. */
+function wireCalendarZoom() {
+  const HAS_GESTURE = typeof window !== 'undefined' && 'GestureEvent' in window;
+  const PINCH_GAIN = 1.8; // exponent on the pinch scale — >1 makes zoom feel stronger
+  const scrollEl = () => $('.cal__scroll', view);
+  const distOf = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  let startPx = CAL.hourPx, anchor = 0, raf = 0;
+
+  const captureAnchor = () => { const sc = scrollEl(); anchor = sc && sc.scrollHeight ? (sc.scrollTop + sc.clientHeight / 2) / sc.scrollHeight : 0; };
+  const applyZoom = (px) => {
+    if (!setCalHourPx(px, false)) return;
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      renderCalendar();
+      const sc = scrollEl(); // keep the pinch roughly centered on where it started
+      if (sc) sc.scrollTop = Math.max(0, anchor * sc.scrollHeight - sc.clientHeight / 2);
+    });
+  };
+  const persist = () => { try { localStorage.setItem(CAL_ZOOM_LS, String(CAL.hourPx)); } catch { /* */ } };
+
+  // ── Safari / iPadOS: native pinch gesture (scale is relative to gesturestart) ──
+  let gesturing = false;
+  view.addEventListener('gesturestart', (e) => {
+    if (currentView !== 'calendar') return;
+    e.preventDefault(); gesturing = true; startPx = CAL.hourPx; captureAnchor();
+  });
+  view.addEventListener('gesturechange', (e) => {
+    if (!gesturing) return;
+    e.preventDefault();
+    applyZoom(startPx * Math.pow(e.scale || 1, PINCH_GAIN));
+  });
+  const endGesture = () => { if (gesturing) { gesturing = false; persist(); } };
+  view.addEventListener('gestureend', endGesture);
+
+  // ── Other engines: two-finger touch math (skipped where GestureEvent exists) ──
+  let pinching = false, startDist = 1;
+  view.addEventListener('touchstart', (e) => {
+    activeTouches = e.touches.length;
+    if (HAS_GESTURE || currentView !== 'calendar' || e.touches.length !== 2) return;
+    pinching = true; startDist = distOf(e.touches) || 1; startPx = CAL.hourPx; captureAnchor();
+  }, { passive: true });
+  view.addEventListener('touchmove', (e) => {
+    if (!pinching || e.touches.length !== 2) return;
+    e.preventDefault(); // stop the page/timeline from scrolling mid-pinch
+    applyZoom(startPx * Math.pow(distOf(e.touches) / startDist, PINCH_GAIN));
+  }, { passive: false });
+  const endTouch = (e) => {
+    activeTouches = e.touches.length;
+    if (pinching && e.touches.length < 2) { pinching = false; persist(); }
+  };
+  view.addEventListener('touchend', endTouch);
+  view.addEventListener('touchcancel', endTouch);
+
+  // ── Desktop: ctrl/⌘ + wheel ──
+  view.addEventListener('wheel', (e) => {
+    if (currentView !== 'calendar' || !(e.ctrlKey || e.metaKey)) return;
+    e.preventDefault();
+    captureAnchor();
+    if (setCalHourPx(CAL.hourPx * (e.deltaY < 0 ? 1.12 : 1 / 1.12))) { renderCalendar(); const sc = scrollEl(); if (sc) sc.scrollTop = Math.max(0, anchor * sc.scrollHeight - sc.clientHeight / 2); }
+    persist();
+  }, { passive: false });
 }
 
 function nowLineHtml() {
@@ -1164,6 +1300,7 @@ function wireOnce() {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeDrawer(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
   $$('.tab').forEach((t) => t.addEventListener('click', () => { currentView = t.dataset.view; syncTabs(); render(); }));
+  wireCalendarZoom();
   setInterval(paintStatus, 30000);
 }
 

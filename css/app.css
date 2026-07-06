@@ -29,15 +29,24 @@ a { color: var(--periwinkle); }
 .app.is-auth { grid-template-columns: 1fr; }
 .content {
   min-width: 0;
-  padding: max(var(--sp-6), env(safe-area-inset-top)) var(--sp-6) var(--sp-24);
+  padding:
+    max(var(--sp-6), env(safe-area-inset-top))
+    max(var(--sp-8), env(safe-area-inset-right))
+    var(--sp-24)
+    max(var(--sp-8), env(safe-area-inset-left));
 }
-
 /* ── Sidebar (navigation table) ────────────────── */
 .sidebar {
   display: flex;
   flex-direction: column;
   gap: var(--sp-6);
-  padding: max(var(--sp-5), env(safe-area-inset-top)) var(--sp-4) var(--sp-4);
+  /* top / right / bottom / left — bottom carries the home-indicator inset so the
+     Sign out button never runs under it (or off-screen). */
+  padding:
+    calc(var(--sp-6) + env(safe-area-inset-top))
+    var(--sp-4)
+    calc(var(--sp-6) + env(safe-area-inset-bottom))
+    max(var(--sp-4), env(safe-area-inset-left));
   border-right: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
   position: sticky;
@@ -48,6 +57,20 @@ a { color: var(--periwinkle); }
 }
 .sidebar__group { display: flex; flex-direction: column; gap: var(--sp-2); }
 .sidebar__group--foot { margin-top: auto; }
+
+/* Roomier perimeter on tablet / desktop widths (e.g. iPadOS) so the UI isn't
+   jammed against the screen edges — the sidebar owns the left outer gutter and
+   the content owns the right one. Placed AFTER the base .content / .sidebar
+   rules so these longhand overrides win over their padding shorthands. */
+@media (min-width: 900px) {
+  .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); padding-top: max(var(--sp-8), env(safe-area-inset-top)); }
+  .sidebar {
+    padding-left: max(var(--sp-8), env(safe-area-inset-left));
+    padding-right: var(--sp-5, 20px);
+    padding-top: calc(var(--sp-8) + env(safe-area-inset-top));
+    padding-bottom: calc(var(--sp-8) + env(safe-area-inset-bottom));
+  }
+}
 .sidebar__label {
   font-family: var(--font-pixel);
   font-size: 9px;
@@ -540,7 +563,7 @@ a { color: var(--periwinkle); }
   .sidebar__label { display: none; }
   .tabs { flex-direction: row; flex-wrap: wrap; }
   .tab { width: auto; }
-  .content { padding: var(--sp-4) var(--sp-4) var(--sp-16); }
+  .content { padding: var(--sp-6) max(var(--sp-6), env(safe-area-inset-right)) var(--sp-16) max(var(--sp-6), env(safe-area-inset-left)); }
   .brand__title { font-size: 18px; }
 }
 
@@ -556,11 +579,15 @@ a { color: var(--periwinkle); }
 .cal__nav { display: flex; gap: 4px; }
 .cal__navbtn { width: 28px; height: 28px; border: 1px solid var(--hairline); border-radius: 8px; background: transparent; color: var(--text-mid); font-family: var(--font-mono); font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 .cal__navbtn:hover { color: var(--text-hi); border-color: var(--grey-700); }
+.cal__navbtn:disabled { opacity: 0.35; cursor: not-allowed; }
+.cal__navbtn:disabled:hover { color: var(--text-mid); border-color: var(--hairline); }
 .cal__today { font-family: var(--font-body); font-weight: 600; font-size: 12px; color: var(--text-mid); background: transparent; border: 1px solid var(--hairline); border-radius: var(--r-pill); padding: 5px 13px; cursor: pointer; }
 .cal__today:hover { color: var(--text-hi); border-color: var(--grey-700); }
 .cal__count { font-family: var(--font-pixel); font-size: 10px; letter-spacing: 0.06em; color: var(--text-low); text-transform: uppercase; }
 .cal__legend { margin-left: auto; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-.cal__leg { display: flex; align-items: center; gap: 7px; font-family: var(--font-body); font-weight: 500; font-size: 12px; color: var(--text-mid); }
+.cal__leg { display: flex; align-items: center; gap: 8px; font-family: var(--font-body); font-weight: 500; font-size: 12px; color: var(--text-mid); }
+.cal__leg-name { font-weight: 700; color: var(--text-hi); }
+.cal__legtrig { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-weight: 600; font-size: 11px; color: var(--text-mid); }
 .cal__sw { width: 13px; height: 13px; border-radius: 4px; flex: 0 0 auto; }
 
 .cal__head { display: grid; grid-template-columns: 56px repeat(7, 1fr); border-bottom: 1px solid var(--hairline); }
