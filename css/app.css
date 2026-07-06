@@ -35,20 +35,18 @@ a { color: var(--periwinkle); }
     var(--sp-24)
     max(var(--sp-8), env(safe-area-inset-left));
 }
-/* Roomier perimeter on tablet / desktop widths (e.g. iPadOS) so content isn't
-   jammed against the screen edges. The sidebar owns the left outer gutter and
-   the content owns the right one, so both get bumped in tandem. */
-@media (min-width: 900px) {
-  .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); padding-top: max(var(--sp-8), env(safe-area-inset-top)); }
-  .sidebar { padding-left: max(var(--sp-8), env(safe-area-inset-left)); padding-right: var(--sp-5, 20px); padding-top: max(var(--sp-6), env(safe-area-inset-top)); }
-}
-
 /* ── Sidebar (navigation table) ────────────────── */
 .sidebar {
   display: flex;
   flex-direction: column;
   gap: var(--sp-6);
-  padding: max(var(--sp-5), env(safe-area-inset-top)) var(--sp-4) var(--sp-4) max(var(--sp-4), env(safe-area-inset-left));
+  /* top / right / bottom / left — bottom carries the home-indicator inset so the
+     Sign out button never runs under it (or off-screen). */
+  padding:
+    calc(var(--sp-6) + env(safe-area-inset-top))
+    var(--sp-4)
+    calc(var(--sp-6) + env(safe-area-inset-bottom))
+    max(var(--sp-4), env(safe-area-inset-left));
   border-right: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
   position: sticky;
@@ -59,6 +57,20 @@ a { color: var(--periwinkle); }
 }
 .sidebar__group { display: flex; flex-direction: column; gap: var(--sp-2); }
 .sidebar__group--foot { margin-top: auto; }
+
+/* Roomier perimeter on tablet / desktop widths (e.g. iPadOS) so the UI isn't
+   jammed against the screen edges — the sidebar owns the left outer gutter and
+   the content owns the right one. Placed AFTER the base .content / .sidebar
+   rules so these longhand overrides win over their padding shorthands. */
+@media (min-width: 900px) {
+  .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); padding-top: max(var(--sp-8), env(safe-area-inset-top)); }
+  .sidebar {
+    padding-left: max(var(--sp-8), env(safe-area-inset-left));
+    padding-right: var(--sp-5, 20px);
+    padding-top: calc(var(--sp-8) + env(safe-area-inset-top));
+    padding-bottom: calc(var(--sp-8) + env(safe-area-inset-bottom));
+  }
+}
 .sidebar__label {
   font-family: var(--font-pixel);
   font-size: 9px;
