@@ -75,12 +75,13 @@ const accountTriggers = (id) => (getAccountCfg(id) || {}).triggers || [];
 const triggerCfg = (accId, tId) => accountTriggers(accId).find((t) => t.id === tId);
 const triggerLabel = (accId, tId) => { const t = triggerCfg(accId, tId); return t ? t.label : ''; };
 
-/* Color engine: each account is a hue family; each trigger a distinct shade
-   within it — so A/B/C read as the same account, told apart by shade, and the
-   whole thing stays on-brand against the dark UI. */
+/* Color engine: each account gets a themed set of DISTINCT hues (not just
+   shades), so its triggers A/B/C are easy to tell apart at a glance while the
+   set still reads as one account (warm for the first, cool for the second) and
+   stays on-brand against the dark UI. */
 const HUE_FAMILIES = [
-  ['#BCEF2F', '#86E01E', '#C8FF45', '#9FD630', '#6FBF2A'], // lime / green
-  ['#4D6BFF', '#4DA6FF', '#22D3EE', '#7C9CFF', '#3D5AF1'], // blue / cyan
+  ['#BCEF2F', '#F5D33B', '#FF7A33', '#86E01E', '#E8631C'], // Sparks: green / yellow / orange / …
+  ['#4D6BFF', '#22D3EE', '#B57BFF', '#4DA6FF', '#7C9CFF'], // Zparx: blue / cyan / violet / …
   ['#FF7A33', '#FF9E2C', '#F5D33B', '#FFB066', '#E8631C'], // orange / amber
   ['#B57BFF', '#9B5DE5', '#C77DFF', '#8A5CF6', '#7A3FF0'], // purple
   ['#FF4D8D', '#FF7AA8', '#F15BB5', '#FF9EC4', '#E8327C'], // pink
@@ -130,6 +131,7 @@ function setCalHourPx(v, persist = true) {
   return true;
 }
 let activeTouches = 0; // live count of fingers on the calendar (pinch vs drag guard)
+let lastCalDragEnd = 0; // timestamp a block-drag ended — suppresses the synthetic click that follows
 let calRef = new Date(); // any day inside the week currently shown
 
 /* settings (default model / default account / optional trigger override /
@@ -819,6 +821,9 @@ function renderCalendar() {
         if (!el.isConnected) return; // element was replaced by a re-render (zoom) — ignore
         const r = getRoutine(id);
         if (!dragging) { if (r) openDrawer(r); return; } // it was a tap
+        // A real move just happened — mark it so the synthetic click the browser
+        // fires next on the day column doesn't open a blank "new routine" drawer.
+        lastCalDragEnd = Date.now();
         el.classList.remove('cal__ev--dragging');
         const minutes = Math.round(CAL.startHour * 60 + (topPx / CAL.hourPx) * 60);
         const day = days[ti];
@@ -834,6 +839,7 @@ function renderCalendar() {
   });
   // Click empty space in a day column to create a routine at that exact day + time.
   view.querySelectorAll('.cal__day').forEach((col, i) => col.addEventListener('click', (e) => {
+    if (Date.now() - lastCalDragEnd < 400) return; // just dropped a dragged block — ignore the trailing click
     if (e.target.closest('.cal__ev')) return; // landed on an event — its own handler opens it
     const day = days[i]; if (!day) return;
     const rect = col.getBoundingClientRect();
