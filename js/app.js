@@ -116,7 +116,7 @@ const fmtDuration = (m) => m < 60 ? `${m} min` : (m % 60 === 0 ? `${m / 60} hr` 
 /* Week-calendar layout knobs — full 24h day (routines can fire overnight).
    hourPx is the vertical scale and is pinch-zoomable (see wireCalendarZoom),
    persisted per browser so the chosen zoom sticks. */
-const CAL_HOURPX_MIN = 28, CAL_HOURPX_MAX = 132, CAL_HOURPX_DEFAULT = 44;
+const CAL_HOURPX_MIN = 22, CAL_HOURPX_MAX = 240, CAL_HOURPX_DEFAULT = 44;
 const CAL_ZOOM_LS = 'routiner.cal.hourpx.v1';
 const clampHourPx = (v) => Math.max(CAL_HOURPX_MIN, Math.min(CAL_HOURPX_MAX, Math.round(v)));
 const loadCalHourPx = () => { const n = parseFloat(localStorage.getItem(CAL_ZOOM_LS)); return Number.isFinite(n) ? clampHourPx(n) : CAL_HOURPX_DEFAULT; };
@@ -773,8 +773,8 @@ function renderCalendar() {
   view.querySelectorAll('[data-cal]').forEach((b) => b.addEventListener('click', () => {
     const a = b.dataset.cal;
     if (a === 'today') calRef = new Date();
-    else if (a === 'zoomin') setCalHourPx(CAL.hourPx * 1.25);
-    else if (a === 'zoomout') setCalHourPx(CAL.hourPx / 1.25);
+    else if (a === 'zoomin') setCalHourPx(CAL.hourPx * 1.4);
+    else if (a === 'zoomout') setCalHourPx(CAL.hourPx / 1.4);
     else calRef = addDays(calRef, a === 'next' ? 7 : -7);
     renderCalendar();
   }));
@@ -851,43 +851,73 @@ function renderCalendar() {
 
 /* Pinch-to-zoom the daily timeline (two fingers, like Apple/Google Calendar),
    plus ctrl/⌘ + wheel on desktop. Attached once to the persistent #view element
-   so it survives the calendar's re-renders. */
+   so it survives the calendar's re-renders.
+
+   On iPadOS/Safari a two-finger pinch is delivered as native gesture events
+   (which otherwise page-zoom the whole tab), so we handle those directly — they
+   give an absolute `scale` — and only fall back to raw touch math on engines
+   without GestureEvent. PINCH_GAIN amplifies the response so a modest spread
+   produces a satisfying zoom rather than a barely-perceptible nudge. */
 function wireCalendarZoom() {
+  const HAS_GESTURE = typeof window !== 'undefined' && 'GestureEvent' in window;
+  const PINCH_GAIN = 1.8; // exponent on the pinch scale — >1 makes zoom feel stronger
   const scrollEl = () => $('.cal__scroll', view);
   const distOf = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
-  let pinching = false, startDist = 1, startPx = CAL.hourPx, anchor = 0, raf = 0;
+  let startPx = CAL.hourPx, anchor = 0, raf = 0;
 
-  view.addEventListener('touchstart', (e) => {
-    activeTouches = e.touches.length;
-    if (currentView !== 'calendar' || e.touches.length !== 2) return;
-    pinching = true; startDist = distOf(e.touches) || 1; startPx = CAL.hourPx;
-    const sc = scrollEl();
-    anchor = sc && sc.scrollHeight ? (sc.scrollTop + sc.clientHeight / 2) / sc.scrollHeight : 0;
-  }, { passive: true });
-
-  view.addEventListener('touchmove', (e) => {
-    if (!pinching || e.touches.length !== 2) return;
-    e.preventDefault(); // stop the page/timeline from scrolling mid-pinch
-    if (!setCalHourPx(startPx * (distOf(e.touches) / startDist), false)) return;
-    if (!raf) raf = requestAnimationFrame(() => {
+  const captureAnchor = () => { const sc = scrollEl(); anchor = sc && sc.scrollHeight ? (sc.scrollTop + sc.clientHeight / 2) / sc.scrollHeight : 0; };
+  const applyZoom = (px) => {
+    if (!setCalHourPx(px, false)) return;
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
       raf = 0;
       renderCalendar();
       const sc = scrollEl(); // keep the pinch roughly centered on where it started
       if (sc) sc.scrollTop = Math.max(0, anchor * sc.scrollHeight - sc.clientHeight / 2);
     });
-  }, { passive: false });
+  };
+  const persist = () => { try { localStorage.setItem(CAL_ZOOM_LS, String(CAL.hourPx)); } catch { /* */ } };
 
+  // ── Safari / iPadOS: native pinch gesture (scale is relative to gesturestart) ──
+  let gesturing = false;
+  view.addEventListener('gesturestart', (e) => {
+    if (currentView !== 'calendar') return;
+    e.preventDefault(); gesturing = true; startPx = CAL.hourPx; captureAnchor();
+  });
+  view.addEventListener('gesturechange', (e) => {
+    if (!gesturing) return;
+    e.preventDefault();
+    applyZoom(startPx * Math.pow(e.scale || 1, PINCH_GAIN));
+  });
+  const endGesture = () => { if (gesturing) { gesturing = false; persist(); } };
+  view.addEventListener('gestureend', endGesture);
+
+  // ── Other engines: two-finger touch math (skipped where GestureEvent exists) ──
+  let pinching = false, startDist = 1;
+  view.addEventListener('touchstart', (e) => {
+    activeTouches = e.touches.length;
+    if (HAS_GESTURE || currentView !== 'calendar' || e.touches.length !== 2) return;
+    pinching = true; startDist = distOf(e.touches) || 1; startPx = CAL.hourPx; captureAnchor();
+  }, { passive: true });
+  view.addEventListener('touchmove', (e) => {
+    if (!pinching || e.touches.length !== 2) return;
+    e.preventDefault(); // stop the page/timeline from scrolling mid-pinch
+    applyZoom(startPx * Math.pow(distOf(e.touches) / startDist, PINCH_GAIN));
+  }, { passive: false });
   const endTouch = (e) => {
     activeTouches = e.touches.length;
-    if (pinching && e.touches.length < 2) { pinching = false; try { localStorage.setItem(CAL_ZOOM_LS, String(CAL.hourPx)); } catch { /* */ } }
+    if (pinching && e.touches.length < 2) { pinching = false; persist(); }
   };
   view.addEventListener('touchend', endTouch);
   view.addEventListener('touchcancel', endTouch);
 
+  // ── Desktop: ctrl/⌘ + wheel ──
   view.addEventListener('wheel', (e) => {
     if (currentView !== 'calendar' || !(e.ctrlKey || e.metaKey)) return;
     e.preventDefault();
-    if (setCalHourPx(CAL.hourPx * (e.deltaY < 0 ? 1.1 : 1 / 1.1))) renderCalendar();
+    captureAnchor();
+    if (setCalHourPx(CAL.hourPx * (e.deltaY < 0 ? 1.12 : 1 / 1.12))) { renderCalendar(); const sc = scrollEl(); if (sc) sc.scrollTop = Math.max(0, anchor * sc.scrollHeight - sc.clientHeight / 2); }
+    persist();
   }, { passive: false });
 }
 

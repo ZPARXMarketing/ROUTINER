@@ -36,9 +36,11 @@ a { color: var(--periwinkle); }
     max(var(--sp-8), env(safe-area-inset-left));
 }
 /* Roomier perimeter on tablet / desktop widths (e.g. iPadOS) so content isn't
-   jammed against the screen edges. */
+   jammed against the screen edges. The sidebar owns the left outer gutter and
+   the content owns the right one, so both get bumped in tandem. */
 @media (min-width: 900px) {
-  .content { padding-left: max(var(--sp-12), env(safe-area-inset-left)); padding-right: max(var(--sp-12), env(safe-area-inset-right)); padding-top: max(var(--sp-8), env(safe-area-inset-top)); }
+  .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); padding-top: max(var(--sp-8), env(safe-area-inset-top)); }
+  .sidebar { padding-left: max(var(--sp-8), env(safe-area-inset-left)); padding-right: var(--sp-5, 20px); padding-top: max(var(--sp-6), env(safe-area-inset-top)); }
 }
 
 /* ── Sidebar (navigation table) ────────────────── */
