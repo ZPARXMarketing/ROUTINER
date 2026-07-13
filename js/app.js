@@ -390,30 +390,41 @@ async function fireTrigger(routine) {
   const url = direct || TRIGGER_FN;
   const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, triggerKey: routine?.triggerKey || null, model: routine ? effectiveModel(routine) : undefined, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
   // Send the signed-in user's access token so the gated function authorizes us.
+  // ALWAYS attach it when we have one — including with a direct URL set in
+  // Settings. A direct URL is typically this app's own gated function on its
+  // canonical host (used when the app is served from another domain), and
+  // skipping auth there made every Run now 401 while the Settings "Test"
+  // button (which does send the token, see pingTrigger) reported success.
   const post = (token) => {
     const headers = { 'content-type': 'application/json' };
-    if (token && !direct) headers.Authorization = `Bearer ${token}`;
+    if (token) headers.Authorization = `Bearer ${token}`;
     return fetch(url, { method: 'POST', headers, body: payload });
   };
-  let token = null;
-  if (!direct) {
-    const { session, error } = await sessionForFire();
-    if (error) { toast(error, 'error'); return; }   // client-side: no valid session here
-    token = session.access_token;
-  }
+  const { session, error } = await sessionForFire();
+  // Without a direct URL the gated built-in function will reject an
+  // unauthenticated call anyway, so surface the session problem here. A direct
+  // URL may be ungated — let it try without a token.
+  if (error && !direct) { toast(error, 'error'); return; }
+  let token = session?.access_token || null;
   try {
     let r = await post(token);
     // A 401 despite a token means the server rejected it as expired/invalid —
     // force one refresh and retry before giving up, so a stale token self-heals.
-    if (r.status === 401 && !direct) {
+    if (r.status === 401 && token) {
       const s = await tryRefresh();
-      if (s?.access_token && s.access_token !== token) r = await post(s.access_token);
+      if (s?.access_token && s.access_token !== token) { token = s.access_token; r = await post(token); }
     }
     if (!r.ok) {
       // Distinct wording from the client-side "no session" message above so we
       // can tell the two apart from the toast alone: this one means the browser
-      // HAD a session but the server rejected it.
-      if (r.status === 401) { toast('Server rejected your session (401) even after refresh. Sign out and back in.', 'error'); return; }
+      // HAD a session but the server rejected it. Include the server's own
+      // error text — different rejectors (our function, a foreign endpoint)
+      // say different things, and that difference is the diagnosis.
+      if (r.status === 401) {
+        const m = (await r.text().catch(() => '')).slice(0, 160);
+        toast(`Server rejected the fire (401${m ? `: ${m}` : ''}). ${token ? 'Sign out and back in if this persists.' : 'Sign in and try again.'}`, 'error');
+        return;
+      }
       if (r.status === 403) { toast('This account isn’t allowed to fire routines.', 'error'); return; }
       const m = (await r.text().catch(() => '')).slice(0, 180);
       toast(`Trigger responded ${r.status}. ${m}`, 'error');
