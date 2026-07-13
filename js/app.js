@@ -345,27 +345,35 @@ function toggleFireSwitch() {
 }
 
 /* ---------- Trigger (fire the Claude Code routine) ---------- */
-/* Return a *valid* Supabase access token, refreshing first if the stored one is
-   expired (or about to). getSession() hands back whatever is in storage without
-   validating it, and the background auto-refresh timer often doesn't run while a
-   tab is backgrounded/asleep — so an idle-but-signed-in user can be holding an
-   expired token. Sending that to the gated trigger function yields a 401 ("must
-   be signed in"), which is why signing out and back in "fixes" it. Refresh
-   proactively instead. Pass force=true to refresh regardless (used to retry a
-   401). Returns null only when there's genuinely no session. */
-async function freshAccessToken(force = false) {
-  const { data: { session: s } } = await sb.auth.getSession();
-  if (!s) return null;
-  const now = Math.floor(Date.now() / 1000);
-  // expires_at is a unix timestamp (seconds); refresh if past or within 60s.
-  const stale = !s.expires_at || (s.expires_at - now) < 60;
-  if (force || stale) {
-    const { data, error } = await sb.auth.refreshSession();
-    if (!error && data?.session?.access_token) return data.session.access_token;
-    // Refresh failed (e.g. revoked refresh token) — fall back to what we have;
-    // if that's expired too the server will 401 and the caller reports it.
+/* refreshSession() resolves with {data,error} rather than throwing, but guard
+   anyway so a thrown network error can't break the fire flow. */
+async function tryRefresh() {
+  try { const { data, error } = await sb.auth.refreshSession(); return error ? null : (data?.session || null); }
+  catch { return null; }
+}
+
+/* Resolve a *valid* Supabase session for firing, healing the two ways it goes
+   stale on an idle tab (common on iPad Safari, which suspends backgrounded
+   pages and pauses the auto-refresh timer):
+     1. getSession() returns an expired token (it reads storage without
+        validating) → refresh it.
+     2. getSession() returns nothing at all → try one refresh from the stored
+        refresh token before concluding the user is signed out.
+   Returns { session } on success, or { error } describing what failed so the
+   caller can show it on-screen (no devtools needed to diagnose). */
+async function sessionForFire() {
+  let { data: { session: s } } = await sb.auth.getSession();
+  if (!s) {
+    s = await tryRefresh();
+    if (!s) return { error: 'No active session on this device. Sign out and back in.' };
   }
-  return s.access_token || null;
+  const now = Math.floor(Date.now() / 1000);
+  if (!s.expires_at || (s.expires_at - now) < 60) {   // expired or about to
+    const r = await tryRefresh();
+    if (r) s = r;
+  }
+  if (!s.access_token) return { error: 'Signed in, but no access token is available. Sign out and back in.' };
+  return { session: s };
 }
 
 async function fireTrigger(routine) {
@@ -381,19 +389,23 @@ async function fireTrigger(routine) {
   };
   let token = null;
   if (!direct) {
-    token = await freshAccessToken();
-    if (!token) { toast('You must be signed in to fire routines. Please sign in and try again.', 'error'); return; }
+    const { session, error } = await sessionForFire();
+    if (error) { toast(error, 'error'); return; }   // client-side: no valid session here
+    token = session.access_token;
   }
   try {
     let r = await post(token);
-    // A 401 despite a token means it was rejected as expired/invalid — force one
-    // refresh and retry before giving up, so a stale token self-heals silently.
+    // A 401 despite a token means the server rejected it as expired/invalid —
+    // force one refresh and retry before giving up, so a stale token self-heals.
     if (r.status === 401 && !direct) {
-      const fresh = await freshAccessToken(true);
-      if (fresh && fresh !== token) r = await post(fresh);
+      const s = await tryRefresh();
+      if (s?.access_token && s.access_token !== token) r = await post(s.access_token);
     }
     if (!r.ok) {
-      if (r.status === 401) { toast('Your session expired and couldn’t be refreshed. Sign out and back in to fire routines.', 'error'); return; }
+      // Distinct wording from the client-side "no session" message above so we
+      // can tell the two apart from the toast alone: this one means the browser
+      // HAD a session but the server rejected it.
+      if (r.status === 401) { toast('Server rejected your session (401) even after refresh. Sign out and back in.', 'error'); return; }
       if (r.status === 403) { toast('This account isn’t allowed to fire routines.', 'error'); return; }
       const m = (await r.text().catch(() => '')).slice(0, 180);
       toast(`Trigger responded ${r.status}. ${m}`, 'error');
