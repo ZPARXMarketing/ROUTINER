@@ -22,7 +22,15 @@ const TRIGGER_FN = '/.netlify/functions/claude-trigger';
    preview/branch/dev deploys default to paused so they don't fire by accident. */
 const MAIN_HOST = 'zroutiner.netlify.app';
 
-const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+/* Dedicated storage key: this Supabase project is shared with other ZPARX apps
+   (e.g. the admin dashboard). Two apps on the same browser origin using the
+   default key share ONE session in localStorage and rotate each other's refresh
+   tokens; when a stale token gets replayed, Supabase's reuse detection revokes
+   the whole session, so the trigger function rejects even freshly-refreshed
+   tokens (401) until a manual sign-out/in. An app-specific key gives Routiner
+   its own independent session. (One-time effect: existing users are signed out
+   once by this change and just sign back in.) */
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { storageKey: 'routiner-auth' } });
 const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (Mon–Fri)', weekly: 'Every week' };
 
 /* ---------- Accounts & triggers (user-managed) ----------
