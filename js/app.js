@@ -345,20 +345,55 @@ function toggleFireSwitch() {
 }
 
 /* ---------- Trigger (fire the Claude Code routine) ---------- */
+/* Return a *valid* Supabase access token, refreshing first if the stored one is
+   expired (or about to). getSession() hands back whatever is in storage without
+   validating it, and the background auto-refresh timer often doesn't run while a
+   tab is backgrounded/asleep — so an idle-but-signed-in user can be holding an
+   expired token. Sending that to the gated trigger function yields a 401 ("must
+   be signed in"), which is why signing out and back in "fixes" it. Refresh
+   proactively instead. Pass force=true to refresh regardless (used to retry a
+   401). Returns null only when there's genuinely no session. */
+async function freshAccessToken(force = false) {
+  const { data: { session: s } } = await sb.auth.getSession();
+  if (!s) return null;
+  const now = Math.floor(Date.now() / 1000);
+  // expires_at is a unix timestamp (seconds); refresh if past or within 60s.
+  const stale = !s.expires_at || (s.expires_at - now) < 60;
+  if (force || stale) {
+    const { data, error } = await sb.auth.refreshSession();
+    if (!error && data?.session?.access_token) return data.session.access_token;
+    // Refresh failed (e.g. revoked refresh token) — fall back to what we have;
+    // if that's expired too the server will 401 and the caller reports it.
+  }
+  return s.access_token || null;
+}
+
 async function fireTrigger(routine) {
   if (!settings.firing) { toast('Firing is paused on this site (top-right switch). Toggle it live to fire.', 'error'); return; }
   const direct = settings.triggerUrl.trim();
   const url = direct || TRIGGER_FN;
   const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, triggerKey: routine?.triggerKey || null, model: routine ? effectiveModel(routine) : undefined, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
   // Send the signed-in user's access token so the gated function authorizes us.
-  const headers = { 'content-type': 'application/json' };
-  const { data: { session: s } } = await sb.auth.getSession();
-  if (s?.access_token && !direct) headers.Authorization = `Bearer ${s.access_token}`;
-  if (!s && !direct) { toast('You must be signed in to fire routines. Please sign in and try again.', 'error'); return; }
+  const post = (token) => {
+    const headers = { 'content-type': 'application/json' };
+    if (token && !direct) headers.Authorization = `Bearer ${token}`;
+    return fetch(url, { method: 'POST', headers, body: payload });
+  };
+  let token = null;
+  if (!direct) {
+    token = await freshAccessToken();
+    if (!token) { toast('You must be signed in to fire routines. Please sign in and try again.', 'error'); return; }
+  }
   try {
-    const r = await fetch(url, { method: 'POST', headers, body: payload });
+    let r = await post(token);
+    // A 401 despite a token means it was rejected as expired/invalid — force one
+    // refresh and retry before giving up, so a stale token self-heals silently.
+    if (r.status === 401 && !direct) {
+      const fresh = await freshAccessToken(true);
+      if (fresh && fresh !== token) r = await post(fresh);
+    }
     if (!r.ok) {
-      if (r.status === 401) { toast('You must be signed in to fire routines. Try signing out and back in.', 'error'); return; }
+      if (r.status === 401) { toast('Your session expired and couldn’t be refreshed. Sign out and back in to fire routines.', 'error'); return; }
       if (r.status === 403) { toast('This account isn’t allowed to fire routines.', 'error'); return; }
       const m = (await r.text().catch(() => '')).slice(0, 180);
       toast(`Trigger responded ${r.status}. ${m}`, 'error');
