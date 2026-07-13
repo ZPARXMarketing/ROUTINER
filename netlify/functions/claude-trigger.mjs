@@ -180,13 +180,17 @@ export default async (req) => {
   const rawModel = incoming.model ?? null;
   const model = /^claude-/i.test(rawModel || '') ? rawModel : null;
 
-  // Prefer the signed-in user's in-app settings; fall back to env vars per field.
+  // Prefer the signed-in user's in-app settings AS A PAIR; fall back to env
+  // vars only when the user has nothing stored for this account+trigger.
+  // Never mix fields across sources: a fire URL paired with a token that was
+  // minted for a different routine gets "Token is not authorized for this
+  // routine" from Anthropic.
   const accessToken = bearer(req);
   const userCreds = (accessToken && accessToken !== process.env.ROUTINER_FIRE_SECRET)
     ? await loadUserCreds(accessToken, account, triggerKey) : null;
   const envCreds = resolveAccountCreds(account);
-  const trigger = (userCreds && userCreds.trigger) || envCreds.trigger;
-  const token = (userCreds && userCreds.token) || envCreds.token;
+  const useUser = !!(userCreds && (userCreds.trigger || userCreds.token));
+  const { trigger, token } = useUser ? userCreds : envCreds;
   const url = resolveFireUrl(trigger);
   if (!url) return Response.json({ ok: false, error: `No trigger configured for account "${account || 'default'}" — add its trigger in the app's Settings, or set CLAUDE_TRIGGER_<ACCOUNT> in Netlify env. It must be a routine id (trig_…) or a full /fire URL.` }, { status: 500, headers: cors });
   if (!token) return Response.json({ ok: false, error: `No token for account "${account || 'default'}" — add its token in the app's Settings, or set CLAUDE_TOKEN_<ACCOUNT> in Netlify env.` }, { status: 500, headers: cors });
@@ -204,6 +208,19 @@ export default async (req) => {
       signal: AbortSignal.timeout(FIRE_TIMEOUT_MS),
     });
     const body = await resp.text();
+    // Translate an upstream auth failure instead of passing the 401/403
+    // through: to the browser a raw 401 reads as "your sign-in is bad" (the
+    // app tells the user to sign out and back in), but the user's session
+    // already passed authorize() above — what actually failed is the stored
+    // Anthropic trigger token. Say so, from a status the client won't confuse
+    // with its own auth.
+    if (resp.status === 401 || resp.status === 403) {
+      console.error('claude-trigger upstream auth failure:', resp.status, body.slice(0, 300));
+      const where = useUser
+        ? `the token saved in the app's Settings for this account/trigger — paste a fresh token there (Settings → account → trigger)`
+        : `the CLAUDE_TOKEN env var for account "${account || 'default'}" in Netlify`;
+      return Response.json({ ok: false, error: `Anthropic rejected the trigger token (upstream ${resp.status}) — your sign-in is fine. Fix ${where}.` }, { status: 502, headers: cors });
+    }
     return new Response(body || JSON.stringify({ ok: resp.ok, status: resp.status }), {
       status: resp.ok ? 200 : resp.status,
       headers: {
