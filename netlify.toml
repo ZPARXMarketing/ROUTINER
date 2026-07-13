@@ -11,3 +11,22 @@
   from = "/api/claude-trigger"
   to = "/.netlify/functions/claude-trigger"
   status = 200
+
+# Don't let browsers (esp. iPad Safari, which caches ES modules hard) pin an
+# old copy of the app after a deploy. `no-cache` still allows caching but forces
+# a revalidation against the server first, so a new deploy is picked up
+# immediately instead of the user running stale JS and seeing already-fixed bugs.
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/js/*"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/css/*"
+  [headers.values]
+    Cache-Control = "no-cache"
