@@ -37,6 +37,12 @@ const RETRY_BACKOFF_MIN = num("SCHEDULER_RETRY_BACKOFF_MIN", 2); // 2,4,8… min
 const MAX_STALE_MIN = num("SCHEDULER_MAX_STALE_MIN", 360); // >6h past due → mark missed, don't fire
 const FIRE_TIMEOUT_MS = num("SCHEDULER_FIRE_TIMEOUT_MS", 30_000); // don't let one hung fire stall the run
 
+// Anthropic headers for firing a routine /fire directly (same values the Netlify
+// forwarder uses). Lets the scheduler fire with the owner's in-app token instead
+// of the forwarder's env-var token — see the fire block in processOne.
+const ANTHROPIC_VERSION = "2023-06-01";
+const ANTHROPIC_BETA = Deno.env.get("CLAUDE_ROUTINE_BETA") || "experimental-cc-routine-2026-04-01";
+
 const rest = (path: string) => `${SUPABASE_URL}/rest/v1/${path}`;
 const dbHeaders: Record<string, string> = {
   apikey: SERVICE_KEY,
@@ -168,6 +174,31 @@ function nextOccurrence(iso: string, rec: string, tz?: string | null): string | 
   return new Date(inst).toISOString();
 }
 
+// ── Per-account credential resolution ────────────────────────────────────────
+// Mirrors the app + claude-trigger (netlify/functions/claude-trigger.mjs): a
+// trigger's stored value is either a full /fire URL or a "trig_…" id.
+function resolveFireUrl(trigger?: string | null): string | null {
+  if (!trigger) return null;
+  if (/^https?:\/\//i.test(trigger)) return trigger;
+  if (/^trig_/.test(trigger)) return `https://api.anthropic.com/v1/claude_code/routines/${trigger}/fire`;
+  return null;
+}
+// Resolve one account+trigger's saved { trigger, token } from a user's
+// routiner_settings.accounts (list-of-accounts shape). Returns the pair intact
+// (never mixed across sources) or null when the owner has nothing saved.
+function pickCreds(
+  accounts: unknown,
+  account: string,
+  triggerKey?: string | null,
+): { trigger: string; token: string } | null {
+  if (!Array.isArray(accounts)) return null;
+  const a = accounts.find((x) => x && x.id === account);
+  if (!a) return null;
+  const trigs = Array.isArray(a.triggers) ? a.triggers : [];
+  const t = (triggerKey && trigs.find((x: { id?: string }) => x && x.id === triggerKey)) || trigs[0];
+  return t ? { trigger: t.trigger || "", token: t.token || "" } : null;
+}
+
 // ── REST helpers ─────────────────────────────────────────────────────────────
 async function patchRow(id: string, patch: Record<string, unknown>) {
   await fetch(rest(`routiner_routines?id=eq.${id}`), {
@@ -196,6 +227,7 @@ async function processOne(
   r: Record<string, any>,
   nowIso: string,
   policy: Record<string, Record<string, string>> = ROUTING_POLICY,
+  accounts: unknown = null,
 ): Promise<string> {
   const orig = r.scheduled_at as string;
   const next = nextOccurrence(orig, r.recurrence, r.tz);
@@ -231,30 +263,63 @@ async function processOne(
     return "missed";
   }
 
-  // Fire via the Netlify forwarder (which holds CLAUDE_TRIGGER + CLAUDE_TOKEN).
+  // Fire the routine. Prefer the owner's in-app token (routiner_settings,
+  // resolved here under the service role) so a scheduled fire uses the SAME
+  // credential the app uses for a manual fire — no Netlify env token needed.
+  // Fall back to the Netlify forwarder (which holds CLAUDE_TRIGGER + CLAUDE_TOKEN
+  // env vars) only when the owner has nothing saved for this account+trigger.
+  const rawModel = effectiveModel(r, policy);
+  const model = /^claude-/i.test(rawModel) ? rawModel : null; // only Claude ids go to /fire
+  const creds = pickCreds(accounts, r.account, r.trigger_key);
+  const directUrl = creds && creds.token ? resolveFireUrl(creds.trigger) : null;
+
   let status = "success";
   let output = "";
   try {
-    const fireHeaders: Record<string, string> = { "Content-Type": "application/json" };
-    const fireSecret = Deno.env.get("ROUTINER_FIRE_SECRET");
-    if (fireSecret) fireHeaders.Authorization = `Bearer ${fireSecret}`;
-    const f = await fetch(TRIGGER_URL, {
-      method: "POST",
-      headers: fireHeaders,
-      body: JSON.stringify({
-        text: r.prompt,
-        account: r.account,
-        triggerKey: r.trigger_key,
-        model: effectiveModel(r, policy),
-        source: "routiner-scheduler",
-        routineId: r.id,
-        title: r.title,
-        at: nowIso,
-      }),
-      signal: AbortSignal.timeout(FIRE_TIMEOUT_MS),
-    });
+    let f: Response;
+    if (directUrl && creds) {
+      // Direct fire with the owner's saved token+URL (kept as a matched pair).
+      f = await fetch(directUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${creds.token}`,
+          "anthropic-version": ANTHROPIC_VERSION,
+          "anthropic-beta": ANTHROPIC_BETA,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ text: r.prompt, ...(model ? { model } : {}) }),
+        signal: AbortSignal.timeout(FIRE_TIMEOUT_MS),
+      });
+    } else {
+      // Legacy fallback: let the Netlify forwarder resolve env-var creds.
+      const fireHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      const fireSecret = Deno.env.get("ROUTINER_FIRE_SECRET");
+      if (fireSecret) fireHeaders.Authorization = `Bearer ${fireSecret}`;
+      f = await fetch(TRIGGER_URL, {
+        method: "POST",
+        headers: fireHeaders,
+        body: JSON.stringify({
+          text: r.prompt,
+          account: r.account,
+          triggerKey: r.trigger_key,
+          ...(model ? { model } : {}),
+          source: "routiner-scheduler",
+          routineId: r.id,
+          title: r.title,
+          at: nowIso,
+        }),
+        signal: AbortSignal.timeout(FIRE_TIMEOUT_MS),
+      });
+    }
     output = (await f.text()).slice(0, 2000);
-    if (!f.ok) status = "error";
+    if (!f.ok) {
+      status = "error";
+      // Translate an upstream auth failure on the direct path into an actionable
+      // message — the token saved in the app's Settings needs refreshing.
+      if (directUrl && (f.status === 401 || f.status === 403)) {
+        output = `Anthropic rejected the token saved in Settings for account "${r.account}" / trigger "${r.trigger_key}" (upstream ${f.status}) — paste a fresh token there. ${output}`.slice(0, 2000);
+      }
+    }
   } catch (e) {
     status = "error";
     output = e instanceof DOMException && e.name === "TimeoutError"
@@ -300,31 +365,38 @@ Deno.serve(async () => {
   }
   const due = await dueRes.json();
 
-  // Load each owner's auto-routing policy once (shared with the app via
-  // routiner_settings.model_policy), so `auto` fires pick the model the user
-  // configured. Missing/invalid → the built-in default.
+  // Load each owner's settings once: the auto-routing policy (shared with the app
+  // via routiner_settings.model_policy) so `auto` fires pick the model the user
+  // configured, and the accounts list so a scheduled fire can use the owner's
+  // in-app trigger token — the same credential the app uses for a manual fire.
+  // Missing/invalid policy → the built-in default; missing accounts → the
+  // Netlify-forwarder fallback in processOne.
   const policyByUser: Record<string, Record<string, Record<string, string>>> = {};
+  const accountsByUser: Record<string, unknown> = {};
   const userIds = [...new Set(due.map((r: Record<string, any>) => r.user_id).filter(Boolean))];
   if (userIds.length) {
     try {
       const inList = userIds.map((u) => encodeURIComponent(String(u))).join(",");
       const pr = await fetch(
-        rest(`routiner_settings?select=user_id,model_policy&user_id=in.(${inList})`),
+        rest(`routiner_settings?select=user_id,model_policy,accounts&user_id=in.(${inList})`),
         { headers: dbHeaders },
       );
       if (pr.ok) {
         for (const row of await pr.json()) {
           const np = normalizePolicy(row.model_policy);
           if (np) policyByUser[row.user_id] = np;
+          if (row.accounts) accountsByUser[row.user_id] = row.accounts;
         }
       }
-    } catch { /* fall back to the default policy per routine */ }
+    } catch { /* fall back to the default policy + env-var creds per routine */ }
   }
 
   // Process independently and in parallel; one slow/failed routine can't block
   // the others, and the batch limit keeps this within the function's wall clock.
   const settled = await Promise.allSettled(
-    due.map((r: Record<string, any>) => processOne(r, nowIso, policyByUser[r.user_id] || ROUTING_POLICY)),
+    due.map((r: Record<string, any>) =>
+      processOne(r, nowIso, policyByUser[r.user_id] || ROUTING_POLICY, accountsByUser[r.user_id] ?? null)
+    ),
   );
 
   const results = settled.map((s, i) => ({
