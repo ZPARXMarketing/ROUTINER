@@ -22,19 +22,75 @@ export const ANTHROPIC_BASE = 'https://api.anthropic.com/v1';
    Claude ids run as scheduled Claude Code sessions; OpenRouter ids are for
    the live test / future OpenRouter execution. */
 export const MODELS = [
-  { id: 'auto', label: '✨ Auto — let Routiner choose', auto: true },
+  { id: 'auto', label: 'Auto — let Routiner choose', auto: true },
   // Claude — these actually fire your scheduled routines.
   { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 — most capable' },
   { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 — balanced' },
   { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 — fast & cheap' },
   // OpenRouter — selectable; used by the live test (needs an OpenRouter key).
   { id: 'openrouter/auto', label: 'OpenRouter Auto — provider routes it' },
+  { id: 'openai/gpt-5.6-sol', label: 'GPT-5.6 Sol — flagship (OpenRouter)' },
+  { id: 'openai/gpt-5.6-terra', label: 'GPT-5.6 Terra — balanced (OpenRouter)' },
+  { id: 'openai/gpt-5.6-luna', label: 'GPT-5.6 Luna — fast & cheap (OpenRouter)' },
+  { id: 'google/gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro — most capable Gemini (OpenRouter)' },
+  { id: 'google/gemini-3.5-flash', label: 'Gemini 3.5 Flash — near-Pro, cheaper (OpenRouter)' },
+  { id: 'google/gemini-3-flash-preview', label: 'Gemini 3 Flash — cheapest Gemini (OpenRouter)' },
   { id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat — cheap (OpenRouter)' },
   { id: 'moonshotai/kimi-k2.7-code', label: 'Kimi K2.7 Code (OpenRouter)' },
   { id: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B (OpenRouter)' },
   { id: 'z-ai/glm-4.7', label: 'GLM 4.7 — fast, cheap coding (OpenRouter)' },
-  { id: 'z-ai/glm-5', label: 'GLM 5 — most capable (OpenRouter)' },
+  { id: 'z-ai/glm-5', label: 'GLM 5 — most capable GLM (OpenRouter)' },
 ];
+
+/* ---------- Cost estimation ----------
+   USD per 1M tokens {in, out}. OpenAI/Gemini rates are the published July-2026
+   OpenRouter prices; rows flagged `approx` are best-effort estimates — treat
+   every number this file produces as a budgeting guide, not a bill. Claude ids
+   fire as Claude Code sessions on your subscription, so their rows are the
+   API-equivalent rates (useful for comparing, not billed per-token). */
+export const MODEL_PRICING = {
+  'claude-opus-4-8': { in: 5, out: 25, approx: true },
+  'claude-sonnet-5': { in: 3, out: 15, approx: true },
+  'claude-haiku-4-5-20251001': { in: 1, out: 5, approx: true },
+  'openai/gpt-5.6-sol': { in: 5, out: 30 },
+  'openai/gpt-5.6-terra': { in: 2.5, out: 15 },
+  'openai/gpt-5.6-luna': { in: 1, out: 6 },
+  'google/gemini-3.1-pro-preview': { in: 2, out: 12 },
+  'google/gemini-3.5-flash': { in: 1.5, out: 9 },
+  'google/gemini-3-flash-preview': { in: 0.5, out: 3 },
+  'deepseek/deepseek-chat': { in: 0.27, out: 1.1, approx: true },
+  'moonshotai/kimi-k2.7-code': { in: 0.6, out: 2.5, approx: true },
+  'meta-llama/llama-3.3-70b-instruct': { in: 0.1, out: 0.25, approx: true },
+  'z-ai/glm-4.7': { in: 0.6, out: 2.2, approx: true },
+  'z-ai/glm-5': { in: 1, out: 3.2, approx: true },
+};
+
+/* Estimation knobs: ~4 chars/token for English prose; a routine run carries
+   system/context overhead on top of its prompt, and we assume a mid-size
+   response since real output length is unknowable before the run. */
+export const EST = { charsPerTok: 4, inputOverheadTok: 1500, outputTokDefault: 2000 };
+export const estimateTokens = (text) => Math.ceil(String(text || '').length / EST.charsPerTok);
+
+/* Predict one run's cost for a routine (or any {prompt, model, taskType,
+   complexity} shape). Returns { model, inTok, outTok, usd, approx } or null
+   when the resolved model has no pricing row (e.g. openrouter/auto). */
+export function estimateRunCost(routine = {}, policy) {
+  const model = effectiveModel(routine, policy);
+  const p = MODEL_PRICING[model];
+  if (!p) return null;
+  const inTok = estimateTokens(routine.prompt) + EST.inputOverheadTok;
+  const outTok = EST.outputTokDefault;
+  return { model, inTok, outTok, usd: (inTok * p.in + outTok * p.out) / 1e6, approx: !!p.approx };
+}
+
+/* Compact money formatting for estimates (sub-cent amounts keep precision). */
+export function fmtUSD(v) {
+  if (!Number.isFinite(v)) return '—';
+  if (v >= 100) return `$${Math.round(v)}`;
+  if (v >= 1) return `$${v.toFixed(2)}`;
+  if (v >= 0.01) return `$${v.toFixed(3)}`;
+  return `$${v.toFixed(4)}`;
+}
 
 export const TASK_TYPES = [
   { id: 'general', label: 'General' },
@@ -141,7 +197,7 @@ export function modelLabel(id) {
 export function displayModel(routine = {}, policy = activePolicy) {
   const eff = effectiveModel(routine, policy);
   const isAuto = !routine.model || routine.model === 'auto';
-  return isAuto ? `✨ ${modelLabel(eff)}` : modelLabel(eff);
+  return isAuto ? `Auto · ${modelLabel(eff)}` : modelLabel(eff);
 }
 
 /* ---------- Live-test clients (optional; preview a prompt on a model) ---------- */
@@ -186,4 +242,46 @@ export function runModel(prompt, model, keys = {}, opts = {}) {
   return isClaudeModel(model)
     ? runViaAnthropic(prompt, model, (keys.anthropic || '').trim(), opts)
     : runViaOpenRouter(prompt, model, (keys.openrouter || '').trim(), opts);
+}
+
+/* ---------- Multi-turn chat (the Chat tab) ----------
+   Same providers as the live test, but takes a whole conversation:
+   messages = [{ role: 'user'|'assistant', content }]. */
+export async function chatViaOpenRouter(messages, model, apiKey, opts = {}) {
+  if (!apiKey) return { status: 'dryrun', text: 'No OpenRouter key set — add one in Settings → Advanced to chat with OpenRouter models.' };
+  try {
+    const resp = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${apiKey}`,
+        ...(opts.referer ? { 'HTTP-Referer': opts.referer } : {}),
+        ...(opts.title ? { 'X-Title': opts.title } : {}),
+      },
+      body: JSON.stringify({ model: model || 'openrouter/auto', max_tokens: opts.maxTokens || 2048, messages }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return { status: 'error', text: data?.error?.message || `HTTP ${resp.status}` };
+    return { status: 'success', text: (data?.choices?.[0]?.message?.content || '').trim() || '(empty)', model: data?.model || model };
+  } catch (e) { return { status: 'error', text: 'Request failed: ' + e.message }; }
+}
+
+export async function chatViaAnthropic(messages, model, apiKey, opts = {}) {
+  if (!apiKey) return { status: 'dryrun', text: 'No Anthropic key set — add one in Settings → Advanced to chat with Claude models.' };
+  try {
+    const resp = await fetch(`${ANTHROPIC_BASE}/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+      body: JSON.stringify({ model: model || FALLBACK_MODEL, max_tokens: opts.maxTokens || 2048, messages }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) return { status: 'error', text: data?.error?.message || `HTTP ${resp.status}` };
+    return { status: 'success', text: (data.content || []).map((b) => b.text || '').join('\n').trim() || '(empty)', model: data?.model || model };
+  } catch (e) { return { status: 'error', text: 'Request failed: ' + e.message }; }
+}
+
+export function runChat(messages, model, keys = {}, opts = {}) {
+  return isClaudeModel(model)
+    ? chatViaAnthropic(messages, model, (keys.anthropic || '').trim(), opts)
+    : chatViaOpenRouter(messages, model, (keys.openrouter || '').trim(), opts);
 }

@@ -161,10 +161,12 @@ the exact Supabase REST recipes. The loop:
 > **Report back when you finish — with detail.** So the human can see what a
 > fired routine actually did (not just that it fired), POST a report to the
 > `routiner-admin` edge function at the end of your run — it lands in the app's
-> **History**. `summary` is the only required field (a one-paragraph headline),
-> but prefer a *detailed* report: pass any of the optional structured fields and
-> the function composes them into a rich Markdown entry (URLs and `**bold**`
-> render in History). If the session env has your `routineId` (the scheduler
+> **Log** tab (the full technical record; **History** shows the human a cleaned
+> plain-English recap of the same runs). `summary` is the only required field (a
+> one-paragraph headline), but prefer a *detailed* report: pass any of the
+> optional structured fields and the function composes them into a rich Markdown
+> entry (URLs and `**bold**` render in the Log). If the session env has your
+> `routineId` (the scheduler
 > passes it in the fire body), include it so the run inherits the right owner +
 > title:
 > ```bash
@@ -235,8 +237,12 @@ triggers runs it truly in parallel.
   `js/app.js` (single-page UI, ES module).
 - Key views in `app.js`: **Board** (`renderBoard`), **Calendar**
   (`renderCalendar` — full 24h, blocks colored by trigger within a per-account
-  hue family), Scheduled / Library / Archived / History, the Settings
-  **accounts & triggers** manager, and the create/edit **drawer**.
+  hue family), Scheduled / Library / Archived, **History** (plain-English run
+  recaps) vs **Log** (technical record, failures with reasons), **Chat** (test
+  any model directly), the **budget forecast** (top-bar chip → projected spend
+  from the scheduled queue), the Settings **accounts & triggers** manager, and
+  the create/edit **drawer**. The Library holds every non-archived routine —
+  scheduling doesn't remove it, only archiving takes one off the air.
 - DB schema: `supabase/schema.sql` (one-paste setup for a fresh project) +
   incremental `supabase/migrations/`.
 - Styling follows the ZPARX design system: dark-mode-first; lime and yellow are

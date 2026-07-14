@@ -33,12 +33,14 @@
       <div class="sidebar__group">
         <span class="sidebar__label">Navigation</span>
         <nav class="tabs" id="tabs">
-          <button class="tab is-active" data-view="calendar"><span class="tab__ico">▦</span> Calendar</button>
-          <button class="tab" data-view="board"><span class="tab__ico">✎</span> Board <span class="tab__count" data-count="board">0</span></button>
-          <button class="tab" data-view="scheduled"><span class="tab__ico">◷</span> Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
-          <button class="tab" data-view="library"><span class="tab__ico">▤</span> Library <span class="tab__count" data-count="library">0</span></button>
-          <button class="tab" data-view="archived"><span class="tab__ico">▢</span> Archived <span class="tab__count" data-count="archived">0</span></button>
-          <button class="tab" data-view="history"><span class="tab__ico">↻</span> History <span class="tab__count" data-count="history">0</span></button>
+          <button class="tab is-active" data-view="calendar">Calendar</button>
+          <button class="tab" data-view="board">Board <span class="tab__count" data-count="board">0</span></button>
+          <button class="tab" data-view="scheduled">Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
+          <button class="tab" data-view="library">Library <span class="tab__count" data-count="library">0</span></button>
+          <button class="tab" data-view="archived">Archived <span class="tab__count" data-count="archived">0</span></button>
+          <button class="tab" data-view="history">History <span class="tab__count" data-count="history">0</span></button>
+          <button class="tab" data-view="log">Log <span class="tab__count tab__count--alert" data-count="log">0</span></button>
+          <button class="tab" data-view="chat">Chat</button>
         </nav>
       </div>
 
@@ -57,7 +59,8 @@
         <div class="topbar__spacer"></div>
         <div class="topbar__actions">
           <span class="clock" id="clock">—</span>
-          <button class="btn btn--primary" id="newBtn"><span class="btn__icon">＋</span> New routine</button>
+          <button class="clock budget-chip" id="budgetChip" title="Projected spend from everything scheduled — click for the breakdown" style="display:none">—</button>
+          <button class="btn btn--primary" id="newBtn">New routine</button>
           <label class="fire-toggle" id="fireSwitch" title="Master control: whether this site is allowed to fire routines">
             <span class="fire-toggle__label" id="fireLabel">Inactive</span>
             <span class="fire-toggle__track"><span class="fire-toggle__knob"></span></span>
