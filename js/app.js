@@ -12,8 +12,9 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 import {
   MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
-  effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel,
+  effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel, runChat,
   ROUTING_POLICY, setActivePolicy, getActivePolicy, normalizePolicy,
+  estimateRunCost, fmtUSD,
 } from './model-router.js';
 import { nextOccurrence, nextOccurrences } from './schedule.js';
 
@@ -256,7 +257,7 @@ function warnRecentFailures() {
   _failuresWarned = true;
   const n = bad.length;
   const kinds = bad.some((b) => b.status === 'missed') ? 'failed/missed' : 'failed';
-  toast(`${n} routine run${n > 1 ? 's' : ''} ${kinds} in the last 24h — see History`, 'error');
+  toast(`${n} routine run${n > 1 ? 's' : ''} ${kinds} in the last 24h — see the Log tab`, 'error');
 }
 const getRoutine = (id) => routines.find((r) => r.id === id);
 
@@ -485,17 +486,124 @@ function historyItems() {
 }
 function counts() {
   const fired = firedRoutineIds();
-  const c = { scheduled: 0, library: 0, archived: 0, history: 0, board: notes.filter((n) => n.status === 'active').length };
+  const c = { scheduled: 0, library: 0, archived: 0, history: 0, log: 0, board: notes.filter((n) => n.status === 'active').length };
   routines.forEach((r) => {
     if (r.status === 'archived') { c.archived++; return; }
     if (isPastOneOff(r, fired)) return;              // counted under History below
     if (r.status === 'scheduled') c.scheduled++;
-    else if (r.status === 'library') c.library++;
+    // The Library is every non-archived routine — scheduled ones stay live in it.
+    c.library++;
   });
-  c.history = historyItems().length;
+  const items = historyItems();
+  c.history = items.length;
+  c.log = items.filter((it) => it.status === 'error' || it.status === 'missed').length;
   return c;
 }
-function paintCounts() { const c = counts(); $$('[data-count]').forEach((el) => { el.textContent = c[el.dataset.count] ?? 0; }); }
+function paintCounts() {
+  const c = counts();
+  $$('[data-count]').forEach((el) => {
+    el.textContent = c[el.dataset.count] ?? 0;
+    if (el.classList.contains('tab__count--alert')) el.classList.toggle('is-hot', (c[el.dataset.count] ?? 0) > 0);
+  });
+}
+
+/* ---------- Budget forecast (estimated future spend) ----------
+   Predicts what the scheduled queue will cost before it runs: each routine's
+   per-run estimate (prompt length → input tokens + an assumed output size,
+   priced at the model's per-token rates) times how often its recurrence fires.
+   Estimates, not bills — Claude routines run on your Claude subscription and
+   are shown at API-equivalent rates so models stay comparable. */
+const RUNS_PER_DAY = { daily: 1, weekdays: 5 / 7, weekly: 1 / 7 };
+function costForecast() {
+  const fired = firedRoutineIds();
+  const rows = []; let perDay = 0; let oneOff = 0;
+  routines.forEach((r) => {
+    if (r.status !== 'scheduled') return;
+    const est = estimateRunCost(r);
+    if (!est) return; // unpriced model (e.g. openrouter/auto)
+    const rec = r.recurrence || 'none';
+    if (rec === 'none') {
+      if (isPastOneOff(r, fired)) return;
+      oneOff += est.usd;
+      rows.push({ r, est, perDay: 0, oneOff: est.usd });
+    } else {
+      const rpd = RUNS_PER_DAY[rec] || 0;
+      perDay += est.usd * rpd;
+      rows.push({ r, est, perDay: est.usd * rpd, oneOff: 0 });
+    }
+  });
+  rows.sort((a, b) => (b.perDay + b.oneOff) - (a.perDay + a.oneOff));
+  return { rows, perDay, oneOff };
+}
+/* Projected spend for each of the next 7 days (today first), driven by the
+   same recurrence projection the calendar uses. */
+function next7DayCosts() {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return Array.from({ length: 7 }, (_, i) => {
+    const day = addDays(today, i);
+    let usd = 0;
+    routines.forEach((r) => {
+      if (r.status !== 'scheduled' || !occursOn(r, day)) return;
+      if ((r.recurrence || 'none') === 'none' && new Date(r.scheduledAt).getTime() <= Date.now()) return; // already elapsed
+      const est = estimateRunCost(r);
+      if (est) usd += est.usd;
+    });
+    return { day, usd };
+  });
+}
+function paintBudgetChip() {
+  const el = $('#budgetChip'); if (!el) return;
+  const { rows, perDay, oneOff } = costForecast();
+  if (!rows.length) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  el.innerHTML = perDay > 0
+    ? `est <b>${fmtUSD(perDay)}</b>/day${oneOff > 0 ? ` +${fmtUSD(oneOff)} queued` : ''}`
+    : `est <b>${fmtUSD(oneOff)}</b> queued`;
+}
+function openForecast() {
+  editingId = null;
+  drawerTitle.textContent = 'Budget forecast';
+  const { rows, perDay, oneOff } = costForecast();
+  if (!rows.length) {
+    drawerBody.innerHTML = `<div class="empty"><h3>Nothing to forecast</h3><p>Schedule a routine (on a model with known pricing) and its projected cost shows up here.</p></div>`;
+    drawerFoot.innerHTML = '';
+    overlay.classList.add('is-open');
+    return;
+  }
+  const days = next7DayCosts();
+  const maxUsd = Math.max(...days.map((d) => d.usd), 1e-9);
+  const maxIdx = days.findIndex((d) => d.usd === Math.max(...days.map((x) => x.usd)));
+  const bars = days.map((d, i) => {
+    const hPct = d.usd > 0 ? Math.max(6, (d.usd / maxUsd) * 100) : 0;
+    const lbl = d.day.toLocaleDateString([], { weekday: 'short' });
+    const showVal = d.usd > 0 && (i === 0 || i === maxIdx); // label today + the peak; tooltips carry the rest
+    return `<div class="fc__col" title="${esc(lbl)} · ${fmtUSD(d.usd)} projected">
+      <div class="fc__val">${showVal ? fmtUSD(d.usd) : ''}</div>
+      <div class="fc__barwrap"><div class="fc__bar" style="height:${hPct}%"></div></div>
+      <div class="fc__lbl">${i === 0 ? 'Today' : esc(lbl)}</div>
+    </div>`;
+  }).join('');
+  const tile = (label, v) => `<div class="fc__tile"><div class="fc__tile-v">${fmtUSD(v)}</div><div class="fc__tile-l">${label}</div></div>`;
+  const rowHtml = ({ r, est, perDay: pd, oneOff: oo }) => `
+    <div class="fc__row">
+      <span class="acct-dot" style="background:${triggerColor(r.account, r.triggerKey).solid}"></span>
+      <span class="fc__row-title">${esc(r.title) || 'Untitled'}</span>
+      <span class="fc__row-model">${esc(modelLabel(est.model))}</span>
+      <span class="fc__row-cost" title="${fmtUSD(est.usd)} per run, ${esc(RECURRENCE[r.recurrence] || 'One-time')}">${pd > 0 ? `${fmtUSD(pd)}/day` : `${fmtUSD(oo)} once`}</span>
+    </div>`;
+  drawerBody.innerHTML = `
+    <div class="notice">Estimates from prompt length (~4 chars/token, plus session overhead and an assumed ~2k-token reply), priced at each model's per-token rates. Claude routines run on your Claude subscription — shown at API-equivalent rates so you can compare. Use this to budget, not to bill.</div>
+    <div class="fc__tiles">
+      ${tile('per hour', perDay / 24)}${tile('per day', perDay)}${tile('per week', perDay * 7)}${tile('per month', perDay * 30)}${oneOff > 0 ? tile('one-time queued', oneOff) : ''}
+    </div>
+    <div class="cfg-sep">Next 7 days</div>
+    <div class="fc__chart">${bars}</div>
+    <div class="cfg-sep">By routine (most expensive first)</div>
+    <div class="fc__rows">${rows.map(rowHtml).join('')}</div>
+    <span class="hint">Cheaper model for a heavy routine? Edit it and watch the per-run estimate in the drawer update as you switch.</span>`;
+  drawerFoot.innerHTML = '';
+  overlay.classList.add('is-open');
+}
 function paintStatus() {
   const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const next = routines.filter((r) => r.status === 'scheduled' && r.scheduledAt).sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt))[0];
@@ -504,13 +612,17 @@ function paintStatus() {
 
 function render() {
   if (!session) return;
-  paintCounts(); paintStatus();
+  paintCounts(); paintStatus(); paintBudgetChip();
   if (currentView === 'board') return renderBoard();
   if (currentView === 'calendar') return renderCalendar();
   if (currentView === 'history') return renderHistory();
+  if (currentView === 'log') return renderLog();
+  if (currentView === 'chat') return renderChat();
   const fired = firedRoutineIds();
   const items = routines.filter((r) => {
-    if (r.status !== currentView) return false;
+    // Library = every non-archived routine, scheduled ones included (they stay
+    // live in the Library; only archiving takes a routine off the air).
+    if (currentView === 'library' ? r.status === 'archived' : r.status !== currentView) return false;
     if (currentView === 'archived') return true;
     return !isPastOneOff(r, fired); // Library/Scheduled: past one-offs move to History
   }).sort((a, b) =>
@@ -523,11 +635,11 @@ function render() {
 function renderEmpty() {
   const copy = {
     scheduled: ['No routines queued', 'Create a routine and give it a time to line it up here.'],
-    library: ['Your library is empty', 'Reserved for reusable & recurring routines. Save prompts here to run or schedule anytime — finished one-offs move to History.'],
+    library: ['Your library is empty', 'Every routine you keep lives here — scheduled ones stay live on the calendar too. Only archiving takes one off the air.'],
     archived: ['Nothing archived', 'Archived routines rest here. Restore them to the library anytime.'],
   }[currentView];
   view.innerHTML = `<div class="grid"><div class="empty"><h3>${copy[0]}</h3><p>${copy[1]}</p>
-    <button class="btn btn--primary" data-act="new">＋ New routine</button></div></div>`;
+    <button class="btn btn--primary" data-act="new">New routine</button></div></div>`;
   $('[data-act="new"]', view)?.addEventListener('click', () => openDrawer());
 }
 
@@ -547,27 +659,29 @@ function card(r) {
     recur = `<span class="chip chip--recurring"${tip}>${esc(RECURRENCE[r.recurrence])}</span>`;
   }
   const when = r.status === 'scheduled'
-    ? `<span class="card__meta-item">⏰ <b>${fmt(r.scheduledAt)}</b> · ${relative(r.scheduledAt)}</span>`
+    ? `<span class="card__meta-item">fires <b>${fmt(r.scheduledAt)}</b> · ${relative(r.scheduledAt)}</span>`
     : (r.lastRun ? `<span class="card__meta-item">last run <b>${fmt(r.lastRun)}</b></span>` : '');
   const modelName = displayModel(r);
+  const est = estimateRunCost(r);
+  const cost = est ? `<span class="card__meta-item" title="Estimated cost per run (input + output, API rates)">est <b>${fmtUSD(est.usd)}</b>/run</span>` : '';
   const tLabel = triggerLabel(r.account, r.triggerKey);
   const acctText = accountLabel(r.account) + (tLabel ? ` · ${tLabel}` : '');
   return `<article class="card" data-id="${r.id}">
     <div class="card__head"><span class="card__title">${esc(r.title) || '<em>Untitled routine</em>'}</span>${statusChip(r)}</div>
     <div class="card__prompt">${esc(r.prompt) || '(no prompt)'}</div>
-    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${triggerColor(r.account, r.triggerKey).solid}"></span><b>${esc(acctText)}</b></span><span class="card__meta-item">⚡ <b>${esc(modelName)}</b></span><span class="card__meta-item">⏱ <b>${fmtDuration(r.durationMin || DEFAULT_DURATION_MIN)}</b></span>${when}</div>
+    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${triggerColor(r.account, r.triggerKey).solid}"></span><b>${esc(acctText)}</b></span><span class="card__meta-item"><b>${esc(modelName)}</b></span><span class="card__meta-item"><b>${fmtDuration(r.durationMin || DEFAULT_DURATION_MIN)}</b></span>${cost}${when}</div>
     <div class="card__foot">${cardActions(r)}</div>
   </article>`;
 }
 function cardActions(r) {
-  const run = `<button class="btn btn--accent btn--sm" data-act="run">▶ Run now</button>`;
+  const run = `<button class="btn btn--accent btn--sm" data-act="run">Run now</button>`;
   const edit = `<button class="btn btn--secondary btn--sm" data-act="edit">Edit</button>`;
   const del = `<button class="btn btn--danger-ghost btn--sm" data-act="delete">Delete</button>`;
-  if (r.status === 'archived') return `<button class="btn btn--secondary btn--sm" data-act="library">↩ Restore</button>${del}`;
-  const mid = r.status === 'library'
-    ? `<button class="btn btn--primary btn--sm" data-act="schedule">⏰ Schedule</button>`
-    : `<button class="btn btn--secondary btn--sm" data-act="library">▣ To library</button>`;
-  const dup = `<button class="btn btn--ghost btn--sm" data-act="duplicate">⧉ Copy</button>`;
+  if (r.status === 'archived') return `<button class="btn btn--secondary btn--sm" data-act="library">Restore</button>${del}`;
+  const mid = r.status === 'scheduled'
+    ? `<button class="btn btn--secondary btn--sm" data-act="library">Unschedule</button>`
+    : `<button class="btn btn--primary btn--sm" data-act="schedule">Schedule</button>`;
+  const dup = `<button class="btn btn--ghost btn--sm" data-act="duplicate">Copy</button>`;
   const arch = `<button class="btn btn--ghost btn--sm" data-act="archive">Archive</button>`;
   return `${run}${mid}${edit}${dup}${arch}${del}`;
 }
@@ -590,7 +704,7 @@ function bindCards() {
       }
       if (act === 'library' || act === 'archive') {
         await dbUpdate(r.id, Object.assign({}, r, { status: act === 'archive' ? 'archived' : 'library', scheduledAt: null }));
-        render(); toast(act === 'archive' ? 'Archived.' : 'Moved to Library.'); return;
+        render(); toast(act === 'archive' ? 'Archived — off the air.' : (r.status === 'archived' ? 'Restored to Library.' : 'Unscheduled — still in your Library.')); return;
       }
       if (act === 'delete') {
         if (!confirm('Delete this routine permanently?')) return;
@@ -603,10 +717,10 @@ function bindCards() {
 /* ---------- Board (comment board / intake) ---------- */
 function noteActions(n) {
   const del = `<button class="btn btn--danger-ghost btn--sm" data-nact="delete">Delete</button>`;
-  const sched = `<button class="btn btn--primary btn--sm" data-nact="schedule">⏰ Schedule</button>`;
-  if (n.status === 'brainstorm') return `<button class="btn btn--secondary btn--sm" data-nact="activate">▶ Activate</button>${sched}<button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>${del}`;
-  if (n.status === 'active') return `${sched}<button class="btn btn--secondary btn--sm" data-nact="brainstorm">⏸ Brainstorm</button><button class="btn btn--ghost btn--sm" data-nact="done">✓ Done</button>${del}`;
-  return `<button class="btn btn--ghost btn--sm" data-nact="activate">↩ Reactivate</button><button class="btn btn--ghost btn--sm" data-nact="brainstorm">To brainstorm</button>${del}`;
+  const sched = `<button class="btn btn--primary btn--sm" data-nact="schedule">Schedule</button>`;
+  if (n.status === 'brainstorm') return `<button class="btn btn--secondary btn--sm" data-nact="activate">Activate</button>${sched}<button class="btn btn--ghost btn--sm" data-nact="dismiss">Dismiss</button>${del}`;
+  if (n.status === 'active') return `${sched}<button class="btn btn--secondary btn--sm" data-nact="brainstorm">To brainstorm</button><button class="btn btn--ghost btn--sm" data-nact="done">Done</button>${del}`;
+  return `<button class="btn btn--ghost btn--sm" data-nact="activate">Reactivate</button><button class="btn btn--ghost btn--sm" data-nact="brainstorm">To brainstorm</button>${del}`;
 }
 function noteRow(n) {
   return `<div class="note note--${n.status}" data-id="${n.id}">
@@ -627,7 +741,7 @@ function renderBoard() {
         <span class="hint"><b>Active</b> = Claude works it · <b>Brainstorm</b> = parked, ignored until you activate it.</span>
         <span class="board__compose-btns">
           <button class="btn btn--secondary" id="note-draft">Save as brainstorm</button>
-          <button class="btn btn--primary" id="note-active">▶ Post as active</button>
+          <button class="btn btn--primary" id="note-active">Post as active</button>
         </span>
       </div>
     </div>
@@ -659,14 +773,126 @@ function renderBoard() {
   }));
 }
 
+/* ---------- History (friendly) & Log (technical) ----------
+   History is for reading: plain-English status + a cleaned-up summary of what
+   the model returned — no raw code, links, or markdown. The Log is the
+   technical record: every run with its raw output, failures called out with
+   the date and the reason. */
+const FRIENDLY_STATUS = {
+  success: 'Completed', ran: 'Ran', dryrun: 'Test run',
+  error: 'Had a problem', missed: 'Missed its time',
+};
+/* Strip an output down to readable prose: drop code blocks, URLs, markdown
+   syntax and JSON noise, keep the sentences. */
+function friendlyText(raw) {
+  let s = String(raw || '');
+  s = s.replace(/```[\s\S]*?```/g, ' ');                 // fenced code blocks
+  s = s.replace(/`[^`\n]*`/g, ' ');                      // inline code
+  s = s.replace(/https?:\/\/\S+/g, '');                  // links
+  s = s.replace(/^#{1,6}\s+/gm, '');                     // headings
+  s = s.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/[*_~#>|]/g, ' '); // md marks
+  s = s.replace(/^[\s]*[-•=]{3,}[\s]*$/gm, ' ');         // rules
+  s = s.replace(/[{}[\]\\]/g, ' ');                      // JSON-ish brackets
+  s = s.replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  if (s.length > 420) s = s.slice(0, 420).replace(/\s+\S*$/, '') + '…';
+  return s;
+}
 function renderHistory() {
   const items = historyItems();
   if (!items.length) {
-    view.innerHTML = `<div class="empty"><h3>No history yet</h3><p>Finished routines land here — every fired routine, live test, and elapsed one-off.</p></div>`;
+    view.innerHTML = `<div class="empty"><h3>No history yet</h3><p>Finished routines land here as a plain-English recap of what each run did.</p></div>`;
     return;
   }
-  view.innerHTML = `<div class="section-head"><h2>History</h2><span class="hint">Past &amp; completed routines</span></div>
-    <div class="history">${items.map(runRow).join('')}</div>`;
+  const row = (it) => {
+    const ok = !(it.status === 'error' || it.status === 'missed');
+    const text = friendlyText(it.output);
+    return `<div class="hist ${ok ? '' : 'hist--bad'}">
+      <div class="hist__head">
+        <span class="hist__title">${esc(it.title || 'Untitled')}</span>
+        <span class="hist__status ${ok ? 'is-ok' : 'is-bad'}">${esc(FRIENDLY_STATUS[it.status] || it.status)}</span>
+        <span class="hist__time">${it.time ? fmt(it.time) : ''}</span>
+      </div>
+      ${text ? `<p class="hist__text">${esc(text)}</p>` : `<p class="hist__text hist__text--none">No summary was returned for this run${ok ? '' : ' — the Log tab has the technical details'}.</p>`}
+    </div>`;
+  };
+  view.innerHTML = `<div class="section-head"><h2>History</h2><span class="hint">What each run did, in plain English — technical details live in the Log tab</span></div>
+    <div class="history">${items.map(row).join('')}</div>`;
+}
+
+let logFilter = 'all'; // 'all' | 'failures'
+function renderLog() {
+  const all = historyItems();
+  const failures = all.filter((it) => it.status === 'error' || it.status === 'missed');
+  const items = logFilter === 'failures' ? failures : all;
+  const filterBar = `<div class="log__filter">
+      <button class="btn btn--sm ${logFilter === 'all' ? 'btn--secondary' : 'btn--ghost'}" data-logf="all">All runs (${all.length})</button>
+      <button class="btn btn--sm ${logFilter === 'failures' ? 'btn--secondary' : 'btn--ghost'}" data-logf="failures">Failures (${failures.length})</button>
+    </div>`;
+  const body = items.length
+    ? `<div class="history">${items.map(runRow).join('')}</div>`
+    : `<div class="empty"><h3>${logFilter === 'failures' ? 'No failures logged' : 'Nothing logged yet'}</h3><p>${logFilter === 'failures' ? 'When a routine fails or misses its slot, it lands here with the date and the reason.' : 'Every run — successes and failures — is recorded here with its raw output.'}</p></div>`;
+  view.innerHTML = `<div class="section-head"><h2>Log</h2><span class="hint">The technical record — every run, raw output, failures with the reason</span></div>
+    ${filterBar}${body}`;
+  view.querySelectorAll('[data-logf]').forEach((b) => b.addEventListener('click', () => { logFilter = b.dataset.logf; renderLog(); }));
+}
+
+/* ---------- Chat (test a model directly) ----------
+   A plain chatbot for trying prompts on any model in the picker, using the API
+   keys from Settings → Advanced. Kept in memory for the session — copy out
+   anything you want to keep. */
+const CHAT_MODELS = MODELS.filter((m) => m.id !== 'auto');
+let chatModel = null;      // sticky for the session
+let chatMsgs = [];         // [{ role: 'user'|'assistant', content }]
+let chatBusy = false;
+function renderChat() {
+  if (!chatModel) chatModel = (settings.model && settings.model !== 'auto') ? settings.model : 'claude-sonnet-5';
+  if (!CHAT_MODELS.some((m) => m.id === chatModel)) chatModel = 'claude-sonnet-5';
+  const bubble = (m) => `<div class="chatmsg chatmsg--${m.role === 'user' ? 'user' : 'bot'}${m.error ? ' chatmsg--error' : ''}">${esc(m.content)}</div>`;
+  view.innerHTML = `<div class="chat">
+    <div class="chat__bar">
+      <label class="label" for="chat-model">Model</label>
+      <select class="select chat__model" id="chat-model">${CHAT_MODELS.map((m) => `<option value="${m.id}" ${chatModel === m.id ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select>
+      <button class="btn btn--ghost btn--sm" id="chat-clear" ${chatMsgs.length ? '' : 'disabled'}>Clear</button>
+    </div>
+    <div class="chat__thread" id="chat-thread">
+      ${chatMsgs.length ? chatMsgs.map(bubble).join('') : `<div class="empty"><h3>Test a model</h3><p>Pick a model above and chat with it directly. Claude models use your Anthropic key, the rest use your OpenRouter key (both in Settings → Advanced). The conversation isn't saved yet — copy out what you want to keep.</p></div>`}
+      ${chatBusy ? '<div class="chatmsg chatmsg--bot chatmsg--busy">Thinking…</div>' : ''}
+    </div>
+    <div class="chat__compose">
+      <textarea class="textarea chat__input" id="chat-input" placeholder="Message the model… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button class="btn btn--primary" id="chat-send" ${chatBusy ? 'disabled' : ''}>Send</button>
+    </div>
+  </div>`;
+  const thread = $('#chat-thread', view);
+  thread.scrollTop = thread.scrollHeight;
+  $('#chat-model', view).addEventListener('change', (e) => { chatModel = e.target.value; });
+  $('#chat-clear', view).addEventListener('click', () => { chatMsgs = []; renderChat(); });
+  const input = $('#chat-input', view);
+  const send = async () => {
+    const text = input.value.trim();
+    if (!text || chatBusy) return;
+    chatMsgs.push({ role: 'user', content: text });
+    chatBusy = true;
+    renderChat();
+    // Error bubbles stay visible in the thread but are excluded from what we
+    // send; consecutive same-role turns (left behind by an excluded error) are
+    // merged so providers that require strict alternation accept the history.
+    const messages = [];
+    for (const m of chatMsgs) {
+      if (m.error) continue;
+      const last = messages[messages.length - 1];
+      if (last && last.role === m.role) last.content += '\n\n' + m.content;
+      else messages.push({ role: m.role, content: m.content });
+    }
+    const res = await runChat(messages, chatModel, { anthropic: settings.anthropicKey, openrouter: settings.openrouterKey }, { referer: location.origin, title: 'Routiner' });
+    chatBusy = false;
+    chatMsgs.push({ role: 'assistant', content: res.text, ...(res.status === 'success' ? {} : { error: true }) });
+    if (currentView === 'chat') renderChat();
+  };
+  $('#chat-send', view).addEventListener('click', send);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+  if (!chatBusy) setTimeout(() => input.focus(), 30);
 }
 /* Render a run summary as light, safe Markdown: escape everything first, then
    linkify http(s) URLs and bold **text**. The .run__body container uses
@@ -1035,7 +1261,7 @@ function openDrawer(routine = null, opts = {}) {
         <select class="select" id="f-account">${listAccounts().map((a) => `<option value="${a.id}" ${curAccount === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
       <div class="field"><label class="label" for="f-trigger">Trigger</label>
         <select class="select" id="f-trigger">${triggerOptions(curAccount, r.triggerKey)}</select>
-        <span class="hint">Which instance fires it. Manage these in ⚙ Settings.</span></div>
+        <span class="hint">Which instance fires it. Manage these in Settings.</span></div>
     </div>
     <div class="field"><label class="label" for="f-model">Model</label>
       <select class="select" id="f-model">${MODELS.map((m) => `<option value="${m.id}" ${(r.model || settings.model) === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
@@ -1054,16 +1280,17 @@ function openDrawer(routine = null, opts = {}) {
       <div class="field"><label class="label" for="f-recur">Repeat</label>
         <select class="select" id="f-recur">${Object.entries(RECURRENCE).map(([k, v]) => `<option value="${k}" ${r.recurrence === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
     </div>
-    <div class="field"><button class="btn btn--ghost btn--sm" id="f-test" type="button">⚡ Test live (optional, uses API)</button>
+    <div class="field"><button class="btn btn--ghost btn--sm" id="f-test" type="button">Test live (optional, uses API)</button>
       <div class="run__body" id="f-test-out" style="display:none"></div></div>
     <div class="notice"><b>Run now</b> fires your routine immediately with this prompt. <b>Schedule</b> queues it for the time above (repeating if set). <b>Save to library</b> parks it.</div>`;
   drawerFoot.innerHTML = `
-    <button class="btn btn--accent" data-do="now">▶ Run now</button>
-    <button class="btn btn--brand" data-do="schedule">⏰ Schedule</button>
-    <button class="btn btn--secondary" data-do="library">▣ Save to library</button>`;
+    <button class="btn btn--accent" data-do="now">Run now</button>
+    <button class="btn btn--brand" data-do="schedule">Schedule</button>
+    <button class="btn btn--secondary" data-do="library">Save to library</button>`;
   $('#f-test', drawerBody).addEventListener('click', testLive);
   $('#f-account', drawerBody).addEventListener('change', (e) => { $('#f-trigger', drawerBody).innerHTML = triggerOptions(e.target.value, null); });
   ['#f-model', '#f-tasktype', '#f-complexity'].forEach((s) => $(s, drawerBody).addEventListener('change', refreshModelHint));
+  $('#f-prompt', drawerBody).addEventListener('input', refreshModelHint); // live cost estimate tracks the prompt
   refreshModelHint();
   drawerFoot.querySelectorAll('[data-do]').forEach((b) => b.addEventListener('click', () => submitDrawer(b.dataset.do)));
   setTimeout(() => $(opts.forceSchedule ? '#f-when' : '#f-title', drawerBody)?.focus(), 50);
@@ -1078,12 +1305,16 @@ function refreshModelHint() {
   const hint = $('#f-model-hint', drawerBody);
   if (row) row.style.display = isAuto ? '' : 'none';
   if (!hint) return;
-  if (isAuto) {
-    const resolved = getModelForTask($('#f-tasktype', drawerBody).value, $('#f-complexity', drawerBody).value);
-    hint.innerHTML = `✨ Routiner will use <b>${esc(modelLabel(resolved))}</b> <code>${esc(resolved)}</code> for this task.`;
-  } else {
-    hint.innerHTML = `Pinned to <b>${esc(modelLabel(model))}</b> <code>${esc(model)}</code>.`;
-  }
+  const resolved = isAuto
+    ? getModelForTask($('#f-tasktype', drawerBody).value, $('#f-complexity', drawerBody).value)
+    : model;
+  const est = estimateRunCost({ prompt: $('#f-prompt', drawerBody)?.value || '', model: resolved });
+  const costLine = est
+    ? ` Estimated <b>${fmtUSD(est.usd)}</b> per run (~${est.inTok.toLocaleString()} tokens in, ~${est.outTok.toLocaleString()} out${est.approx ? ', rates approximate' : ''}).`
+    : '';
+  hint.innerHTML = (isAuto
+    ? `Routiner will use <b>${esc(modelLabel(resolved))}</b> <code>${esc(resolved)}</code> for this task.`
+    : `Pinned to <b>${esc(modelLabel(model))}</b> <code>${esc(model)}</code>.`) + costLine;
 }
 
 async function testLive() {
@@ -1093,9 +1324,9 @@ async function testLive() {
   const model = effectiveModel(d);
   const out = $('#f-test-out'), btn = $('#f-test');
   const via = isClaudeModel(model) ? 'Anthropic' : 'OpenRouter';
-  btn.disabled = true; btn.textContent = '⚡ Testing…'; out.style.display = 'block'; out.textContent = `Running on ${modelLabel(model)} via ${via}…`;
+  btn.disabled = true; btn.textContent = 'Testing…'; out.style.display = 'block'; out.textContent = `Running on ${modelLabel(model)} via ${via}…`;
   const res = await callClaude(prompt, model);
-  out.textContent = res.text; btn.disabled = false; btn.textContent = '⚡ Test live (optional, uses API)';
+  out.textContent = res.text; btn.disabled = false; btn.textContent = 'Test live (optional, uses API)';
   await dbInsertRun({ id: editingId, title: $('#f-title').value || 'Live test' }, res);
 }
 function readDrawer() {
@@ -1110,9 +1341,14 @@ async function submitDrawer(action) {
   const fromNote = schedulingNoteId; // if opened from a Board note, mark it planned once handled
 
   if (action === 'library') {
-    await persist(Object.assign(base, { status: 'library', scheduledAt: null }));
+    // Editing an already-scheduled routine? Saving to the library keeps it
+    // scheduled — library membership never takes a routine off the air.
+    const existing = editingId ? getRoutine(editingId) : null;
+    const keepSched = !!(existing && existing.status === 'scheduled' && existing.scheduledAt);
+    await persist(Object.assign(base, keepSched ? { status: 'scheduled' } : { status: 'library', scheduledAt: null }));
     if (fromNote) await dbUpdateNote(fromNote, { status: 'planned' });
-    closeDrawer(); currentView = 'library'; syncTabs(); render(); toast('Saved to Library.'); return;
+    closeDrawer(); currentView = 'library'; syncTabs(); render();
+    toast(keepSched ? 'Saved — still scheduled. Use Unschedule on the card to take it off the calendar.' : 'Saved to Library.'); return;
   }
   if (action === 'schedule') {
     if (!d.whenRaw) return toast('Pick a date & time to schedule.', 'error');
@@ -1156,7 +1392,7 @@ function renderCfgAccounts() {
       <div class="acct-cfg__head">
         <span class="acct-dot" style="background:${cfgColor(ai, -1)}"></span>
         <input class="input cfg-aname" data-ai="${ai}" value="${esc(a.label)}" placeholder="Account name" />
-        <button class="iconbtn" title="Remove account" data-act="del-acct" data-ai="${ai}">🗑</button>
+        <button class="iconbtn" title="Remove account" data-act="del-acct" data-ai="${ai}">✕</button>
       </div>
       <div class="trig-list">${a.triggers.map((t, ti) => `
         <div class="trig-cfg">
@@ -1167,10 +1403,10 @@ function renderCfgAccounts() {
           </div>
           <input class="input cfg-turl" data-ai="${ai}" data-ti="${ti}" value="${esc(t.trigger)}" placeholder="Fire URL or trig_…" />
           <input class="input cfg-ttoken" data-ai="${ai}" data-ti="${ti}" type="password" autocomplete="off" placeholder="${t.token ? '•••• saved — blank to keep' : 'Token (sk-ant-…)'}" />
-          <div class="trig-test"><button class="btn btn--ghost btn--sm" data-act="test-trig" data-ai="${ai}" data-ti="${ti}">▶ Save &amp; test fire</button><span class="trig-status" data-ai="${ai}" data-ti="${ti}"></span></div>
+          <div class="trig-test"><button class="btn btn--ghost btn--sm" data-act="test-trig" data-ai="${ai}" data-ti="${ti}">Save &amp; test fire</button><span class="trig-status" data-ai="${ai}" data-ti="${ti}"></span></div>
         </div>`).join('')}</div>
-      <button class="btn btn--ghost btn--sm" data-act="add-trig" data-ai="${ai}">＋ Add trigger</button>
-    </div>`).join('') + `<button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct">＋ Add account</button>`;
+      <button class="btn btn--ghost btn--sm" data-act="add-trig" data-ai="${ai}">Add trigger</button>
+    </div>`).join('') + `<button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct">Add account</button>`;
 
   host.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
     syncCfgFromDom();
@@ -1351,7 +1587,7 @@ function showApp() {
 
   paintFireSwitch();
   const chip = $('#userChip');
-  if (chip) { chip.innerHTML = `☁ <b>${esc(session.user.email)}</b>`; }
+  if (chip) { chip.innerHTML = `<b>${esc(session.user.email)}</b>`; }
   syncTabs();
   loadAll();
 }
@@ -1359,6 +1595,7 @@ function showApp() {
 /* ---------- Init ---------- */
 function wireOnce() {
   $('#newBtn').addEventListener('click', () => openDrawer());
+  $('#budgetChip').addEventListener('click', openForecast);
   $('#fireSwitch').addEventListener('click', toggleFireSwitch);
   $('#settingsBtn').addEventListener('click', openSettings);
   $('#signOutBtn').addEventListener('click', async () => { await sb.auth.signOut(); });
