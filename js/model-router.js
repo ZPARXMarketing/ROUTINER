@@ -24,6 +24,7 @@ export const ANTHROPIC_BASE = 'https://api.anthropic.com/v1';
 export const MODELS = [
   { id: 'auto', label: 'Auto — let Routiner choose', auto: true },
   // Claude — these actually fire your scheduled routines.
+  { id: 'claude-fable-5', label: 'Claude Fable 5 — newest flagship (Claude 5)' },
   { id: 'claude-opus-4-8', label: 'Claude Opus 4.8 — most capable' },
   { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 — balanced' },
   { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 — fast & cheap' },
@@ -49,6 +50,7 @@ export const MODELS = [
    fire as Claude Code sessions on your subscription, so their rows are the
    API-equivalent rates (useful for comparing, not billed per-token). */
 export const MODEL_PRICING = {
+  'claude-fable-5': { in: 5, out: 25, approx: true },
   'claude-opus-4-8': { in: 5, out: 25, approx: true },
   'claude-sonnet-5': { in: 3, out: 15, approx: true },
   'claude-haiku-4-5-20251001': { in: 1, out: 5, approx: true },
