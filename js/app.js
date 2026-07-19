@@ -1286,7 +1286,8 @@ function openDrawer(routine = null, opts = {}) {
   drawerFoot.innerHTML = `
     <button class="btn btn--accent" data-do="now">Run now</button>
     <button class="btn btn--brand" data-do="schedule">Schedule</button>
-    <button class="btn btn--secondary" data-do="library">Save to library</button>`;
+    <button class="btn btn--secondary" data-do="library">Save to library</button>
+    ${editingId ? '<button class="btn btn--danger-ghost drawer__del" data-do="delete" type="button">Delete routine</button>' : ''}`;
   $('#f-test', drawerBody).addEventListener('click', testLive);
   $('#f-account', drawerBody).addEventListener('change', (e) => { $('#f-trigger', drawerBody).innerHTML = triggerOptions(e.target.value, null); });
   ['#f-model', '#f-tasktype', '#f-complexity'].forEach((s) => $(s, drawerBody).addEventListener('change', refreshModelHint));
@@ -1335,6 +1336,14 @@ function readDrawer() {
 async function persist(base) { return editingId ? dbUpdate(editingId, Object.assign(getRoutine(editingId) || {}, base)) : dbCreate(base); }
 
 async function submitDrawer(action) {
+  // Delete works on the existing routine regardless of the form contents, so it
+  // runs before the read/validate below (no prompt required to remove a block).
+  if (action === 'delete') {
+    if (!editingId) return;
+    if (!confirm('Delete this routine permanently?')) return;
+    if (await dbDelete(editingId)) { closeDrawer(); render(); toast('Deleted.'); }
+    return;
+  }
   const d = readDrawer();
   if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
   const base = { title: d.title, prompt: d.prompt, model: d.model, taskType: d.taskType, complexity: d.complexity, account: d.account, triggerKey: d.triggerKey, durationMin: d.durationMin, recurrence: d.recurrence };
