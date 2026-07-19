@@ -220,7 +220,7 @@ Per-block fields:
 | `prompt` | self-contained task for the future session — required |
 | `scheduled_at` | ISO-8601 UTC, in the future |
 | `recurrence` | `none` / `daily` / `weekdays` / `weekly` |
-| `model` | `claude-opus-4-8` / `claude-sonnet-5` / `claude-haiku-4-5-20251001` / `auto` |
+| `model` | `claude-fable-5` / `claude-opus-4-8` / `claude-sonnet-5` / `claude-haiku-4-5-20251001` / `auto` |
 | `duration_min` | block length in minutes (drives the calendar block height) |
 
 Then mark each note you turned into blocks so it isn't re-planned:
