@@ -49,9 +49,16 @@ populating one surface informs the others even across the two Supabase projects.
    ```
    supabase functions deploy lead-enrichment --no-verify-jwt
    ```
-   Deploy with **verify_jwt = false** (same posture as `dynamic-responder` /
-   `routiner-admin`) so the scheduler/cron can call it. If you set
-   `RESPONDER_SECRET`, callers must send `x-responder-secret`.
+   The live deploy currently has **verify_jwt = true** (the MCP deploy default),
+   so callers must send the project's anon key (`apikey` + `Authorization:
+   Bearer`). To match `dynamic-responder`/`routiner-admin` and drop that header,
+   redeploy with `--no-verify-jwt`. If you set `RESPONDER_SECRET`, callers must
+   also send `x-responder-secret`.
+
+   > **Deployed status:** as of this writing the migration is applied, the
+   > function is live (v1), the four Huntsville ICP targets are seeded + enabled,
+   > and one live run has already placed 17 leads in the Review tab. What remains
+   > is turning on a recurring schedule (below) and, optionally, Abstrax sync.
 3. **Define your ICP.** Edit `lead_enrichment_targets` — set real `niche`,
    `location`, `dm_titles`, `count`, and flip `enabled = true`:
    ```sql
@@ -87,13 +94,20 @@ create extension if not exists pg_cron;
 create extension if not exists pg_net;
 
 -- Weekly, Mondays 13:00 UTC: process every ENABLED target.
+-- The function is deployed with verify_jwt=true, so pass the project's anon key
+-- (a public publishable key — safe to inline). Alternatively redeploy with
+-- --no-verify-jwt and drop the apikey/authorization headers.
 select cron.schedule(
   'lead-enrichment-weekly',
   '0 13 * * 1',
   $$
   select net.http_post(
     url     := 'https://vonfdzttupyemtomsojy.supabase.co/functions/v1/lead-enrichment',
-    headers := '{"content-type":"application/json"}'::jsonb,
+    headers := jsonb_build_object(
+                 'content-type', 'application/json',
+                 'apikey', '<ANON_KEY>',
+                 'authorization', 'Bearer <ANON_KEY>'
+               ),
     body    := '{}'::jsonb
   );
   $$
