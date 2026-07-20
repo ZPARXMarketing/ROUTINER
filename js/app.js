@@ -71,6 +71,32 @@ const PERPLEXITY_MODELS = [
   { id: 'perplexity/sonar-deep-research', label: 'Sonar Deep Research — deepest' },
 ];
 const DEFAULT_PERPLEXITY_MODEL = 'perplexity/sonar-pro';
+
+/* OpenRouter "agent" accounts (kind 'openrouter-agent') — user-addable and
+   non-Claude. Each instance (trigger) runs a bounded tool-use loop on a chosen
+   OpenRouter model (default Kimi) via the `openrouter-agent` edge function, and
+   its full result lands in the Log. This is DISTINCT from the built-in
+   `openrouter` (Perplexity enrichment) account above, which is left untouched. */
+const DEFAULT_AGENT_MODEL = 'moonshotai/kimi-k2.7-code';
+const AGENT_TOOLS = [
+  { id: 'read', label: 'Read your data' },
+  { id: 'research', label: 'Web research' },
+  { id: 'write', label: 'Write to apps' },
+];
+const AGENT_TOOL_IDS = AGENT_TOOLS.map((t) => t.id);
+/* Coerce whatever's stored (array of ids, or a {read:true,…} object) into the
+   canonical ordered array of enabled tool ids. */
+const normalizeTools = (t) => {
+  const arr = Array.isArray(t) ? t : (t && typeof t === 'object' ? Object.keys(t).filter((k) => t[k]) : null);
+  return AGENT_TOOL_IDS.filter((id) => (arr || AGENT_TOOL_IDS).includes(id));
+};
+/* OpenRouter chat models an agent instance can run — every non-Claude,
+   non-perplexity, non-auto id in the shared catalog. */
+const AGENT_MODELS = () => MODELS.filter((m) => !m.auto && !isClaudeModel(m.id) && !/^perplexity\//.test(m.id));
+/* A fresh OpenRouter agent account for the "Add OpenRouter account" button. */
+const NEW_AGENT_ACCOUNT = () => ({ id: genId('acc'), label: 'Kimi', kind: 'openrouter-agent', key: '',
+  triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '', model: DEFAULT_AGENT_MODEL, tools: [...AGENT_TOOL_IDS] }] });
+
 let accountsCfg = DEFAULT_ACCOUNTS();
 let settingsPolicy = null; // the user's saved auto-routing policy (null = built-in default)
 
@@ -88,16 +114,21 @@ function ensureBuiltins(list) {
   return list;
 }
 function normalizeAccounts(raw, keepSecrets) {
+  // `model` + `tools` are not secrets (they drive rendering), so keep them
+  // always; only trigger/token (Claude) and the account `key` (OpenRouter) are
+  // stripped from the broadly-held copy.
   const trig = (t, i) => ({ id: t.id || genId('t'), label: t.label || String.fromCharCode(65 + i),
-    trigger: keepSecrets ? (t.trigger || '') : '', token: keepSecrets ? (t.token || '') : '' });
+    trigger: keepSecrets ? (t.trigger || '') : '', token: keepSecrets ? (t.token || '') : '',
+    model: t.model || '', tools: normalizeTools(t.tools) });
   if (Array.isArray(raw) && raw.length) {
     return ensureBuiltins(raw.map((a) => ({ id: a.id || genId('acc'), label: a.label || KNOWN_LABELS[a.id] || a.id,
       kind: a.kind || (a.id === 'openrouter' ? 'openrouter' : 'claude'),
+      key: keepSecrets ? (a.key || '') : '',
       triggers: (a.triggers || []).map(trig) })));
   }
   if (raw && typeof raw === 'object' && Object.keys(raw).length) { // old map shape
     return ensureBuiltins(Object.entries(raw).map(([id, v]) => ({ id, label: KNOWN_LABELS[id] || id,
-      kind: id === 'openrouter' ? 'openrouter' : 'claude',
+      kind: id === 'openrouter' ? 'openrouter' : 'claude', key: '',
       triggers: (v && (v.trigger || v.token)) ? [trig({ id: 't1', label: 'A', trigger: v.trigger, token: v.token }, 0)] : [] })));
   }
   return DEFAULT_ACCOUNTS();
@@ -111,6 +142,17 @@ const accountKind = (id) => (getAccountCfg(id) || {}).kind || (id === 'openroute
 const accountTriggers = (id) => (getAccountCfg(id) || {}).triggers || [];
 const triggerCfg = (accId, tId) => accountTriggers(accId).find((t) => t.id === tId);
 const triggerLabel = (accId, tId) => { const t = triggerCfg(accId, tId); return t ? t.label : ''; };
+const isAgentKind = (id) => accountKind(id) === 'openrouter-agent';
+/* The OpenRouter model an agent instance runs (falls back to the first
+   trigger's model, then the default) and its enabled tools. */
+const triggerModel = (accId, tId) => {
+  const t = triggerCfg(accId, tId) || accountTriggers(accId)[0];
+  return (t && t.model) || DEFAULT_AGENT_MODEL;
+};
+const triggerTools = (accId, tId) => {
+  const t = triggerCfg(accId, tId) || accountTriggers(accId)[0];
+  return normalizeTools(t && t.tools);
+};
 
 /* Color engine: each account gets a themed set of DISTINCT hues (not just
    shades), so its triggers A/B/C are easy to tell apart at a glance while the
@@ -417,6 +459,8 @@ async function fireTrigger(routine) {
   if (!settings.firing) { toast('Firing is paused on this site (top-right switch). Toggle it live to fire.', 'error'); return; }
   // OpenRouter account → run the Perplexity enrichment engine directly (no Claude).
   if (accountKind(routine?.account) === 'openrouter') return fireEnrichment(routine);
+  // OpenRouter agent account → run the model + tool loop (no Claude).
+  if (accountKind(routine?.account) === 'openrouter-agent') return fireAgent(routine);
   const direct = settings.triggerUrl.trim();
   const url = direct || TRIGGER_FN;
   const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, triggerKey: routine?.triggerKey || null, model: routine ? effectiveModel(routine) : undefined, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
@@ -501,6 +545,40 @@ async function fireEnrichment(routine) {
     toast(`Done — ${bits.join(', ')} (~$${Number(t.cost || 0).toFixed(4)}). Check Command's Review tab.`);
   } catch (e) {
     toast(`Enrichment request failed: ${e.message}`, 'error');
+  }
+}
+
+/* Fire an OpenRouter agent routine: POST the task to the openrouter-agent edge
+   function, which runs the chosen model in a bounded tool-use loop (read data /
+   web research / write to apps) using the resolved OpenRouter key (per-account
+   override or the server key), then writes the full result to routiner_runs. We
+   just kick it off, authenticate with the user's Supabase token, and surface the
+   recap; the function persists the output so both Run-now and the scheduler
+   store it the same way. */
+async function fireAgent(routine) {
+  const account = routine?.account;
+  const triggerKey = routine?.triggerKey || null;
+  const model = triggerModel(account, triggerKey);
+  const tools = triggerTools(account, triggerKey);
+  if (!routine?.prompt || !routine.prompt.trim()) { toast('This routine has no directions.', 'error'); return; }
+  const { session, error } = await sessionForFire();
+  if (error) { toast(error, 'error'); return; }
+  const who = `${accountLabel(account)}/${triggerLabel(account, triggerKey) || 'instance'}`;
+  toast(`Running ${modelLabel(model)} — ${who}… this can take a minute.`);
+  try {
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/openrouter-agent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}` },
+      body: JSON.stringify({ account, triggerKey, model, tools, prompt: routine.prompt,
+        routineId: routine?.id, title: routine?.title, report: true, source: 'planner' }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) { toast(`Agent run failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); return; }
+    const cost = Number(data.cost || 0);
+    toast(`Done — ${modelLabel(model)} finished${data.steps ? ` in ${data.steps} step(s)` : ''}${cost ? ` (~$${cost.toFixed(4)})` : ''}. See the Log.`);
+    try { await loadAll(); render(); } catch { /* non-fatal: the row is saved regardless */ }
+  } catch (e) {
+    toast(`Agent request failed: ${e.message}`, 'error');
   }
 }
 
@@ -1335,11 +1413,12 @@ function openDrawer(routine = null, opts = {}) {
       <span class="hint">Sent to your routine as a session turn. Use {{date}} / {{datetime}} for the run time.</span></div>
     <div class="field__row">
       <div class="field"><label class="label" for="f-account">Account</label>
-        <select class="select" id="f-account">${listAccounts().map((a) => `<option value="${a.id}" ${curAccount === a.id ? 'selected' : ''}>${esc(a.label)}${a.kind === 'openrouter' ? ' ⚡' : ''}</option>`).join('')}</select></div>
+        <select class="select" id="f-account">${listAccounts().map((a) => `<option value="${a.id}" ${curAccount === a.id ? 'selected' : ''}>${esc(a.label)}${(a.kind === 'openrouter' || a.kind === 'openrouter-agent') ? ' ⚡' : ''}</option>`).join('')}</select></div>
       <div class="field"><label class="label" for="f-trigger">Trigger</label>
         <select class="select" id="f-trigger">${triggerOptions(curAccount, r.triggerKey)}</select>
         <span class="hint">Which instance fires it. Manage these in Settings.</span></div>
     </div>
+    <div class="notice" id="f-agent-hint" style="display:none"></div>
     <div id="f-enrich" style="display:none">
       <div class="field__row">
         <div class="field"><label class="label" for="f-e-niche">Niche</label>
@@ -1391,6 +1470,7 @@ function openDrawer(routine = null, opts = {}) {
     ${editingId ? '<button class="btn btn--danger-ghost drawer__del" data-do="delete" type="button">Delete routine</button>' : ''}`;
   $('#f-test', drawerBody).addEventListener('click', testLive);
   $('#f-account', drawerBody).addEventListener('change', (e) => { $('#f-trigger', drawerBody).innerHTML = triggerOptions(e.target.value, null); refreshDrawerKind(); });
+  $('#f-trigger', drawerBody).addEventListener('change', refreshDrawerKind); // agent hint tracks the chosen instance
   ['#f-model', '#f-tasktype', '#f-complexity'].forEach((s) => $(s, drawerBody).addEventListener('change', refreshModelHint));
   $('#f-prompt', drawerBody).addEventListener('input', refreshModelHint); // live cost estimate tracks the prompt
   refreshDrawerKind();
@@ -1398,22 +1478,40 @@ function openDrawer(routine = null, opts = {}) {
   setTimeout(() => $(opts.forceSchedule ? '#f-when' : '#f-title', drawerBody)?.focus(), 50);
   overlay.classList.add('is-open');
 }
-/* Swap the drawer between a Claude routine (directions + model) and an
-   OpenRouter routine (the Perplexity enrichment panel). Called on open and
-   whenever the account changes. */
+/* Swap the drawer between a Claude routine (directions + model), a Perplexity
+   enrichment routine (the niche panel), and an OpenRouter agent routine
+   (directions + a per-instance model/tool hint). Called on open and whenever the
+   account or trigger changes. */
 function refreshDrawerKind() {
   const acc = $('#f-account', drawerBody)?.value;
-  const isOR = accountKind(acc) === 'openrouter';
+  const kind = accountKind(acc);
+  const isEnrich = kind === 'openrouter';      // Perplexity enrichment panel
+  const isAgent = kind === 'openrouter-agent'; // OpenRouter model + tools
+  const nonClaude = isEnrich || isAgent;
   const enrich = $('#f-enrich', drawerBody);
-  if (enrich) enrich.style.display = isOR ? '' : 'none';
-  // Claude-only fields: hide for an OpenRouter routine.
-  const hide = (sel) => { const el = $(sel, drawerBody)?.closest('.field'); if (el) el.style.display = isOR ? 'none' : ''; };
-  hide('#f-prompt'); hide('#f-model'); hide('#f-test');
-  const autoRow = $('#f-auto-row', drawerBody); if (autoRow && isOR) autoRow.style.display = 'none';
-  const hint = $('#f-model-hint', drawerBody); if (hint) hint.style.display = isOR ? 'none' : '';
-  const promptLabel = $('label[for="f-prompt"]', drawerBody); // (kept for a11y; field hidden anyway)
-  if (promptLabel) promptLabel.textContent = 'Directions for Claude';
-  if (!isOR) refreshModelHint();
+  if (enrich) enrich.style.display = isEnrich ? '' : 'none';
+  // Toggle fields by kind. Prompt is hidden only for enrichment (agent uses it).
+  const hide = (sel, cond) => { const el = $(sel, drawerBody)?.closest('.field'); if (el) el.style.display = cond ? 'none' : ''; };
+  hide('#f-prompt', isEnrich);
+  hide('#f-model', nonClaude);
+  hide('#f-test', nonClaude);
+  const autoRow = $('#f-auto-row', drawerBody); if (autoRow && nonClaude) autoRow.style.display = 'none';
+  const hint = $('#f-model-hint', drawerBody); if (hint) hint.style.display = nonClaude ? 'none' : '';
+  // Agent instance hint: which model + tools this instance runs.
+  const ah = $('#f-agent-hint', drawerBody);
+  if (ah) {
+    ah.style.display = isAgent ? '' : 'none';
+    if (isAgent) {
+      const tId = $('#f-trigger', drawerBody)?.value || null;
+      const m = triggerModel(acc, tId);
+      const tools = triggerTools(acc, tId);
+      const toolNames = tools.length ? tools.map((id) => (AGENT_TOOLS.find((x) => x.id === id) || {}).label || id).join(', ') : 'no tools';
+      ah.innerHTML = `Runs <b>${esc(modelLabel(m))}</b> <code>${esc(m)}</code> with ${esc(toolNames)}. Its output lands in the Log. Change the model &amp; tools in Settings.`;
+    }
+  }
+  const promptLabel = $('label[for="f-prompt"]', drawerBody);
+  if (promptLabel) promptLabel.textContent = isAgent ? 'Directions for the agent' : 'Directions for Claude';
+  if (!nonClaude) refreshModelHint();
 }
 
 /* Reflect the model choice: when Auto, show the task-type/complexity inputs and
@@ -1465,6 +1563,12 @@ function readDrawer() {
     // Store the config as the prompt (the scheduler/edge read it); model column
     // carries the Perplexity id so the card/forecast show what will run.
     return Object.assign(common, { title, prompt: JSON.stringify(cfg), model, taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY, openrouter: true });
+  }
+  if (isAgentKind(account)) {
+    // Agent routine: plain-text task. The model comes from the chosen instance
+    // (stored on the routine's `model` column so cards/forecasts show it).
+    return Object.assign(common, { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value,
+      model: triggerModel(account, common.triggerKey), taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY });
   }
   return Object.assign(common, { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, taskType: $('#f-tasktype').value, complexity: $('#f-complexity').value });
 }
@@ -1529,15 +1633,29 @@ function nextTrigLabel(a) {
 }
 function syncCfgFromDom() {
   $$('.cfg-aname').forEach((el) => { const a = cfgModel[+el.dataset.ai]; if (a) a.label = el.value.trim() || a.label; });
+  // Account-level OpenRouter key override (agent accounts). Blank keeps the saved one.
+  $$('.cfg-akey').forEach((el) => { const a = cfgModel[+el.dataset.ai]; if (a) { const v = el.value.trim(); if (v) a.key = v; } });
   $$('.cfg-tlabel').forEach((el) => { const t = (cfgModel[+el.dataset.ai] || {}).triggers?.[+el.dataset.ti]; if (t) t.label = el.value.trim(); });
   $$('.cfg-turl').forEach((el) => { const t = (cfgModel[+el.dataset.ai] || {}).triggers?.[+el.dataset.ti]; if (t) t.trigger = el.value.trim(); });
   $$('.cfg-ttoken').forEach((el) => { const t = (cfgModel[+el.dataset.ai] || {}).triggers?.[+el.dataset.ti]; if (t) { const v = el.value.trim(); if (v) t.token = v; } });
+  // Agent instance model select.
+  $$('.cfg-tmodel').forEach((el) => { const t = (cfgModel[+el.dataset.ai] || {}).triggers?.[+el.dataset.ti]; if (t) t.model = el.value; });
+  // Agent instance tool checkboxes — reset each instance's list on first box seen, then collect the checked ones.
+  const toolSeen = new Set();
+  $$('.cfg-ttool').forEach((el) => {
+    const ai = +el.dataset.ai, ti = +el.dataset.ti;
+    const t = (cfgModel[ai] || {}).triggers?.[ti]; if (!t) return;
+    const k = `${ai}:${ti}`; if (!toolSeen.has(k)) { t.tools = []; toolSeen.add(k); }
+    if (el.checked) t.tools.push(el.dataset.tool);
+  });
 }
 function renderCfgAccounts() {
   const host = $('#cfg-accounts'); if (!host) return;
+  const kindOf = (a) => a.kind || (a.id === 'openrouter' ? 'openrouter' : 'claude');
   host.innerHTML = cfgModel.map((a, ai) => {
-    const isOR = (a.kind || (a.id === 'openrouter' ? 'openrouter' : 'claude')) === 'openrouter';
-    if (isOR) return `
+    const kind = kindOf(a);
+    // Built-in Perplexity enrichment account — left exactly as-is (read-only).
+    if (kind === 'openrouter') return `
     <div class="acct-cfg">
       <div class="acct-cfg__head">
         <span class="acct-dot" style="background:${cfgColor(ai, -1)}"></span>
@@ -1546,6 +1664,31 @@ function renderCfgAccounts() {
       </div>
       <div class="hint" style="padding:6px 2px">Executes <b>without a Claude session</b> — routines under this account run Perplexity research through the server-side OpenRouter key and write straight to Command / Abstrax. No Fire URL or token to set here; the key lives in Supabase edge secrets. Create a routine and pick this account to schedule lead enrichment.</div>
     </div>`;
+    // OpenRouter agent account — user-addable; multiple named instances, each a
+    // model + tool set. Runs the openrouter-agent edge function.
+    if (kind === 'openrouter-agent') return `
+    <div class="acct-cfg">
+      <div class="acct-cfg__head">
+        <span class="acct-dot" style="background:${cfgColor(ai, -1)}"></span>
+        <input class="input cfg-aname" data-ai="${ai}" value="${esc(a.label)}" placeholder="Account name" />
+        <span class="pill" title="Runs an OpenRouter model with tools">⚡ Agent</span>
+        <button class="iconbtn" title="Remove account" data-act="del-acct" data-ai="${ai}">✕</button>
+      </div>
+      <input class="input cfg-akey" data-ai="${ai}" type="password" autocomplete="off" placeholder="${a.key ? '•••• key saved — blank to keep' : 'OpenRouter API key (sk-or-…) — blank = use server key'}" />
+      <div class="trig-list">${a.triggers.map((t, ti) => `
+        <div class="trig-cfg">
+          <div class="trig-cfg__top">
+            <span class="acct-dot" style="background:${cfgColor(ai, ti)}"></span>
+            <input class="input cfg-tlabel" data-ai="${ai}" data-ti="${ti}" value="${esc(t.label)}" placeholder="Instance name" />
+            <button class="iconbtn" title="Remove instance" data-act="del-trig" data-ai="${ai}" data-ti="${ti}">✕</button>
+          </div>
+          <select class="select cfg-tmodel" data-ai="${ai}" data-ti="${ti}">${AGENT_MODELS().map((m) => `<option value="${m.id}" ${(t.model || DEFAULT_AGENT_MODEL) === m.id ? 'selected' : ''}>${esc(m.label.split(' — ')[0])}</option>`).join('')}</select>
+          <div class="trig-tools">${AGENT_TOOLS.map((tool) => `<label class="tool-chk"><input type="checkbox" class="cfg-ttool" data-ai="${ai}" data-ti="${ti}" data-tool="${tool.id}" ${normalizeTools(t.tools).includes(tool.id) ? 'checked' : ''} /> ${esc(tool.label)}</label>`).join('')}</div>
+          <div class="trig-test"><button class="btn btn--ghost btn--sm" data-act="test-trig" data-ai="${ai}" data-ti="${ti}">Save &amp; test run</button><span class="trig-status" data-ai="${ai}" data-ti="${ti}"></span></div>
+        </div>`).join('')}</div>
+      <button class="btn btn--ghost btn--sm" data-act="add-trig" data-ai="${ai}">Add instance</button>
+    </div>`;
+    // Claude account (default).
     return `
     <div class="acct-cfg">
       <div class="acct-cfg__head">
@@ -1566,15 +1709,21 @@ function renderCfgAccounts() {
         </div>`).join('')}</div>
       <button class="btn btn--ghost btn--sm" data-act="add-trig" data-ai="${ai}">Add trigger</button>
     </div>`;
-  }).join('') + `<button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct">Add account</button>`;
+  }).join('') + `<div class="cfg-addacct-row"><button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct">Add Claude account</button><button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct-or">Add OpenRouter account</button></div>`;
 
   host.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
     syncCfgFromDom();
     const ai = +b.dataset.ai, ti = +b.dataset.ti, act = b.dataset.act;
-    if (act === 'test-trig') return testTrigger(ai, ti); // no re-render — keep typed values + show status
-    if (act === 'add-acct') cfgModel.push({ id: genId('acc'), label: 'New account', triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '' }] });
+    if (act === 'test-trig') return (kindOf(cfgModel[ai] || {}) === 'openrouter-agent' ? testAgentRun(ai, ti) : testTrigger(ai, ti)); // no re-render — keep typed values + show status
+    if (act === 'add-acct') cfgModel.push({ id: genId('acc'), label: 'New account', kind: 'claude', triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '' }] });
+    else if (act === 'add-acct-or') cfgModel.push(NEW_AGENT_ACCOUNT());
     else if (act === 'del-acct') cfgModel.splice(ai, 1);
-    else if (act === 'add-trig') cfgModel[ai].triggers.push({ id: genId('t'), label: nextTrigLabel(cfgModel[ai]), trigger: '', token: '' });
+    else if (act === 'add-trig') {
+      const a = cfgModel[ai];
+      const base = { id: genId('t'), label: nextTrigLabel(a), trigger: '', token: '' };
+      if (kindOf(a) === 'openrouter-agent') { base.model = DEFAULT_AGENT_MODEL; base.tools = [...AGENT_TOOL_IDS]; }
+      a.triggers.push(base);
+    }
     else if (act === 'del-trig') cfgModel[ai].triggers.splice(ti, 1);
     renderCfgAccounts();
   }));
@@ -1608,6 +1757,32 @@ async function testTrigger(ai, ti) {
   const res = await pingTrigger(acc.id, t.id);
   statusEl.textContent = res.ok ? '✓ Reached your Claude routine — it’s live.' : `✕ ${res.msg}`;
   statusEl.className = 'trig-status ' + (res.ok ? 'is-ok' : 'is-err');
+}
+/* Save settings, then ping the openrouter-agent function so the user confirms
+   the chosen model is reachable with the resolved key (per-account override or
+   the server key). A `ping` does a 1-token completion, no tools. */
+async function testAgentRun(ai, ti) {
+  syncCfgFromDom();
+  const acc = cfgModel[ai], t = acc && acc.triggers[ti];
+  const statusEl = $(`.trig-status[data-ai="${ai}"][data-ti="${ti}"]`);
+  if (!t) return;
+  statusEl.textContent = 'Saving + testing…'; statusEl.className = 'trig-status';
+  const saved = await dbSaveAccountCreds(cfgModel);
+  accountsCfg = normalizeAccounts(cfgModel, false);
+  if (!saved) { statusEl.textContent = 'Couldn’t save settings.'; statusEl.className = 'trig-status is-err'; return; }
+  const { session, error } = await sessionForFire();
+  if (error) { statusEl.textContent = `✕ ${error}`; statusEl.className = 'trig-status is-err'; return; }
+  try {
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/openrouter-agent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}` },
+      body: JSON.stringify({ ping: true, account: acc.id, triggerKey: t.id, model: t.model || DEFAULT_AGENT_MODEL }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) { statusEl.textContent = `✕ ${data.error || `HTTP ${r.status}`}`; statusEl.className = 'trig-status is-err'; return; }
+    statusEl.textContent = `✓ ${modelLabel(t.model || DEFAULT_AGENT_MODEL)} reachable${data.keySource ? ` (${data.keySource} key)` : ''}.`;
+    statusEl.className = 'trig-status is-ok';
+  } catch (e) { statusEl.textContent = `✕ ${e.message}`; statusEl.className = 'trig-status is-err'; }
 }
 /* Auto-routing policy editor — a task_type × complexity grid of model pickers.
    Prefilled from the live policy (the user's saved one, else the built-in
@@ -1648,7 +1823,7 @@ async function openSettings() {
   cfgModel = normalizeAccounts(await dbLoadAccountCreds(), true);
 
   drawerBody.innerHTML = `
-    <div class="notice">Add a Claude <b>account</b>, then give it one or more <b>triggers</b> — each is a Fire URL (or <code>trig_…</code>) + token. Routines pick which trigger fires them. Saved to your account and used server-side; no Netlify setup needed.</div>
+    <div class="notice">Add a Claude <b>account</b>, then give it one or more <b>triggers</b> — each is a Fire URL (or <code>trig_…</code>) + token. Or add an <b>OpenRouter account</b> whose named <b>instances</b> each run a model (e.g. Kimi) with tools to read your data, research the web, and write into your apps — their output lands in the Log. Routines pick which trigger/instance fires them. Saved to your account and used server-side; no Netlify setup needed.</div>
     <div class="field__row">
       <div class="field"><label class="label" for="s-account">Default account</label>
         <select class="select" id="s-account">${cfgModel.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>

@@ -32,6 +32,12 @@ const TRIGGER_URL = Deno.env.get("ROUTINER_TRIGGER_URL") ??
 // directly (Perplexity lead enrichment) instead of a Claude routine /fire.
 const LEAD_ENRICHMENT_URL = Deno.env.get("LEAD_ENRICHMENT_URL") ??
   `${SUPABASE_URL}/functions/v1/lead-enrichment`;
+// Non-Claude executor: an "openrouter-agent"-kind account fires this edge
+// function (a model + tool loop), which itself writes the run's full output to
+// routiner_runs — so the scheduler does NOT log a second row for it.
+const OPENROUTER_AGENT_URL = Deno.env.get("OPENROUTER_AGENT_URL") ??
+  `${SUPABASE_URL}/functions/v1/openrouter-agent`;
+const DEFAULT_AGENT_MODEL = "moonshotai/kimi-k2.7-code";
 
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
@@ -251,6 +257,46 @@ async function fireOpenRouter(r: Record<string, any>): Promise<{ status: string;
   }
 }
 
+// Resolve an openrouter-agent instance's model + tools from the owner's
+// accounts (the trigger carries model/tools). Falls back to the first instance,
+// then the routine's own model / the default.
+function pickAgentInstance(accounts: unknown, account: string, triggerKey?: string | null): { model: string | null; tools: string[] | null } {
+  if (!Array.isArray(accounts)) return { model: null, tools: null };
+  const a = accounts.find((x) => x && x.id === account);
+  const trigs = a && Array.isArray(a.triggers) ? a.triggers : [];
+  const t = (triggerKey && trigs.find((x: { id?: string }) => x && x.id === triggerKey)) || trigs[0];
+  return {
+    model: t && typeof t.model === "string" && t.model ? t.model : null,
+    tools: t && Array.isArray(t.tools) ? t.tools : null,
+  };
+}
+
+// Fire an OpenRouter agent routine: POST the task to the openrouter-agent edge
+// function, which runs the model + tool loop and writes the full output to
+// routiner_runs itself. `persisted` tells the caller whether a run row was
+// written (true when the function accepted the job) so we don't duplicate it.
+async function fireAgent(r: Record<string, any>, accounts: unknown): Promise<{ status: string; output: string; persisted: boolean }> {
+  if (!r.prompt || !String(r.prompt).trim()) return { status: "error", output: "Agent routine has no directions.", persisted: false };
+  const inst = pickAgentInstance(accounts, r.account, r.trigger_key);
+  const model = inst.model || (typeof r.model === "string" && r.model && r.model !== "auto" ? r.model : DEFAULT_AGENT_MODEL);
+  const tools = inst.tools || ["read", "research", "write"];
+  try {
+    const f = await fetch(OPENROUTER_AGENT_URL, {
+      method: "POST",
+      headers: { ...dbHeaders },
+      body: JSON.stringify({ prompt: r.prompt, model, tools, account: r.account, triggerKey: r.trigger_key, routineId: r.id, title: r.title, source: "routiner-scheduler" }),
+      signal: AbortSignal.timeout(150_000),
+    });
+    const data = await f.json().catch(() => ({}));
+    if (!f.ok || data.ok === false) return { status: "error", output: String(data.error || `agent HTTP ${f.status}`).slice(0, 2000), persisted: false };
+    // The function wrote the routiner_runs row (full-length); don't log again.
+    return { status: "success", output: String(data.output || "").slice(0, 2000), persisted: true };
+  } catch (e) {
+    const output = e instanceof DOMException && e.name === "TimeoutError" ? "Agent run timed out" : String(e);
+    return { status: "error", output, persisted: false };
+  }
+}
+
 // ── REST helpers ─────────────────────────────────────────────────────────────
 async function patchRow(id: string, patch: Record<string, unknown>) {
   await fetch(rest(`routiner_routines?id=eq.${id}`), {
@@ -333,6 +379,23 @@ async function processOne(
     }
     await logRun(r, orStatus, orOutput);
     return orStatus;
+  }
+
+  // OpenRouter agent account: run the model + tool loop. The edge function writes
+  // the run row itself, so we only logRun when it was NOT persisted (a hard
+  // reject before it ran) — avoids a duplicate Log entry on the happy path.
+  if (accountKind(accounts, r.account) === "openrouter-agent") {
+    const { status: agStatus, output: agOutput, persisted } = await fireAgent(r, accounts);
+    if (agStatus === "error" && r.recurrence === "none") {
+      const attempts = (r.retry_count || 0) + 1;
+      if (attempts <= MAX_RETRIES) {
+        const backoff = RETRY_BACKOFF_MIN * 2 ** (attempts - 1);
+        const retryAt = new Date(Date.now() + backoff * 60000).toISOString();
+        await patchRow(r.id, { status: "scheduled", scheduled_at: retryAt, retry_count: attempts });
+      }
+    }
+    if (!persisted) await logRun(r, agStatus, agOutput);
+    return agStatus;
   }
 
   const rawModel = effectiveModel(r, policy);
