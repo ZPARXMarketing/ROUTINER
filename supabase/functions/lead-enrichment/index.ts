@@ -107,6 +107,7 @@ interface Target {
   dm_titles: string[];
   model: string;
   sync_abstrax: boolean;
+  to_command: boolean; // write to Command's staged_leads (Review tab). Default true.
 }
 
 // ── research one target via Perplexity/OpenRouter ─────────────────────────────
@@ -210,6 +211,9 @@ async function loadTargets(body: Record<string, unknown>): Promise<Target[]> {
     dm_titles: Array.isArray(r.dm_titles) ? r.dm_titles : Array.isArray(r.dmTitles) ? r.dmTitles : [],
     model: typeof r.model === "string" && r.model.trim() ? r.model.trim() : "perplexity/sonar-pro",
     sync_abstrax: Boolean(r.sync_abstrax ?? r.syncAbstrax ?? false),
+    // Default true so table targets + legacy callers still populate Command;
+    // an OpenRouter routine can set toCommand:false to write Abstrax-only.
+    to_command: (r.to_command ?? r.toCommand) !== false,
   });
   if (body.targetId) {
     const rows = await sbGet(`lead_enrichment_targets?id=eq.${body.targetId}&limit=1`);
@@ -290,17 +294,23 @@ Deno.serve(async (req: Request) => {
 
     let inserted = 0, mirrored = 0, insErr: string | undefined;
     if (!dryRun && fresh.length) {
-      try {
-        await sbInsert("staged_leads", fresh.map(toStagedLead));
-        inserted = fresh.length;
-        totalInserted += inserted;
-      } catch (e) { insErr = (e as Error).message; }
+      // Command (staged_leads) and Abstrax (competitors) are independent
+      // destinations — a routine can target either or both.
+      if (t.to_command) {
+        try {
+          await sbInsert("staged_leads", fresh.map(toStagedLead));
+          inserted = fresh.length;
+          totalInserted += inserted;
+        } catch (e) { insErr = (e as Error).message; }
+      }
 
-      if (t.sync_abstrax && roicalKey && inserted) {
+      if (t.sync_abstrax && roicalKey) {
         try {
           await sbInsert("competitors", fresh.map(toCompetitor), roicalUrl, roicalKey);
           mirrored = fresh.length;
         } catch (e) { insErr = (insErr ? insErr + "; " : "") + `abstrax: ${(e as Error).message}`; }
+      } else if (t.sync_abstrax && !roicalKey) {
+        insErr = (insErr ? insErr + "; " : "") + "abstrax: ROICAL_SERVICE_ROLE_KEY not set";
       }
     }
 

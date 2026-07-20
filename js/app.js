@@ -40,20 +40,37 @@ const RECURRENCE = { none: 'One-time', daily: 'Every day', weekdays: 'Weekdays (
    The structure lives in Supabase routiner_settings.accounts and is editable
    in Settings; `accountsCfg` is the in-memory copy (secrets stripped) used to
    render. */
-const KNOWN_LABELS = { sparks9679: 'Sparks', zparxmarketing: 'Zparx' };
+const KNOWN_LABELS = { sparks9679: 'Sparks', zparxmarketing: 'Zparx', openrouter: 'OpenRouter' };
 const DEFAULT_ACCOUNT = 'sparks9679';
+// Built-in "OpenRouter" account: its routines execute WITHOUT a Claude session —
+// they fire the lead-enrichment edge function (Perplexity) directly. The key
+// itself lives server-side (edge secret); this account is its handle in the app.
+const OPENROUTER_ACCOUNT = () => ({
+  id: 'openrouter', label: 'OpenRouter', kind: 'openrouter',
+  triggers: [{ id: 'perplexity', label: 'Perplexity', trigger: '', token: '' }],
+});
 const DEFAULT_ACCOUNTS = () => [
-  { id: 'sparks9679', label: 'Sparks', triggers: [
+  { id: 'sparks9679', label: 'Sparks', kind: 'claude', triggers: [
     { id: 't_a', label: 'A', trigger: '', token: '' },
     { id: 't_b', label: 'B', trigger: '', token: '' },
     { id: 't_c', label: 'C', trigger: '', token: '' },
   ] },
-  { id: 'zparxmarketing', label: 'Zparx', triggers: [
+  { id: 'zparxmarketing', label: 'Zparx', kind: 'claude', triggers: [
     { id: 't_x', label: 'X', trigger: '', token: '' },
     { id: 't_y', label: 'Y', trigger: '', token: '' },
     { id: 't_z', label: 'Z', trigger: '', token: '' },
   ] },
+  OPENROUTER_ACCOUNT(),
 ];
+// Perplexity research models an OpenRouter routine can pick (cheap → deepest).
+const PERPLEXITY_MODELS = [
+  { id: 'perplexity/sonar', label: 'Sonar — cheapest' },
+  { id: 'perplexity/sonar-pro', label: 'Sonar Pro — default' },
+  { id: 'perplexity/sonar-reasoning', label: 'Sonar Reasoning' },
+  { id: 'perplexity/sonar-reasoning-pro', label: 'Sonar Reasoning Pro' },
+  { id: 'perplexity/sonar-deep-research', label: 'Sonar Deep Research — deepest' },
+];
+const DEFAULT_PERPLEXITY_MODEL = 'perplexity/sonar-pro';
 let accountsCfg = DEFAULT_ACCOUNTS();
 let settingsPolicy = null; // the user's saved auto-routing policy (null = built-in default)
 
@@ -62,16 +79,26 @@ const genId = (p) => `${p}_${Math.random().toString(36).slice(2, 8)}`;
 /* Normalize whatever is stored (new array shape, old { id:{trigger,token} } map,
    or empty) into the array shape. `keepSecrets:false` strips trigger/token so the
    broadly-held copy carries only ids + labels. */
+// Guarantee the built-in OpenRouter (non-Claude) account is always present, so
+// it appears top-right even for users whose saved settings predate it.
+function ensureBuiltins(list) {
+  if (!list.some((a) => (a.kind || (a.id === 'openrouter' ? 'openrouter' : 'claude')) === 'openrouter')) {
+    list.push(OPENROUTER_ACCOUNT());
+  }
+  return list;
+}
 function normalizeAccounts(raw, keepSecrets) {
   const trig = (t, i) => ({ id: t.id || genId('t'), label: t.label || String.fromCharCode(65 + i),
     trigger: keepSecrets ? (t.trigger || '') : '', token: keepSecrets ? (t.token || '') : '' });
   if (Array.isArray(raw) && raw.length) {
-    return raw.map((a) => ({ id: a.id || genId('acc'), label: a.label || KNOWN_LABELS[a.id] || a.id,
-      triggers: (a.triggers || []).map(trig) }));
+    return ensureBuiltins(raw.map((a) => ({ id: a.id || genId('acc'), label: a.label || KNOWN_LABELS[a.id] || a.id,
+      kind: a.kind || (a.id === 'openrouter' ? 'openrouter' : 'claude'),
+      triggers: (a.triggers || []).map(trig) })));
   }
   if (raw && typeof raw === 'object' && Object.keys(raw).length) { // old map shape
-    return Object.entries(raw).map(([id, v]) => ({ id, label: KNOWN_LABELS[id] || id,
-      triggers: (v && (v.trigger || v.token)) ? [trig({ id: 't1', label: 'A', trigger: v.trigger, token: v.token }, 0)] : [] }));
+    return ensureBuiltins(Object.entries(raw).map(([id, v]) => ({ id, label: KNOWN_LABELS[id] || id,
+      kind: id === 'openrouter' ? 'openrouter' : 'claude',
+      triggers: (v && (v.trigger || v.token)) ? [trig({ id: 't1', label: 'A', trigger: v.trigger, token: v.token }, 0)] : [] })));
   }
   return DEFAULT_ACCOUNTS();
 }
@@ -80,6 +107,7 @@ const listAccounts = () => accountsCfg;
 const getAccountCfg = (id) => accountsCfg.find((a) => a.id === id);
 const accountIndex = (id) => accountsCfg.findIndex((a) => a.id === id);
 const accountLabel = (id) => { const a = getAccountCfg(id); return a ? a.label : (KNOWN_LABELS[id] || id || ''); };
+const accountKind = (id) => (getAccountCfg(id) || {}).kind || (id === 'openrouter' ? 'openrouter' : 'claude');
 const accountTriggers = (id) => (getAccountCfg(id) || {}).triggers || [];
 const triggerCfg = (accId, tId) => accountTriggers(accId).find((t) => t.id === tId);
 const triggerLabel = (accId, tId) => { const t = triggerCfg(accId, tId); return t ? t.label : ''; };
@@ -387,6 +415,8 @@ async function sessionForFire() {
 
 async function fireTrigger(routine) {
   if (!settings.firing) { toast('Firing is paused on this site (top-right switch). Toggle it live to fire.', 'error'); return; }
+  // OpenRouter account → run the Perplexity enrichment engine directly (no Claude).
+  if (accountKind(routine?.account) === 'openrouter') return fireEnrichment(routine);
   const direct = settings.triggerUrl.trim();
   const url = direct || TRIGGER_FN;
   const payload = JSON.stringify({ text: routine?.prompt || '', account: routine?.account || DEFAULT_ACCOUNT, triggerKey: routine?.triggerKey || null, model: routine ? effectiveModel(routine) : undefined, source: 'claude-routine-planner', routineId: routine?.id, title: routine?.title, at: new Date().toISOString() });
@@ -435,6 +465,42 @@ async function fireTrigger(routine) {
   } catch (e) {
     if (direct) { try { await fetch(direct, { method: 'POST', mode: 'no-cors', body: payload }); toast('Trigger sent (no-cors).'); return; } catch { /* */ } }
     toast(`Trigger failed: ${e.message}. (Set CLAUDE_TRIGGER + CLAUDE_TOKEN in Netlify.)`, 'error');
+  }
+}
+
+/* Fire an OpenRouter routine: POST its research config straight to the
+   lead-enrichment edge function. No Claude, no routine token — the OpenRouter
+   key lives server-side. We authenticate with the signed-in user's Supabase
+   token (the function verifies a JWT), so this rides the same session the app
+   already has. The research call is slow (live web search), so we report the
+   result when it returns. */
+async function fireEnrichment(routine) {
+  let cfg = {}; try { cfg = JSON.parse(routine?.prompt || '{}'); } catch { /* */ }
+  if (!cfg.niche) { toast('This OpenRouter routine has no niche configured.', 'error'); return; }
+  const { session, error } = await sessionForFire();
+  if (error) { toast(error, 'error'); return; }
+  const body = JSON.stringify({ niche: cfg.niche, location: cfg.location ?? null, count: cfg.count, vertical: cfg.vertical,
+    dmTitles: cfg.dmTitles, model: cfg.model, toCommand: cfg.toCommand, syncAbstrax: cfg.toAbstrax,
+    routineId: routine?.id, report: true });
+  const dest = [cfg.toCommand ? 'Command' : null, cfg.toAbstrax ? 'Abstrax' : null].filter(Boolean).join(' + ') || 'nowhere';
+  toast(`Researching ${cfg.niche} via Perplexity → ${dest}… this can take a minute.`);
+  try {
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/lead-enrichment`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}` },
+      body,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) { toast(`Enrichment failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); return; }
+    const t = data.totals || {};
+    const run = (data.runs || [])[0] || {};
+    const bits = [`${t.inserted ?? 0} new lead(s)`];
+    if (run.skipped) bits.push(`${run.skipped} dup`);
+    if (run.mirrored) bits.push(`${run.mirrored}→Abstrax`);
+    if (run.error) bits.push(`⚠ ${run.error}`);
+    toast(`Done — ${bits.join(', ')} (~$${Number(t.cost || 0).toFixed(4)}). Check Command's Review tab.`);
+  } catch (e) {
+    toast(`Enrichment request failed: ${e.message}`, 'error');
   }
 }
 
@@ -1250,6 +1316,17 @@ function openDrawer(routine = null, opts = {}) {
   const r = Object.assign(defaults, routine || {});
   const whenVal = r.scheduledAt ? toLocalInput(new Date(r.scheduledAt)) : defaultWhen();
   const curAccount = getAccountCfg(r.account) ? r.account : (listAccounts()[0] || {}).id;
+  // OpenRouter routines store their research config as JSON in `prompt`; parse it
+  // to prefill the enrichment panel (defaults for a brand-new one).
+  let enr = { niche: '', location: '', count: 10, vertical: '', dmTitles: '', model: DEFAULT_PERPLEXITY_MODEL, toCommand: true, toAbstrax: false };
+  if (accountKind(curAccount) === 'openrouter') {
+    try {
+      const c = JSON.parse(r.prompt || '{}');
+      if (c && typeof c === 'object') enr = { niche: c.niche || '', location: c.location || '', count: c.count || 10,
+        vertical: c.vertical || '', dmTitles: (c.dmTitles || []).join(', '), model: c.model || DEFAULT_PERPLEXITY_MODEL,
+        toCommand: c.toCommand !== false, toAbstrax: !!c.toAbstrax };
+    } catch { /* not JSON yet */ }
+  }
   drawerBody.innerHTML = `
     <div class="field"><label class="label" for="f-title">Title</label>
       <input class="input" id="f-title" placeholder="e.g. Morning competitor scan" value="${esc(r.title)}" /></div>
@@ -1257,11 +1334,35 @@ function openDrawer(routine = null, opts = {}) {
       <textarea class="textarea" id="f-prompt" placeholder="Describe the task. It runs in your Claude Code routine session with full tools.">${esc(r.prompt)}</textarea>
       <span class="hint">Sent to your routine as a session turn. Use {{date}} / {{datetime}} for the run time.</span></div>
     <div class="field__row">
-      <div class="field"><label class="label" for="f-account">Claude account</label>
-        <select class="select" id="f-account">${listAccounts().map((a) => `<option value="${a.id}" ${curAccount === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
+      <div class="field"><label class="label" for="f-account">Account</label>
+        <select class="select" id="f-account">${listAccounts().map((a) => `<option value="${a.id}" ${curAccount === a.id ? 'selected' : ''}>${esc(a.label)}${a.kind === 'openrouter' ? ' ⚡' : ''}</option>`).join('')}</select></div>
       <div class="field"><label class="label" for="f-trigger">Trigger</label>
         <select class="select" id="f-trigger">${triggerOptions(curAccount, r.triggerKey)}</select>
         <span class="hint">Which instance fires it. Manage these in Settings.</span></div>
+    </div>
+    <div id="f-enrich" style="display:none">
+      <div class="field__row">
+        <div class="field"><label class="label" for="f-e-niche">Niche</label>
+          <input class="input" id="f-e-niche" placeholder="e.g. established medical spas" value="${esc(enr.niche)}" /></div>
+        <div class="field"><label class="label" for="f-e-location">Location</label>
+          <input class="input" id="f-e-location" placeholder="e.g. Huntsville, AL" value="${esc(enr.location)}" /></div>
+      </div>
+      <div class="field__row">
+        <div class="field"><label class="label" for="f-e-count">How many</label>
+          <input class="input" type="number" id="f-e-count" min="1" max="25" value="${esc(String(enr.count))}" /></div>
+        <div class="field"><label class="label" for="f-e-vertical">Vertical tag</label>
+          <input class="input" id="f-e-vertical" placeholder="auto from niche" value="${esc(enr.vertical)}" /></div>
+      </div>
+      <div class="field"><label class="label" for="f-e-model">Perplexity model</label>
+        <select class="select" id="f-e-model">${PERPLEXITY_MODELS.map((m) => `<option value="${m.id}" ${enr.model === m.id ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select></div>
+      <div class="field"><label class="label" for="f-e-dm">Decision-maker titles</label>
+        <input class="input" id="f-e-dm" placeholder="Owner, Medical Director, Practice Manager" value="${esc(enr.dmTitles)}" />
+        <span class="hint">Comma-separated. Blank = let the research infer.</span></div>
+      <div class="field__row">
+        <label class="label" style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="f-e-command" ${enr.toCommand ? 'checked' : ''} /> Send to Command (Review tab)</label>
+        <label class="label" style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="f-e-abstrax" ${enr.toAbstrax ? 'checked' : ''} /> Send to Abstrax (prospects)</label>
+      </div>
+      <span class="hint">Runs Perplexity deep research via OpenRouter — no Claude session, no token. Abstrax needs its service key set server-side to actually write.</span>
     </div>
     <div class="field"><label class="label" for="f-model">Model</label>
       <select class="select" id="f-model">${MODELS.map((m) => `<option value="${m.id}" ${(r.model || settings.model) === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
@@ -1288,14 +1389,32 @@ function openDrawer(routine = null, opts = {}) {
     <button class="btn btn--brand" data-do="schedule">Schedule</button>
     <button class="btn btn--secondary" data-do="library">Save to library</button>`;
   $('#f-test', drawerBody).addEventListener('click', testLive);
-  $('#f-account', drawerBody).addEventListener('change', (e) => { $('#f-trigger', drawerBody).innerHTML = triggerOptions(e.target.value, null); });
+  $('#f-account', drawerBody).addEventListener('change', (e) => { $('#f-trigger', drawerBody).innerHTML = triggerOptions(e.target.value, null); refreshDrawerKind(); });
   ['#f-model', '#f-tasktype', '#f-complexity'].forEach((s) => $(s, drawerBody).addEventListener('change', refreshModelHint));
   $('#f-prompt', drawerBody).addEventListener('input', refreshModelHint); // live cost estimate tracks the prompt
-  refreshModelHint();
+  refreshDrawerKind();
   drawerFoot.querySelectorAll('[data-do]').forEach((b) => b.addEventListener('click', () => submitDrawer(b.dataset.do)));
   setTimeout(() => $(opts.forceSchedule ? '#f-when' : '#f-title', drawerBody)?.focus(), 50);
   overlay.classList.add('is-open');
 }
+/* Swap the drawer between a Claude routine (directions + model) and an
+   OpenRouter routine (the Perplexity enrichment panel). Called on open and
+   whenever the account changes. */
+function refreshDrawerKind() {
+  const acc = $('#f-account', drawerBody)?.value;
+  const isOR = accountKind(acc) === 'openrouter';
+  const enrich = $('#f-enrich', drawerBody);
+  if (enrich) enrich.style.display = isOR ? '' : 'none';
+  // Claude-only fields: hide for an OpenRouter routine.
+  const hide = (sel) => { const el = $(sel, drawerBody)?.closest('.field'); if (el) el.style.display = isOR ? 'none' : ''; };
+  hide('#f-prompt'); hide('#f-model'); hide('#f-test');
+  const autoRow = $('#f-auto-row', drawerBody); if (autoRow && isOR) autoRow.style.display = 'none';
+  const hint = $('#f-model-hint', drawerBody); if (hint) hint.style.display = isOR ? 'none' : '';
+  const promptLabel = $('label[for="f-prompt"]', drawerBody); // (kept for a11y; field hidden anyway)
+  if (promptLabel) promptLabel.textContent = 'Directions for Claude';
+  if (!isOR) refreshModelHint();
+}
+
 /* Reflect the model choice: when Auto, show the task-type/complexity inputs and
    the model they resolve to; otherwise hide them and name the pinned model. */
 function refreshModelHint() {
@@ -1330,13 +1449,33 @@ async function testLive() {
   await dbInsertRun({ id: editingId, title: $('#f-title').value || 'Live test' }, res);
 }
 function readDrawer() {
-  return { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, taskType: $('#f-tasktype').value, complexity: $('#f-complexity').value, account: $('#f-account').value, triggerKey: $('#f-trigger').value || null, durationMin: parseInt($('#f-dur').value, 10) || DEFAULT_DURATION_MIN, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
+  const account = $('#f-account').value;
+  const common = { account, triggerKey: $('#f-trigger').value || null, durationMin: parseInt($('#f-dur').value, 10) || DEFAULT_DURATION_MIN, recurrence: $('#f-recur').value, whenRaw: $('#f-when').value };
+  if (accountKind(account) === 'openrouter') {
+    const niche = $('#f-e-niche').value.trim();
+    const location = $('#f-e-location').value.trim();
+    const count = Math.max(1, Math.min(parseInt($('#f-e-count').value, 10) || 10, 25));
+    const vertical = ($('#f-e-vertical').value.trim() || niche.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')).slice(0, 32);
+    const dmTitles = $('#f-e-dm').value.split(',').map((s) => s.trim()).filter(Boolean);
+    const model = $('#f-e-model').value;
+    const cfg = { action: 'lead-enrichment', niche, location: location || null, count, vertical, dmTitles, model,
+      toCommand: $('#f-e-command').checked, toAbstrax: $('#f-e-abstrax').checked };
+    const title = $('#f-title').value.trim() || `${niche}${location ? ` — ${location}` : ''}`;
+    // Store the config as the prompt (the scheduler/edge read it); model column
+    // carries the Perplexity id so the card/forecast show what will run.
+    return Object.assign(common, { title, prompt: JSON.stringify(cfg), model, taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY, openrouter: true });
+  }
+  return Object.assign(common, { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, taskType: $('#f-tasktype').value, complexity: $('#f-complexity').value });
 }
 async function persist(base) { return editingId ? dbUpdate(editingId, Object.assign(getRoutine(editingId) || {}, base)) : dbCreate(base); }
 
 async function submitDrawer(action) {
   const d = readDrawer();
-  if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
+  if (d.openrouter) {
+    let cfg = {}; try { cfg = JSON.parse(d.prompt); } catch { /* */ }
+    if (!cfg.niche) { toast('Add a niche to research.', 'error'); $('#f-e-niche')?.focus(); return; }
+    if (!cfg.toCommand && !cfg.toAbstrax) { toast('Pick at least one destination (Command or Abstrax).', 'error'); return; }
+  } else if (!d.prompt.trim()) { toast('Add directions first.', 'error'); $('#f-prompt').focus(); return; }
   const base = { title: d.title, prompt: d.prompt, model: d.model, taskType: d.taskType, complexity: d.complexity, account: d.account, triggerKey: d.triggerKey, durationMin: d.durationMin, recurrence: d.recurrence };
   const fromNote = schedulingNoteId; // if opened from a Board note, mark it planned once handled
 
@@ -1387,7 +1526,18 @@ function syncCfgFromDom() {
 }
 function renderCfgAccounts() {
   const host = $('#cfg-accounts'); if (!host) return;
-  host.innerHTML = cfgModel.map((a, ai) => `
+  host.innerHTML = cfgModel.map((a, ai) => {
+    const isOR = (a.kind || (a.id === 'openrouter' ? 'openrouter' : 'claude')) === 'openrouter';
+    if (isOR) return `
+    <div class="acct-cfg">
+      <div class="acct-cfg__head">
+        <span class="acct-dot" style="background:${cfgColor(ai, -1)}"></span>
+        <input class="input cfg-aname" data-ai="${ai}" value="${esc(a.label)}" placeholder="Account name" />
+        <span class="pill" title="Non-Claude executor">⚡ OpenRouter</span>
+      </div>
+      <div class="hint" style="padding:6px 2px">Executes <b>without a Claude session</b> — routines under this account run Perplexity research through the server-side OpenRouter key and write straight to Command / Abstrax. No Fire URL or token to set here; the key lives in Supabase edge secrets. Create a routine and pick this account to schedule lead enrichment.</div>
+    </div>`;
+    return `
     <div class="acct-cfg">
       <div class="acct-cfg__head">
         <span class="acct-dot" style="background:${cfgColor(ai, -1)}"></span>
@@ -1406,7 +1556,8 @@ function renderCfgAccounts() {
           <div class="trig-test"><button class="btn btn--ghost btn--sm" data-act="test-trig" data-ai="${ai}" data-ti="${ti}">Save &amp; test fire</button><span class="trig-status" data-ai="${ai}" data-ti="${ti}"></span></div>
         </div>`).join('')}</div>
       <button class="btn btn--ghost btn--sm" data-act="add-trig" data-ai="${ai}">Add trigger</button>
-    </div>`).join('') + `<button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct">Add account</button>`;
+    </div>`;
+  }).join('') + `<button class="btn btn--secondary btn--sm cfg-addacct" data-act="add-acct">Add account</button>`;
 
   host.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
     syncCfgFromDom();
