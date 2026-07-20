@@ -416,6 +416,8 @@ a { color: var(--periwinkle); }
   background: var(--bg-base);
 }
 .drawer__foot .btn { flex: 1 1 auto; justify-content: center; }
+/* Destructive action drops to its own full-width row, apart from the primaries. */
+.drawer__foot .drawer__del { flex-basis: 100%; }
 
 /* ── Forms ─────────────────────────────────────── */
 .field { display: flex; flex-direction: column; gap: var(--sp-2); }
