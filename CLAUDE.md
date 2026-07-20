@@ -202,6 +202,22 @@ the exact Supabase REST recipes. The loop:
 5. **Mark each note** `planned` (or `done` if you handled it on the spot) so it
    isn't re-planned.
 
+## Lead enrichment — the autonomous ICP flywheel
+
+Scheduled **Perplexity deep research → Command's Review tab**, with no Claude in
+the hot path. A `lead-enrichment` edge function (on this same zparx-dashboard
+project) reads ICP targets from `lead_enrichment_targets`, runs Perplexity via
+OpenRouter (reusing the `dynamic-responder` key), validates + de-dupes, and
+inserts `pending` rows into `staged_leads` — which Command's Review tab reads.
+Optionally mirrors to Abstrax `competitors` (RoiCal) when a target opts in.
+
+Everything shares one `EnrichedLead` contract
+(`supabase/functions/_shared/lead-schema.ts`). Setup, scheduling (pg_cron or a
+thin Routiner routine), Abstrax sync, and tuning are in
+**[`docs/LEAD_ENRICHMENT.md`](docs/LEAD_ENRICHMENT.md)**. Steer it by editing
+`lead_enrichment_targets` (niche × location × decision-maker titles × count);
+disabled rows are ignored, so the machine only spins on targets you enable.
+
 ## Data model (Supabase — all RLS per user)
 
 - **`routiner_notes`** — the Board. `body`, `status`
