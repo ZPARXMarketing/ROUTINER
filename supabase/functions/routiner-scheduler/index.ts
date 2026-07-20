@@ -28,6 +28,10 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const TRIGGER_URL = Deno.env.get("ROUTINER_TRIGGER_URL") ??
   "https://zroutiner.netlify.app/.netlify/functions/claude-trigger";
+// Non-Claude executor: an "openrouter"-kind account fires this edge function
+// directly (Perplexity lead enrichment) instead of a Claude routine /fire.
+const LEAD_ENRICHMENT_URL = Deno.env.get("LEAD_ENRICHMENT_URL") ??
+  `${SUPABASE_URL}/functions/v1/lead-enrichment`;
 
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
@@ -199,6 +203,54 @@ function pickCreds(
   return t ? { trigger: t.trigger || "", token: t.token || "" } : null;
 }
 
+// An account's executor kind. "claude" (default) fires a Claude routine /fire;
+// "openrouter" fires the lead-enrichment edge function with no Claude at all.
+function accountKind(accounts: unknown, account: string): string {
+  if (!Array.isArray(accounts)) return "claude";
+  const a = accounts.find((x) => x && x.id === account);
+  return (a && typeof a.kind === "string" && a.kind) || "claude";
+}
+
+// Fire an OpenRouter-kind routine: its `prompt` is a small JSON config
+// { niche, location, count, dmTitles, vertical, model, toCommand, toAbstrax }.
+// We POST it to the lead-enrichment function (service-role auth satisfies the
+// function's verify_jwt) which does the Perplexity research + writes. Returns
+// { status, output } shaped like the Claude path so the caller's tail is shared.
+async function fireOpenRouter(r: Record<string, any>): Promise<{ status: string; output: string }> {
+  let cfg: Record<string, unknown> = {};
+  try { cfg = JSON.parse(r.prompt || "{}"); } catch { /* not JSON → empty config */ }
+  const payload = {
+    niche: cfg.niche,
+    location: cfg.location ?? null,
+    count: cfg.count,
+    dmTitles: cfg.dmTitles,
+    vertical: cfg.vertical,
+    model: cfg.model,
+    toCommand: cfg.toCommand,
+    syncAbstrax: cfg.toAbstrax ?? cfg.syncAbstrax,
+    routineId: r.id,
+    report: true,
+  };
+  if (!payload.niche) {
+    return { status: "error", output: "OpenRouter routine has no 'niche' in its config prompt." };
+  }
+  try {
+    const f = await fetch(LEAD_ENRICHMENT_URL, {
+      method: "POST",
+      headers: { ...dbHeaders },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(150_000),
+    });
+    const output = (await f.text()).slice(0, 2000);
+    return { status: f.ok ? "success" : "error", output };
+  } catch (e) {
+    return {
+      status: "error",
+      output: e instanceof DOMException && e.name === "TimeoutError" ? "Enrichment timed out" : String(e),
+    };
+  }
+}
+
 // ── REST helpers ─────────────────────────────────────────────────────────────
 async function patchRow(id: string, patch: Record<string, unknown>) {
   await fetch(rest(`routiner_routines?id=eq.${id}`), {
@@ -268,6 +320,21 @@ async function processOne(
   // credential the app uses for a manual fire — no Netlify env token needed.
   // Fall back to the Netlify forwarder (which holds CLAUDE_TRIGGER + CLAUDE_TOKEN
   // env vars) only when the owner has nothing saved for this account+trigger.
+  // OpenRouter-kind account: fire the enrichment engine directly, no Claude.
+  if (accountKind(accounts, r.account) === "openrouter") {
+    const { status: orStatus, output: orOutput } = await fireOpenRouter(r);
+    if (orStatus === "error" && r.recurrence === "none") {
+      const attempts = (r.retry_count || 0) + 1;
+      if (attempts <= MAX_RETRIES) {
+        const backoff = RETRY_BACKOFF_MIN * 2 ** (attempts - 1);
+        const retryAt = new Date(Date.now() + backoff * 60000).toISOString();
+        await patchRow(r.id, { status: "scheduled", scheduled_at: retryAt, retry_count: attempts });
+      }
+    }
+    await logRun(r, orStatus, orOutput);
+    return orStatus;
+  }
+
   const rawModel = effectiveModel(r, policy);
   const model = /^claude-/i.test(rawModel) ? rawModel : null; // only Claude ids go to /fire
   const creds = pickCreds(accounts, r.account, r.trigger_key);
