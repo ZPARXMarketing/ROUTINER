@@ -75,7 +75,7 @@ const DEFAULT_PERPLEXITY_MODEL = 'perplexity/sonar-pro';
 /* OpenRouter "agent" accounts (kind 'openrouter-agent') — user-addable and
    non-Claude. Each instance (trigger) runs a bounded tool-use loop on a chosen
    OpenRouter model (default Kimi) via the `openrouter-agent` edge function, and
-   its full result lands in the Log. This is DISTINCT from the built-in
+   its full result lands in History (resumable). This is DISTINCT from the built-in
    `openrouter` (Perplexity enrichment) account above, which is left untouched. */
 const DEFAULT_AGENT_MODEL = 'moonshotai/kimi-k2.7-code';
 const AGENT_TOOLS = [
@@ -310,7 +310,12 @@ async function loadAll() {
   setActivePolicy(settingsPolicy);
   if (rRes.error) { toast('Load failed: ' + rRes.error.message, 'error'); return; }
   routines = (rRes.data || []).map(fromRow);
-  runs = (runRes.data || []).map((x) => ({ id: x.id, routineId: x.routine_id, title: x.title, status: x.status, output: x.output, firedAt: x.fired_at }));
+  runs = (runRes.data || []).map((x) => ({
+    id: x.id, routineId: x.routine_id, title: x.title, status: x.status, output: x.output, firedAt: x.fired_at,
+    // Agent runs also carry the resumable conversation + the context needed to
+    // continue it (issues #51/#52). Null for Claude-trigger and legacy runs.
+    messages: x.messages || null, model: x.model || null, account: x.account || null, triggerKey: x.trigger_key || null, tools: x.tools || null,
+  }));
   await dbLoadNotes();
   render();
   warnRecentFailures();
@@ -327,7 +332,7 @@ function warnRecentFailures() {
   _failuresWarned = true;
   const n = bad.length;
   const kinds = bad.some((b) => b.status === 'missed') ? 'failed/missed' : 'failed';
-  toast(`${n} routine run${n > 1 ? 's' : ''} ${kinds} in the last 24h — see the Log tab`, 'error');
+  toast(`${n} routine run${n > 1 ? 's' : ''} ${kinds} in the last 24h — see History`, 'error');
 }
 const getRoutine = (id) => routines.find((r) => r.id === id);
 
@@ -575,7 +580,7 @@ async function fireAgent(routine) {
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) { toast(`Agent run failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); return; }
     const cost = Number(data.cost || 0);
-    toast(`Done — ${modelLabel(model)} finished${data.steps ? ` in ${data.steps} step(s)` : ''}${cost ? ` (~$${cost.toFixed(4)})` : ''}. See the Log.`);
+    toast(`Done — ${modelLabel(model)} finished${data.steps ? ` in ${data.steps} step(s)` : ''}${cost ? ` (~$${cost.toFixed(4)})` : ''}. Open it in History to read the full reply or continue.`);
     try { await loadAll(); render(); } catch { /* non-fatal: the row is saved regardless */ }
   } catch (e) {
     toast(`Agent request failed: ${e.message}`, 'error');
@@ -615,8 +620,9 @@ function isPastOneOff(r, fired) {
 function historyItems() {
   const fired = firedRoutineIds();
   const items = runs.map((run) => ({
-    id: 'run-' + run.id, title: run.title, status: run.status || 'ran',
+    id: 'run-' + run.id, runId: run.id, title: run.title, status: run.status || 'ran',
     output: run.output, time: run.firedAt, routineId: run.routineId,
+    messages: run.messages, model: run.model, account: run.account, triggerKey: run.triggerKey, tools: run.tools,
   }));
   routines.forEach((r) => {
     if (r.status === 'archived') return;
@@ -630,7 +636,7 @@ function historyItems() {
 }
 function counts() {
   const fired = firedRoutineIds();
-  const c = { scheduled: 0, library: 0, archived: 0, history: 0, log: 0, board: notes.filter((n) => n.status === 'active').length };
+  const c = { scheduled: 0, library: 0, archived: 0, history: 0, historyFail: 0, board: notes.filter((n) => n.status === 'active').length };
   routines.forEach((r) => {
     if (r.status === 'archived') { c.archived++; return; }
     if (isPastOneOff(r, fired)) return;              // counted under History below
@@ -640,14 +646,16 @@ function counts() {
   });
   const items = historyItems();
   c.history = items.length;
-  c.log = items.filter((it) => it.status === 'error' || it.status === 'missed').length;
+  c.historyFail = items.filter((it) => it.status === 'error' || it.status === 'missed').length;
   return c;
 }
 function paintCounts() {
   const c = counts();
   $$('[data-count]').forEach((el) => {
     el.textContent = c[el.dataset.count] ?? 0;
-    if (el.classList.contains('tab__count--alert')) el.classList.toggle('is-hot', (c[el.dataset.count] ?? 0) > 0);
+    // The History tab glows only when something actually needs attention
+    // (a failed or missed run), not merely because history is non-empty.
+    if (el.classList.contains('tab__count--alert')) el.classList.toggle('is-hot', (c.historyFail ?? 0) > 0);
   });
 }
 
@@ -760,7 +768,6 @@ function render() {
   if (currentView === 'board') return renderBoard();
   if (currentView === 'calendar') return renderCalendar();
   if (currentView === 'history') return renderHistory();
-  if (currentView === 'log') return renderLog();
   if (currentView === 'chat') return renderChat();
   const fired = firedRoutineIds();
   const items = routines.filter((r) => {
@@ -917,11 +924,12 @@ function renderBoard() {
   }));
 }
 
-/* ---------- History (friendly) & Log (technical) ----------
-   History is for reading: plain-English status + a cleaned-up summary of what
-   the model returned — no raw code, links, or markdown. The Log is the
-   technical record: every run with its raw output, failures called out with
-   the date and the reason. */
+/* ---------- History (the single record of every run) ----------
+   History is both the friendly recap AND the full technical record (the old
+   separate Log tab is folded in here — issue #52). Each row shows plain-English
+   status + a cleaned-up summary; click it to open the full exchange, see exactly
+   what the model returned (issue #51), and — for agent runs — reply to keep the
+   conversation going with the same model and tools. */
 const FRIENDLY_STATUS = {
   success: 'Completed', ran: 'Ran', dryrun: 'Test run',
   error: 'Had a problem', missed: 'Missed its time',
@@ -942,43 +950,171 @@ function friendlyText(raw) {
   if (s.length > 420) s = s.slice(0, 420).replace(/\s+\S*$/, '') + '…';
   return s;
 }
+/* An agent run carries a resumable transcript (or at least a model id), so it can
+   be reopened and continued. Claude-trigger and legacy rows can't — they open
+   read-only. */
+function isContinuable(it) { return !!(it && it.runId && (it.model || (Array.isArray(it.messages) && it.messages.length))); }
+
+let historyFilter = 'all'; // 'all' | 'failures'
 function renderHistory() {
-  const items = historyItems();
-  if (!items.length) {
-    view.innerHTML = `<div class="empty"><h3>No history yet</h3><p>Finished routines land here as a plain-English recap of what each run did.</p></div>`;
+  const all = historyItems();
+  if (!all.length) {
+    view.innerHTML = `<div class="empty"><h3>No history yet</h3><p>Finished runs land here — click any one to read the full exchange, and reply to keep the conversation going.</p></div>`;
     return;
   }
+  const failures = all.filter((it) => it.status === 'error' || it.status === 'missed');
+  const items = historyFilter === 'failures' ? failures : all;
+  const filterBar = `<div class="log__filter">
+      <button class="btn btn--sm ${historyFilter === 'all' ? 'btn--secondary' : 'btn--ghost'}" data-histf="all">All runs (${all.length})</button>
+      <button class="btn btn--sm ${historyFilter === 'failures' ? 'btn--secondary' : 'btn--ghost'}" data-histf="failures">Failures (${failures.length})</button>
+    </div>`;
   const row = (it) => {
     const ok = !(it.status === 'error' || it.status === 'missed');
     const text = friendlyText(it.output);
-    return `<div class="hist ${ok ? '' : 'hist--bad'}">
+    const can = isContinuable(it);
+    const meta = [it.model ? modelLabel(it.model) : '', can ? 'Reply to continue' : ''].filter(Boolean).join(' · ');
+    return `<div class="hist hist--click ${ok ? '' : 'hist--bad'}" data-hist="${esc(it.id)}" role="button" tabindex="0">
       <div class="hist__head">
         <span class="hist__title">${esc(it.title || 'Untitled')}</span>
         <span class="hist__status ${ok ? 'is-ok' : 'is-bad'}">${esc(FRIENDLY_STATUS[it.status] || it.status)}</span>
         <span class="hist__time">${it.time ? fmt(it.time) : ''}</span>
       </div>
-      ${text ? `<p class="hist__text">${esc(text)}</p>` : `<p class="hist__text hist__text--none">No summary was returned for this run${ok ? '' : ' — the Log tab has the technical details'}.</p>`}
+      ${text ? `<p class="hist__text">${esc(text)}</p>` : `<p class="hist__text hist__text--none">No summary was returned for this run — open it for the full details.</p>`}
+      ${meta ? `<div class="hist__meta">${esc(meta)} <span class="hist__open">Open →</span></div>` : `<div class="hist__meta"><span class="hist__open">Open →</span></div>`}
     </div>`;
   };
-  view.innerHTML = `<div class="section-head"><h2>History</h2><span class="hint">What each run did, in plain English — technical details live in the Log tab</span></div>
-    <div class="history">${items.map(row).join('')}</div>`;
+  const body = items.length
+    ? `<div class="history">${items.map(row).join('')}</div>`
+    : `<div class="empty"><h3>No failures</h3><p>Nothing has failed or missed its slot. 🎉</p></div>`;
+  view.innerHTML = `<div class="section-head"><h2>History</h2><span class="hint">Every run — click one to see the full exchange and reply to continue it</span></div>
+    ${filterBar}${body}`;
+  view.querySelectorAll('[data-histf]').forEach((b) => b.addEventListener('click', () => { historyFilter = b.dataset.histf; renderHistory(); }));
+  const open = (id) => { const it = historyItems().find((x) => x.id === id); if (it) openRunModal(it); };
+  view.querySelectorAll('[data-hist]').forEach((el) => {
+    el.addEventListener('click', () => open(el.dataset.hist));
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(el.dataset.hist); } });
+  });
 }
 
-let logFilter = 'all'; // 'all' | 'failures'
-function renderLog() {
-  const all = historyItems();
-  const failures = all.filter((it) => it.status === 'error' || it.status === 'missed');
-  const items = logFilter === 'failures' ? failures : all;
-  const filterBar = `<div class="log__filter">
-      <button class="btn btn--sm ${logFilter === 'all' ? 'btn--secondary' : 'btn--ghost'}" data-logf="all">All runs (${all.length})</button>
-      <button class="btn btn--sm ${logFilter === 'failures' ? 'btn--secondary' : 'btn--ghost'}" data-logf="failures">Failures (${failures.length})</button>
-    </div>`;
-  const body = items.length
-    ? `<div class="history">${items.map(runRow).join('')}</div>`
-    : `<div class="empty"><h3>${logFilter === 'failures' ? 'No failures logged' : 'Nothing logged yet'}</h3><p>${logFilter === 'failures' ? 'When a routine fails or misses its slot, it lands here with the date and the reason.' : 'Every run — successes and failures — is recorded here with its raw output.'}</p></div>`;
-  view.innerHTML = `<div class="section-head"><h2>Log</h2><span class="hint">The technical record — every run, raw output, failures with the reason</span></div>
-    ${filterBar}${body}`;
-  view.querySelectorAll('[data-logf]').forEach((b) => b.addEventListener('click', () => { logFilter = b.dataset.logf; renderLog(); }));
+/* ---------- Run detail modal (full exchange + continue) ----------
+   Opens a run as a conversation: the original task, the model's reply, any tool
+   actions it took, and (for agent runs) a compose box to reply. Follow-ups call
+   the openrouter-agent function with { runId, prompt }, which resumes the stored
+   transcript with the same model + tools and saves the whole thread back. */
+let runModalId = null;      // the historyItems id currently open
+let runModalBusy = false;   // a follow-up is in flight
+
+/* Turn a stored transcript into display turns: user + assistant bubbles, with a
+   compact line for each tool the model ran. Falls back to the single output blob
+   for runs with no saved transcript. */
+function transcriptTurns(it) {
+  const msgs = Array.isArray(it.messages) ? it.messages : null;
+  if (!msgs || !msgs.length) {
+    return it.output ? [{ kind: 'assistant', content: it.output }] : [];
+  }
+  const turns = [];
+  for (const m of msgs) {
+    if (!m || m.role === 'system') continue;
+    if (m.role === 'user') { turns.push({ kind: 'user', content: String(m.content || '') }); continue; }
+    if (m.role === 'tool') { turns.push({ kind: 'toolresult', content: String(m.content || '') }); continue; }
+    if (m.role === 'assistant') {
+      if (m.content && String(m.content).trim()) turns.push({ kind: 'assistant', content: String(m.content) });
+      (Array.isArray(m.tool_calls) ? m.tool_calls : []).forEach((tc) => {
+        const name = tc?.function?.name || 'tool';
+        let args = tc?.function?.arguments || '';
+        try { args = JSON.stringify(JSON.parse(args)); } catch { /* leave as-is */ }
+        turns.push({ kind: 'tool', content: `${name}(${String(args).slice(0, 160)})` });
+      });
+    }
+  }
+  return turns;
+}
+
+function runModalHtml(it) {
+  const ok = !(it.status === 'error' || it.status === 'missed');
+  const turns = transcriptTurns(it);
+  const bubbles = turns.map((t) => {
+    if (t.kind === 'user') return `<div class="chatmsg chatmsg--user">${esc(t.content)}</div>`;
+    if (t.kind === 'tool') return `<div class="transcript__tool">⚙ ${esc(t.content)}</div>`;
+    if (t.kind === 'toolresult') return `<details class="transcript__res"><summary>tool result</summary><pre>${esc(t.content.slice(0, 4000))}</pre></details>`;
+    return `<div class="chatmsg chatmsg--bot">${renderRunBody(t.content)}</div>`;
+  }).join('') || `<div class="empty"><h3>Nothing was recorded</h3><p>This run has no saved output.</p></div>`;
+  const can = isContinuable(it);
+  const compose = can
+    ? `<div class="modal__compose">
+        <textarea class="textarea chat__input" id="run-input" placeholder="Reply to the model — answer its question, grant permission, or ask for more… (Enter to send)" ${runModalBusy ? 'disabled' : ''}></textarea>
+        <button class="btn btn--primary" id="run-send" ${runModalBusy ? 'disabled' : ''}>Send</button>
+      </div>`
+    : `<div class="modal__note">This run isn't an interactive model chat, so it can't be continued here — it's shown for the record.</div>`;
+  return `<div class="modal">
+    <div class="modal__head">
+      <span class="chip chip--${esc(it.status || 'ran')}">${esc(FRIENDLY_STATUS[it.status] || it.status || 'ran')}</span>
+      <h2 class="modal__title">${esc(it.title || 'Untitled')}</h2>
+      <span class="modal__time">${it.time ? fmt(it.time) : ''}</span>
+      <button class="drawer__close" id="run-close" aria-label="Close">×</button>
+    </div>
+    <div class="modal__thread" id="run-thread">
+      ${bubbles}
+      ${runModalBusy ? '<div class="chatmsg chatmsg--bot chatmsg--busy">Thinking…</div>' : ''}
+    </div>
+    ${compose}
+  </div>`;
+}
+
+function openRunModal(it) {
+  runModalId = it.id;
+  let ov = $('#runOverlay');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'runOverlay';
+    ov.className = 'overlay overlay--modal';
+    document.body.appendChild(ov);
+    ov.addEventListener('click', (e) => { if (e.target === ov) closeRunModal(); });
+  }
+  ov.innerHTML = runModalHtml(it);
+  ov.classList.add('is-open');
+  const thread = $('#run-thread', ov);
+  if (thread) thread.scrollTop = thread.scrollHeight;
+  $('#run-close', ov)?.addEventListener('click', closeRunModal);
+  const input = $('#run-input', ov);
+  if (input) {
+    const send = () => continueRun(it, input.value);
+    $('#run-send', ov)?.addEventListener('click', send);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+    if (!runModalBusy) setTimeout(() => input.focus(), 30);
+  }
+}
+function closeRunModal() { runModalId = null; $('#runOverlay')?.classList.remove('is-open'); }
+// Re-open the currently-open run from fresh data (after a follow-up round-trips).
+function refreshRunModal() { if (!runModalId) return; const it = historyItems().find((x) => x.id === runModalId); if (it) openRunModal(it); else closeRunModal(); }
+
+async function continueRun(it, raw) {
+  const text = (raw || '').trim();
+  if (!text || runModalBusy || !isContinuable(it)) return;
+  const { session, error } = await sessionForFire();
+  if (error) { toast(error, 'error'); return; }
+  runModalBusy = true;
+  // Optimistically show the user's message + a thinking bubble.
+  const optimistic = { ...it, messages: [...(Array.isArray(it.messages) ? it.messages : []), { role: 'user', content: text }] };
+  openRunModal(optimistic);
+  try {
+    const r = await fetch(`${SUPABASE_URL}/functions/v1/openrouter-agent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}` },
+      body: JSON.stringify({ runId: it.runId, prompt: text }),
+    });
+    const data = await r.json().catch(() => ({}));
+    runModalBusy = false;
+    if (!r.ok || data.ok === false) { toast(`Reply failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); refreshRunModal(); return; }
+    const cost = Number(data.cost || 0);
+    toast(`Replied — ${modelLabel(data.model || it.model)}${cost ? ` (~$${cost.toFixed(4)})` : ''}.`);
+    try { await loadAll(); } catch { /* the row is saved regardless */ }
+    refreshRunModal();
+  } catch (e) {
+    runModalBusy = false;
+    toast(`Reply request failed: ${e.message}`, 'error');
+    refreshRunModal();
+  }
 }
 
 /* ---------- Chat (test a model directly) ----------
@@ -1048,14 +1184,6 @@ function renderRunBody(text) {
     (u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
   s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>'); // bold, single-line
   return s;
-}
-function runRow(it) {
-  const body = it.output ? `<div class="run__body">${renderRunBody(it.output)}</div>` : '';
-  return `<div class="run"><div class="run__head">
-      <span class="chip chip--${it.status}">${esc(it.status)}</span>
-      <span class="run__title">${esc(it.title)}</span>
-      <span class="run__time">${it.time ? fmt(it.time) : ''}</span>
-    </div>${body}</div>`;
 }
 
 /* ---------- Calendar (week plan) ---------- */
@@ -1506,7 +1634,7 @@ function refreshDrawerKind() {
       const m = triggerModel(acc, tId);
       const tools = triggerTools(acc, tId);
       const toolNames = tools.length ? tools.map((id) => (AGENT_TOOLS.find((x) => x.id === id) || {}).label || id).join(', ') : 'no tools';
-      ah.innerHTML = `Runs <b>${esc(modelLabel(m))}</b> <code>${esc(m)}</code> with ${esc(toolNames)}. Its output lands in the Log. Change the model &amp; tools in Settings.`;
+      ah.innerHTML = `Runs <b>${esc(modelLabel(m))}</b> <code>${esc(m)}</code> with ${esc(toolNames)}. Its output lands in History, where you can reply to continue it. Change the model &amp; tools in Settings.`;
     }
   }
   const promptLabel = $('label[for="f-prompt"]', drawerBody);
@@ -1823,7 +1951,7 @@ async function openSettings() {
   cfgModel = normalizeAccounts(await dbLoadAccountCreds(), true);
 
   drawerBody.innerHTML = `
-    <div class="notice">Add a Claude <b>account</b>, then give it one or more <b>triggers</b> — each is a Fire URL (or <code>trig_…</code>) + token. Or add an <b>OpenRouter account</b> whose named <b>instances</b> each run a model (e.g. Kimi) with tools to read your data, research the web, and write into your apps — their output lands in the Log. Routines pick which trigger/instance fires them. Saved to your account and used server-side; no Netlify setup needed.</div>
+    <div class="notice">Add a Claude <b>account</b>, then give it one or more <b>triggers</b> — each is a Fire URL (or <code>trig_…</code>) + token. Or add an <b>OpenRouter account</b> whose named <b>instances</b> each run a model (e.g. Kimi) with tools to read your data, research the web, and write into your apps — their output lands in History, where you can reply to continue the conversation. Routines pick which trigger/instance fires them. Saved to your account and used server-side; no Netlify setup needed.</div>
     <div class="field__row">
       <div class="field"><label class="label" for="s-account">Default account</label>
         <select class="select" id="s-account">${cfgModel.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
@@ -1936,7 +2064,7 @@ function wireOnce() {
   $('#signOutBtn').addEventListener('click', async () => { await sb.auth.signOut(); });
   $('#drawerClose').addEventListener('click', closeDrawer);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeDrawer(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeDrawer(); closeRunModal(); } });
   $$('.tab').forEach((t) => t.addEventListener('click', () => { currentView = t.dataset.view; syncTabs(); render(); }));
   wireCalendarZoom();
   setInterval(paintStatus, 30000);

@@ -22,11 +22,15 @@
 // same model those functions use. An optional RESPONDER_SECRET gate is honored.
 //
 // Request (POST JSON):
-//   { prompt, model?, tools?: ("read"|"research"|"write")[], account?, triggerKey?,
-//     routineId?, title?, source?, ping? }
+//   Fresh run:  { prompt, model?, tools?: ("read"|"research"|"write")[], account?,
+//                 triggerKey?, routineId?, title?, source?, ping? }
+//   Continue:   { runId, prompt }   — resumes that stored run's transcript with
+//               its own model/account/trigger/tools; the follow-up is `prompt`.
 // Response:
-//   { ok: true, output, steps, cost, model, keySource }   (ping: { ok, keySource, model })
+//   { ok: true, runId, output, steps?, cost, model, keySource }   (ping: { ok, keySource, model })
 //   { ok: false, error }
+// The full message transcript is persisted on the run row (routiner_runs.messages)
+// so the app can render the whole exchange and continue it (issues #51, #52).
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
@@ -271,6 +275,61 @@ async function runTool(name: string, args: Record<string, any>, ctx: { userId: s
   }
 }
 
+// The system prompt that frames an instance. Shared by fresh runs and by the
+// reconstruction path for legacy runs that predate stored transcripts.
+function buildSystem(model: string, toolList: string): string {
+  return `You are a Routiner agent instance running the model ${model}. You complete the user's task and return a clear, useful written result that is saved to the Routiner History for reuse, and which the user can reply to to keep the conversation going.
+You have these tool capabilities: ${toolList}.
+- Use read_* tools to ground your work in the owner's real data before acting.
+- Use web_research for anything you need current facts on.
+- Use write_note to save durable notes, and find_and_save_leads to source prospects into Command.
+Take the actions the task calls for, then finish with a concise summary of what you found and did. If you need the user to clarify something or grant permission before acting, say so plainly and stop — they can reply and you'll pick up from there. Do not claim to have done something a tool did not confirm.`;
+}
+
+// Run the bounded tool-use loop over `messages` (mutated in place so the caller
+// keeps the full transcript, final assistant turn included). Returns the final
+// text, a recap of tool actions, accumulated cost, and step count.
+async function runAgentLoop(opts: {
+  key: string; model: string; tools: unknown[]; messages: any[];
+  ctx: { userId: string | null; account: string | null; triggerKey: string | null };
+}): Promise<{ finalText: string; actions: string[]; cost: number; steps: number }> {
+  const { key, model, tools, messages, ctx } = opts;
+  const actions: string[] = [];
+  let cost = 0, steps = 0, finalText = "";
+  const started = Date.now();
+  for (let i = 0; i < MAX_STEPS; i++) {
+    steps = i + 1;
+    const r = await openrouter(key, model, messages, { tools });
+    cost += Number(r.usage?.cost) || 0;
+    await logUsage(model, r.usage, ctx.account, ctx.triggerKey, r.ok, r.error ?? null);
+    if (!r.ok) { finalText = `⚠ Model error on step ${steps}: ${r.error}`; break; }
+
+    const msg = r.message || {};
+    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    if (!toolCalls.length) {
+      finalText = (msg.content || "").toString().trim();
+      // Keep the final answer in the transcript so it displays and so a later
+      // continuation has the model's own last turn as context.
+      messages.push({ role: "assistant", content: msg.content || "" });
+      break;
+    }
+
+    // Record the assistant turn (with its tool calls), then run each tool.
+    messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls });
+    for (const tc of toolCalls) {
+      const name = tc?.function?.name || "";
+      let args: Record<string, any> = {};
+      try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
+      const result = (await runTool(name, args, { userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey })).slice(0, TOOL_RESULT_CAP);
+      actions.push(`${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`);
+      messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+    }
+    if (Date.now() - started > DEADLINE_MS) { finalText = (finalText || "Stopped: hit the time budget before a final answer.").toString(); break; }
+  }
+  if (!finalText) finalText = "Stopped after the maximum number of tool steps without a final answer.";
+  return { finalText, actions, cost, steps };
+}
+
 // ── Handler ─────────────────────────────────────────────────────────────────────
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("", { status: 204, headers: cors });
@@ -282,8 +341,72 @@ Deno.serve(async (req: Request) => {
   let body: Record<string, any> = {};
   try { body = await req.json(); } catch { /* empty ok */ }
 
-  const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
   const allow = allowedModels();
+  const runId = typeof body.runId === "string" ? body.runId.trim()
+              : (typeof body.run_id === "string" ? body.run_id.trim() : "");
+
+  // ── Continuation: reopen a stored run and keep the same conversation going ──
+  // The follow-up carries only { runId, prompt }; model, account, trigger and
+  // enabled tools all come from the stored run so it resumes with the same
+  // context and capabilities. Persists back onto the same row.
+  if (runId) {
+    const prompt = typeof body.prompt === "string" ? body.prompt : "";
+    if (!prompt.trim()) return json({ ok: false, error: "Missing 'prompt' (the follow-up message)." }, 400);
+
+    let row: any = null;
+    try {
+      const rows = await sbGet(`routiner_runs?id=eq.${encodeURIComponent(runId)}&select=id,user_id,routine_id,title,status,output,messages,model,account,trigger_key,tools&limit=1`);
+      row = rows?.[0] || null;
+    } catch (e) { return json({ ok: false, error: `Could not load the run: ${(e as Error).message}` }, 502); }
+    if (!row) return json({ ok: false, error: "Run not found." }, 404);
+
+    const userId = row.user_id || null;
+    const account = typeof row.account === "string" ? row.account : null;
+    const triggerKey = typeof row.trigger_key === "string" ? row.trigger_key : null;
+    let model = typeof row.model === "string" && row.model.trim() ? row.model.trim() : DEFAULT_MODEL;
+    if (!allow.has(model)) model = DEFAULT_MODEL;             // stored model was removed from the allowlist
+    const enabled = new Set<string>(
+      Array.isArray(row.tools) && row.tools.length ? row.tools.filter((t: unknown) => typeof t === "string") : ["read", "research", "write"],
+    );
+    const tools = toolSpecs(enabled);
+    const toolList = enabled.size ? [...enabled].join(", ") : "none";
+
+    const override = await accountKeyOverride(userId, account || undefined);
+    const serverKey = Deno.env.get("OPENROUTER_API_KEY") || "";
+    const key = override || serverKey;
+    const keySource = override ? "account" : "server";
+    if (!key) return json({ ok: false, error: "No OpenRouter key available to continue this run." }, 500);
+
+    const capRaw = Deno.env.get("MAX_DAILY_SPEND");
+    const cap = capRaw ? Number(capRaw) : 0;
+    if (cap > 0) { const spent = await todaySpend(); if (spent != null && spent >= cap) return json({ ok: false, error: `Daily spend cap reached ($${spent.toFixed(4)} of $${cap.toFixed(2)}).` }, 429); }
+
+    // Seed from the stored transcript; reconstruct a minimal one for legacy runs
+    // that predate stored messages (single assistant turn = their saved output).
+    let messages: any[] = Array.isArray(row.messages) && row.messages.length ? row.messages.slice() : [];
+    if (!messages.length) {
+      messages = [{ role: "system", content: buildSystem(model, toolList) }];
+      if (row.output) messages.push({ role: "assistant", content: String(row.output) });
+    } else if (messages[0]?.role !== "system") {
+      messages.unshift({ role: "system", content: buildSystem(model, toolList) });
+    }
+    messages.push({ role: "user", content: prompt });
+
+    const { finalText, actions, cost } = await runAgentLoop({ key, model, tools, messages, ctx: { userId, account, triggerKey } });
+    const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
+    const output = `${finalText}${recap}`.slice(0, OUTPUT_CAP);
+    const status = finalText.startsWith("⚠") ? "error" : "success";
+
+    await fetch(rest(`routiner_runs?id=eq.${encodeURIComponent(runId)}`), {
+      method: "PATCH", headers: { ...H(), Prefer: "return=minimal" },
+      body: JSON.stringify({ status, output, messages, model, fired_at: new Date().toISOString() }),
+    }).catch(() => {});
+
+    return json({ ok: true, runId, output, cost: Number(cost.toFixed(6)), model, keySource });
+  }
+
+  // ── Fresh run ──
+  const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
   if (!allow.has(model)) return json({ ok: false, error: `Model "${model}" is not allowed. Allowed: ${[...allow].join(", ")}.` }, 400);
 
   const account = typeof body.account === "string" ? body.account : null;
@@ -322,60 +445,29 @@ Deno.serve(async (req: Request) => {
   const tools = toolSpecs(enabled);
   const toolList = enabled.size ? [...enabled].join(", ") : "none";
 
-  const system = `You are a Routiner agent instance running the model ${model}. You complete the user's task and return a clear, useful written result that will be saved to the Routiner Log for reuse.
-You have these tool capabilities: ${toolList}.
-- Use read_* tools to ground your work in the owner's real data before acting.
-- Use web_research for anything you need current facts on.
-- Use write_note to save durable notes, and find_and_save_leads to source prospects into Command.
-Take the actions the task calls for, then finish with a concise summary of what you found and did. Do not claim to have done something a tool did not confirm.`;
+  const messages: any[] = [{ role: "system", content: buildSystem(model, toolList) }, { role: "user", content: prompt }];
+  const { finalText, actions, cost, steps } = await runAgentLoop({ key, model, tools, messages, ctx: { userId, account, triggerKey } });
 
-  const messages: any[] = [{ role: "system", content: system }, { role: "user", content: prompt }];
-  const actions: string[] = [];
-  let cost = 0;
-  let steps = 0;
-  let finalText = "";
-  const started = Date.now();
-
-  for (let i = 0; i < MAX_STEPS; i++) {
-    steps = i + 1;
-    const r = await openrouter(key, model, messages, { tools });
-    cost += Number(r.usage?.cost) || 0;
-    await logUsage(model, r.usage, account, triggerKey, r.ok, r.error ?? null);
-    if (!r.ok) { finalText = `⚠ Model error on step ${steps}: ${r.error}`; break; }
-
-    const msg = r.message || {};
-    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
-    if (!toolCalls.length) { finalText = (msg.content || "").toString().trim(); break; }
-
-    // Record the assistant turn (with its tool calls), then run each tool.
-    messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls });
-    for (const tc of toolCalls) {
-      const name = tc?.function?.name || "";
-      let args: Record<string, any> = {};
-      try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
-      const result = (await runTool(name, args, { userId, key, account, triggerKey })).slice(0, TOOL_RESULT_CAP);
-      actions.push(`${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`);
-      messages.push({ role: "tool", tool_call_id: tc.id, content: result });
-    }
-    if (Date.now() - started > DEADLINE_MS) { finalText = (finalText || "Stopped: hit the time budget before a final answer.").toString(); break; }
-  }
-  if (!finalText) finalText = "Stopped after the maximum number of tool steps without a final answer.";
-
-  // Compose the full-length output stored in the Log: the result, plus a short
+  // Compose the full-length output stored in History: the result, plus a short
   // recap of the actions taken (so the run is auditable).
   const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
   const output = `${finalText}${recap}`.slice(0, OUTPUT_CAP);
 
-  // Persist the run (full-length) — the single writer for both Run-now and the
-  // scheduler, so output lands in the Log the same way regardless of trigger.
+  // Persist the run (full transcript included) — the single writer for both
+  // Run-now and the scheduler, so a run lands in History the same way regardless
+  // of trigger. return=representation so we can hand the new run id back for
+  // an immediate follow-up.
   const status = finalText.startsWith("⚠") ? "error" : "success";
   const title = (typeof body.title === "string" && body.title.trim()) ? body.title.trim() : (routineTitle || `${model} run`);
+  let newRunId: string | null = null;
   if (userId) {
-    await fetch(rest("routiner_runs"), {
-      method: "POST", headers: { ...H(), Prefer: "return=minimal" },
-      body: JSON.stringify({ user_id: userId, routine_id: routineId || null, title, status, output }),
-    }).catch(() => {});
+    const ins = await fetch(rest("routiner_runs"), {
+      method: "POST", headers: { ...H(), Prefer: "return=representation" },
+      body: JSON.stringify({ user_id: userId, routine_id: routineId || null, title, status, output,
+        messages, model, account, trigger_key: triggerKey, tools: [...enabled] }),
+    }).catch(() => null);
+    if (ins && ins.ok) { const rows = await ins.json().catch(() => []); newRunId = rows?.[0]?.id || null; }
   }
 
-  return json({ ok: true, output, steps, cost: Number(cost.toFixed(6)), model, keySource });
+  return json({ ok: true, runId: newRunId, output, steps, cost: Number(cost.toFixed(6)), model, keySource });
 });
