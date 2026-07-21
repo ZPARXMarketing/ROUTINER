@@ -191,7 +191,7 @@ function toolSpecs(enabled: Set<string>): unknown[] {
   }
   if (enabled.has("research")) {
     specs.push({ type: "function", function: { name: "web_research", description: "Run live web / deep research on a query via Perplexity and return the findings.",
-      parameters: { type: "object", required: ["query"], properties: { query: { type: "string", description: "what to research" } } } });
+      parameters: { type: "object", required: ["query"], properties: { query: { type: "string", description: "what to research" } } } } });
   }
   if (enabled.has("write")) {
     specs.push(
