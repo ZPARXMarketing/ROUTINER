@@ -31,13 +31,20 @@ create table if not exists public.routiner_routines (
 
 -- ── Run history ──────────────────────────────────────────────────────────
 create table if not exists public.routiner_runs (
-  id         uuid primary key default gen_random_uuid(),
-  user_id    uuid not null default auth.uid() references auth.users(id) on delete cascade,
-  routine_id uuid references public.routiner_routines(id) on delete set null,
-  title      text not null default '',
-  status     text not null default 'success',
-  output     text not null default '',
-  fired_at   timestamptz not null default now()
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  routine_id  uuid references public.routiner_routines(id) on delete set null,
+  title       text not null default '',
+  status      text not null default 'success',
+  output      text not null default '',
+  -- Agent runs also store the full, resumable conversation + the context to
+  -- continue it (issues #51/#52). Null for Claude-trigger + report-only rows.
+  messages    jsonb,                        -- full transcript (system/user/assistant/tool)
+  model       text,                         -- OpenRouter model id the run used
+  account     text,                         -- account id (to resolve the same key on continue)
+  trigger_key text,                         -- trigger/instance within the account
+  tools       jsonb,                        -- enabled tool groups, e.g. ["read","research","write"]
+  fired_at    timestamptz not null default now()
 );
 
 -- ── Per-user accounts + triggers (set in-app via Settings) ───────────────

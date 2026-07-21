@@ -530,8 +530,19 @@ a { color: var(--periwinkle); }
 .hist__time { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); }
 .hist__text { font-size: 13.5px; line-height: 1.55; color: var(--text-mid); margin-top: var(--sp-2); }
 .hist__text--none { color: var(--text-low); font-style: italic; }
+.hist__meta {
+  display: flex; align-items: center; gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--text-low);
+}
+.hist__open { margin-left: auto; color: var(--periwinkle); font-weight: 600; opacity: 0; transition: opacity .15s ease; }
+/* Clickable rows: a run opens into its full exchange. */
+.hist--click { cursor: pointer; transition: border-color .15s ease, transform .05s ease; }
+.hist--click:hover { border-color: var(--grey-700); }
+.hist--click:hover .hist__open { opacity: 1; }
+.hist--click:focus-visible { outline: 2px solid var(--periwinkle); outline-offset: 2px; }
 
-/* ── Log (technical record) ────────────────────── */
+/* ── Run-history filter (all / failures) ───────── */
 .log__filter { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-4); }
 
 /* ── Chat (model testing) ──────────────────────── */
@@ -568,6 +579,75 @@ a { color: var(--periwinkle); }
 .chat__compose { display: flex; gap: var(--sp-2); align-items: flex-end; }
 .chat__input { min-height: 56px; max-height: 180px; flex: 1; }
 .chat__compose .btn { flex: 0 0 auto; }
+
+/* ── Run detail modal (full exchange + continue) ── */
+/* Centered dialog (the drawer overlay justifies to the right; this one centers). */
+.overlay--modal { align-items: center; justify-content: center; padding: var(--sp-6); }
+.modal {
+  width: min(760px, 100%);
+  max-height: min(88vh, 900px);
+  background: var(--bg-surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  animation: modalIn .18s ease;
+}
+@keyframes modalIn { from { transform: translateY(10px) scale(.99); opacity: .5; } to { transform: none; opacity: 1; } }
+.modal__head {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--hairline);
+}
+.modal__title { font-family: var(--font-display); font-weight: 800; font-size: 17px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal__time { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); }
+.modal__thread {
+  flex: 1; overflow-y: auto;
+  display: flex; flex-direction: column; gap: var(--sp-3);
+  padding: var(--sp-5);
+  background: var(--bg-base);
+}
+/* The model's tool actions + their raw results, shown compactly in the thread. */
+.transcript__tool {
+  align-self: flex-start;
+  font-family: var(--font-mono); font-size: 11.5px;
+  color: var(--text-low);
+  background: var(--bg-elevated);
+  border: 1px dashed var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 2px var(--sp-2);
+}
+.transcript__res { align-self: flex-start; max-width: 100%; font-size: 12px; }
+.transcript__res summary { cursor: pointer; color: var(--text-low); font-family: var(--font-mono); }
+.transcript__res pre {
+  margin-top: var(--sp-2);
+  background: var(--bg-elevated);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: var(--sp-3);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-mid);
+}
+.modal__thread .chatmsg { max-width: 88%; }
+.modal__thread .chatmsg--bot a { color: var(--accent); text-decoration: underline; word-break: break-all; }
+.modal__thread .chatmsg--bot strong { color: var(--text-high); font-weight: 600; }
+.modal__compose {
+  display: flex; gap: var(--sp-2); align-items: flex-end;
+  padding: var(--sp-4) var(--sp-5);
+  border-top: 1px solid var(--hairline);
+  background: var(--bg-base);
+}
+.modal__compose .chat__input { min-height: 52px; }
+.modal__compose .btn { flex: 0 0 auto; }
+.modal__note {
+  padding: var(--sp-4) var(--sp-5);
+  border-top: 1px solid var(--hairline);
+  background: var(--bg-base);
+  font-size: 12.5px; color: var(--text-low);
+}
 
 /* ── Budget chip + forecast panel ──────────────── */
 .budget-chip { cursor: pointer; transition: border-color .15s ease, color .15s ease; }
