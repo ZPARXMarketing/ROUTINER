@@ -16,8 +16,11 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 //     two overlapping invocations can never both fire the same routine.
 //   • Parallel — due routines are processed with Promise.allSettled, bounded by
 //     SCHEDULER_BATCH per run so a backlog can't blow the function's wall clock.
-//   • Bounded retry — a one-off whose fire fails is re-armed with exponential
-//     backoff and gives up after MAX_RETRIES, instead of being silently lost.
+//   • Bounded retry — a one-off whose fire fails for a *transient* reason is
+//     re-armed with exponential backoff and gives up after MAX_RETRIES, instead
+//     of being silently lost. A *permanent* failure (misconfigured account /
+//     rejected token — see isPermanentError) gives up on the first failure
+//     rather than retrying an error that can never succeed (issue #48).
 //   • Grace window — a routine more than MAX_STALE_MIN past due (e.g. after
 //     scheduler downtime) is marked "missed" rather than fired, so recovery
 //     doesn't unleash a flood of stale fires.
@@ -42,7 +45,7 @@ const DEFAULT_AGENT_MODEL = "moonshotai/kimi-k2.7-code";
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
 const SCHEDULER_BATCH = num("SCHEDULER_BATCH", 50);   // max routines processed per invocation
-const MAX_RETRIES = num("SCHEDULER_MAX_RETRIES", 3);  // one-off fire retries before giving up
+const MAX_RETRIES = num("SCHEDULER_MAX_RETRIES", 1);  // transient one-off fire retries before giving up
 const RETRY_BACKOFF_MIN = num("SCHEDULER_RETRY_BACKOFF_MIN", 2); // 2,4,8… minutes
 const MAX_STALE_MIN = num("SCHEDULER_MAX_STALE_MIN", 360); // >6h past due → mark missed, don't fire
 const FIRE_TIMEOUT_MS = num("SCHEDULER_FIRE_TIMEOUT_MS", 30_000); // don't let one hung fire stall the run
@@ -319,6 +322,45 @@ async function logRun(r: Record<string, unknown>, status: string, output: string
   });
 }
 
+// A permanent failure is a misconfiguration or a rejected credential: it will
+// fail identically on every retry, so re-arming it just spams the Log with the
+// same error "over and over" (issue #48 — a mis-typed openrouter account with no
+// trigger produced 4 identical failures per routine). Detected from the fire's
+// output text, which is stable across all three fire paths (Netlify forwarder,
+// direct /fire, and the openrouter/-agent functions).
+function isPermanentError(output: string): boolean {
+  const o = (output || "").toLowerCase();
+  return (
+    o.includes("no trigger configured") ||  // account has no /fire URL or trig_ id
+    o.includes("rejected the token") ||      // annotated 401/403 on the direct path
+    o.includes("upstream 401") || o.includes("upstream 403") ||
+    (o.includes("401") && o.includes("token")) || // forwarder-shaped auth failures
+    o.includes("no 'niche'") ||              // openrouter lead-enrichment misconfig
+    o.includes("has no directions")          // openrouter-agent with an empty prompt
+  );
+}
+
+// Decide what happens to a failed one-off after a fire error, and return the
+// output annotated with the outcome. Permanent errors give up immediately;
+// transient errors back off and retry up to MAX_RETRIES. Recurring routines are
+// left untouched (their next occurrence already stands). Shared by all three
+// fire paths so retry policy stays identical everywhere.
+async function handleFireFailure(r: Record<string, any>, output: string): Promise<string> {
+  if (r.recurrence !== "none") return output;
+  if (isPermanentError(output)) {
+    return output +
+      `\n(permanent error — gave up without retrying; fix the routine's account/trigger in Settings, then re-run it)`;
+  }
+  const attempts = (r.retry_count || 0) + 1;
+  if (attempts <= MAX_RETRIES) {
+    const backoff = RETRY_BACKOFF_MIN * 2 ** (attempts - 1);
+    const retryAt = new Date(Date.now() + backoff * 60_000).toISOString();
+    await patchRow(r.id, { status: "scheduled", scheduled_at: retryAt, retry_count: attempts });
+    return output + `\n(retry ${attempts}/${MAX_RETRIES} in ${backoff} min)`;
+  }
+  return output + `\n(gave up after ${MAX_RETRIES} retries)`;
+}
+
 // Process a single due routine end to end: claim, then fire (or mark missed),
 // then retry/log. Independent per routine, so callers run these in parallel.
 async function processOne(
@@ -368,15 +410,8 @@ async function processOne(
   // env vars) only when the owner has nothing saved for this account+trigger.
   // OpenRouter-kind account: fire the enrichment engine directly, no Claude.
   if (accountKind(accounts, r.account) === "openrouter") {
-    const { status: orStatus, output: orOutput } = await fireOpenRouter(r);
-    if (orStatus === "error" && r.recurrence === "none") {
-      const attempts = (r.retry_count || 0) + 1;
-      if (attempts <= MAX_RETRIES) {
-        const backoff = RETRY_BACKOFF_MIN * 2 ** (attempts - 1);
-        const retryAt = new Date(Date.now() + backoff * 60000).toISOString();
-        await patchRow(r.id, { status: "scheduled", scheduled_at: retryAt, retry_count: attempts });
-      }
-    }
+    let { status: orStatus, output: orOutput } = await fireOpenRouter(r);
+    if (orStatus === "error") orOutput = await handleFireFailure(r, orOutput);
     await logRun(r, orStatus, orOutput);
     return orStatus;
   }
@@ -385,15 +420,8 @@ async function processOne(
   // the run row itself, so we only logRun when it was NOT persisted (a hard
   // reject before it ran) — avoids a duplicate Log entry on the happy path.
   if (accountKind(accounts, r.account) === "openrouter-agent") {
-    const { status: agStatus, output: agOutput, persisted } = await fireAgent(r, accounts);
-    if (agStatus === "error" && r.recurrence === "none") {
-      const attempts = (r.retry_count || 0) + 1;
-      if (attempts <= MAX_RETRIES) {
-        const backoff = RETRY_BACKOFF_MIN * 2 ** (attempts - 1);
-        const retryAt = new Date(Date.now() + backoff * 60000).toISOString();
-        await patchRow(r.id, { status: "scheduled", scheduled_at: retryAt, retry_count: attempts });
-      }
-    }
+    let { status: agStatus, output: agOutput, persisted } = await fireAgent(r, accounts);
+    if (agStatus === "error") agOutput = await handleFireFailure(r, agOutput);
     if (!persisted) await logRun(r, agStatus, agOutput);
     return agStatus;
   }
@@ -457,19 +485,13 @@ async function processOne(
       : String(e);
   }
 
-  if (status === "error" && r.recurrence === "none") {
-    // Bounded retry for one-offs: re-arm with exponential backoff, give up after
-    // MAX_RETRIES. (Recurring routines already have a next occurrence queued, so
-    // a single failed instance just gets logged.)
-    const attempts = (r.retry_count || 0) + 1;
-    if (attempts <= MAX_RETRIES) {
-      const backoff = RETRY_BACKOFF_MIN * 2 ** (attempts - 1);
-      const retryAt = new Date(Date.now() + backoff * 60_000).toISOString();
-      await patchRow(r.id, { status: "scheduled", scheduled_at: retryAt, retry_count: attempts });
-      output += `\n(retry ${attempts}/${MAX_RETRIES} in ${backoff} min)`;
-    } else {
-      output += `\n(gave up after ${MAX_RETRIES} retries)`;
-    }
+  if (status === "error") {
+    // Bounded retry for one-offs: transient errors back off and retry up to
+    // MAX_RETRIES; permanent errors (bad account/token) give up on the first
+    // failure so they don't retry over and over (issue #48). Recurring routines
+    // already have a next occurrence queued, so a failed instance just gets
+    // logged. All handled by the shared handleFireFailure helper.
+    output = await handleFireFailure(r, output);
   } else if (status === "success" && (r.retry_count || 0) > 0) {
     await patchRow(r.id, { retry_count: 0 }); // clear the counter after a good run
   }
