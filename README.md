@@ -1,128 +1,297 @@
 # Claude Routine Planner
 
-A Claude Code routine planner and scheduler, built on the
-[ZPARX design system](https://github.com/zparxmarketing/zparxbrand-design).
+[![Netlify Status](https://api.netlify.com/api/v1/badges/your-badge-id/deploy-status)](https://app.netlify.com/sites/zroutiner/deploys)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Built with Supabase](https://img.shields.io/badge/Built%20with-Supabase-green)](https://supabase.com)
 
-Sign in, write a prompt, and choose what happens to it. Your routines and run
-history live in **Supabase** (row-level-secured per user), so they're there on
-every device, every login. **Run now** fires your **Claude Code routine** via a
-Netlify function, passing the prompt straight into the routine's session.
+> **A powerful Claude Code routine planner and scheduler** that orchestrates AI agents to execute scheduled tasks with intelligent work delegation.
+
+Built on the [ZPARX design system](https://github.com/zparxmarketing/zparxbrand-design), Routiner lets you create, schedule, and manage AI-powered routines that run automatically across multiple Claude accounts.
+
+---
+
+## 🎯 Quick Start
+
+### For Users
+1. **Visit** [zroutiner.netlify.app](https://zroutiner.netlify.app)
+2. **Sign in** with your email/password
+3. **Create a routine** by writing a prompt
+4. **Choose an action**: Run now, Schedule, or Save to library
+
+### For Developers (Self-Hosting)
+```bash
+# 1. Clone the repository
+git clone https://github.com/zparxmarketing/zroutiner.git
+cd zroutiner
+
+# 2. Set up Supabase
+#    - Create a project at supabase.com
+#    - Run supabase/schema.sql in the SQL editor
+#    - Update credentials in js/app.js
+
+# 3. Deploy to Netlify
+#    - Connect your GitHub repo to Netlify
+#    - Set environment variables (see Setup section below)
+#    - Deploy!
+```
+
+---
+
+## 🏗️ Architecture
 
 ```
- Planner UI ──auth + CRUD──► Supabase (routiner_routines / routiner_runs)
-     │
-     └─ Run now ─► /.netlify/functions/claude-trigger ─► Claude Code routine /fire
+┌─────────────────────────────────────────────────────────────┐
+│                         Planner UI                          │
+│                   (index.html + js/app.js)                  │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+          ┌────────────────┼────────────────┐
+          │                │                │
+          ▼                ▼                ▼
+    ┌──────────┐    ┌──────────┐    ┌──────────────┐
+    │   Auth   │    │   CRUD   │    │   Run Now    │
+    │  (Sign)  │    │Operations│    │  (Trigger)   │
+    └────┬─────┘    └────┬─────┘    └──────┬───────┘
+         │               │                  │
+         └───────────────┴──────────────────┘
+                         │
+         ┌───────────────▼────────────────┐
+         │      Supabase Backend          │
+         │  (routiner_routines/runs)      │
+         │     + Row-Level Security       │
+         └───────────────┬────────────────┘
+                         │
+         ┌───────────────▼────────────────┐
+         │   Netlify Functions             │
+         │  (claude-trigger.mjs)           │
+         └───────────────┬────────────────┘
+                         │
+         ┌───────────────▼────────────────┐
+         │   Claude Code Routines         │
+         │    (Parallel Execution)        │
+         │                                │
+         │  ┌──────┐  ┌──────┐  ┌──────┐│
+         │  │ A    │  │ B    │  │ C    ││
+         │  │Agent │  │Agent │  │Agent ││
+         │  └──────┘  └──────┘  └──────┘│
+         └────────────────────────────────┘
 ```
 
-## What you can do
+---
 
-- **▶ Run now** — fires your Claude routine immediately with this prompt.
-- **⏰ Schedule** — queue a prompt for a date & time, optionally repeating
-  daily / weekdays / weekly.
-- **▣ Save to library** — park a prompt to iterate on later.
-- **⧉ Copy / Archive / Restore / Delete** — manage prompts across
-  Scheduled → Library → Archived.
-- **⚡ Test live** — optional instant preview via the Messages API (needs an
-  Anthropic key).
+## ✨ Features
 
-## Agents that delegate their own work
+### Core Capabilities
 
-Routiner isn't one assistant — it's a **swarm of scheduled Claude agents that
-split the work between them.**
+| Feature | Description |
+|---------|-------------|
+| ▶ **Run Now** | Fire your Claude routine immediately with the current prompt |
+| ⏰ **Schedule** | Queue prompts for specific dates/times with repeat options (daily/weekdays/weekly) |
+| ▣ **Save to Library** | Store prompts for later iteration and refinement |
+| ⧉ **Manage** | Copy, archive, restore, and delete prompts across states |
+| ⚡ **Test Live** | Instant preview via Messages API (requires Anthropic key) |
 
-- **Parallel routines.** Each account can have several triggers (A/B/C…) that
-  fire as **independent, simultaneous sessions**. A week's worth of work gets
-  laid out as timed Calendar blocks and executed across accounts without anyone
-  babysitting it — one Claude planning, many Claudes doing.
-- **Decomposition.** Hand a routine a big ask and it breaks it into an ordered
-  sequence of smaller blocks across the right horizon (an hour → a week), so
-  multi-step projects finish in order, on schedule.
-- **Cheap-work offload.** Inside each session the agent acts as an
-  *orchestrator*: it keeps the judgment calls and **delegates the grunt work** —
-  boilerplate, first drafts, focused coding sub-tasks — to a faster, cheaper
-  model (**GLM via OpenRouter**), reviews every line, then ships. Cheap where it
-  can be, careful where it matters.
-- **Every call metered.** Delegated calls are logged with token + dollar cost to
-  a live usage dashboard (`usage.html` / `scripts/usage-meter.mjs`), so you can
-  see exactly what your agents did and what it cost.
+### 🤖 Intelligent Agent Orchestration
 
-The OpenRouter path runs through a Supabase edge proxy (`dynamic-responder`) that
-holds the key server-side, so a fired session never needs a key of its own — it
-just calls the one-line helper:
+Routiner isn't just one assistant—it's a **coordinated swarm of scheduled Claude agents**:
+
+- **Parallel Execution** — Multiple triggers (A/B/C) fire as independent, simultaneous sessions. A week's work executes automatically across accounts without manual oversight.
+
+- **Smart Decomposition** — Complex tasks break into ordered sequences across appropriate time horizons (hour → week), ensuring multi-step projects finish in order and on schedule.
+
+- **Cost-Optimized Delegation** — The orchestrator agent handles judgment calls while delegating grunt work (boilerplate, first drafts, focused coding sub-tasks) to faster, cheaper models via **GLM through OpenRouter**, reviewing every line before shipping.
+
+- **Real-Time Usage Tracking** — Every delegated call logs token count and dollar cost to a live dashboard (`usage.html`), giving you complete visibility into agent activity and spend.
+
+---
+
+## 🔧 Setup
+
+### Prerequisites
+
+- Supabase account (free tier works)
+- Netlify account (free tier works)
+- Anthropic API key (for Claude routines)
+
+### 1️⃣ Supabase Configuration
+
+The app uses Supabase for:
+- ✅ Authentication (email/password)
+- ✅ Data storage (routines, runs, settings)
+- ✅ Row-Level Security (each user sees only their data)
+
+**Steps:**
+
+1. Create a Supabase project at [supabase.com](https://supabase.com)
+2. Open **SQL Editor** and run [`supabase/schema.sql`](supabase/schema.sql)
+3. Copy your project URL and anon key from **Settings → API**
+4. Update credentials in `js/app.js`:
+   ```javascript
+   const SUPABASE_URL = 'https://your-project.supabase.co';
+   const SUPABASE_ANON_KEY = 'your-anon-key';
+   ```
+
+**⚠️ Important:** In Supabase dashboard → **Authentication → Sign In/Providers → Email**, turn **OFF** "Confirm email" for immediate account activation (or leave ON for email verification).
+
+### 2️⃣ Netlify Deployment
+
+**Option A: One-Click Deploy**
+
+[![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start)
+
+**Option B: Manual Setup**
+
+1. Connect your GitHub repo to Netlify
+2. Build settings are auto-detected from `netlify.toml`
+3. Set environment variables (see below)
+
+**Environment Variables:**
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CLAUDE_TRIGGER` | Yes* | Routine trigger ID (`trig_...`) or full `/fire` URL |
+| `CLAUDE_TOKEN` | Yes* | Anthropic bearer token (or use `ANTHROPIC_API_KEY`) |
+| `ROUTINER_FIRE_SECRET` | Recommended | Shared secret to lock the trigger endpoint |
+| `ALLOWED_EMAILS` | Optional | Comma-separated whitelist of allowed emails |
+| `CLAUDE_ROUTINE_BETA` | Optional | Override the `anthropic-beta` header |
+
+<sub>*Can also be configured in-app under Settings</sub>
+
+**Per-Account Overrides:**
+```
+CLAUDE_TRIGGER_ZPARXMARKETING=trig_abc123...
+CLAUDE_TOKEN_ZPARXMARKETING=sk-ant-...
+```
+
+### 3️⃣ Security: Lock the Trigger Endpoint
+
+By default, the trigger function is open. Secure it:
+
+1. Set `ROUTINER_FIRE_SECRET` in Netlify environment variables (use a long random string)
+2. Set the **same** secret in Supabase → Edge Functions → `routiner-scheduler` → Secrets
+3. Optionally set `ALLOWED_EMAILS` to whitelist specific users
+
+Once configured:
+- Web app sends Supabase access token automatically
+- Scheduler authenticates with shared secret
+- Random users can't burn your tokens
+
+---
+
+## 🚀 Usage
+
+### Running Routines
+
+**Via Web UI:**
+1. Sign in at your deployed URL
+2. Click "+ New Routine"
+3. Write your prompt
+4. Choose: Run Now, Schedule, or Save to Library
+
+**Via API:**
+```bash
+curl -X POST https://your-site.netlify.app/api/claude-trigger \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_SUPABASE_TOKEN" \
+  -d '{"text": "Your prompt here"}'
+```
+
+### Delegating Work to GLM
+
+For cheap, high-volume sub-tasks, delegate to GLM:
 
 ```bash
+# Simple coding task
 node scripts/glm.mjs "Write a regex for E.164 phone numbers. Output only it."
-node scripts/glm.mjs --ping   # health check: proxy alive + spend logging works
+
+# Harder task with GLM-5
+node scripts/glm.mjs --model z-ai/glm-5 "<complex sub-task>"
+
+# Health check
+node scripts/glm.mjs --ping
 ```
 
-You set the intent; the swarm plans, splits, executes, and reports back. See
-[`CLAUDE.md`](CLAUDE.md) for the full delegation playbook.
+**Model Selection:**
+- `z-ai/glm-4.7` — Coding default (fast & cheap)
+- `z-ai/glm-5` — Harder coding tasks
+- `deepseek/deepseek-chat` — Cheapest all-rounder
+- `meta-llama/llama-3.3-70b-instruct` — Longer structured output
 
-## Setup
+> **Note:** GLM calls are proxied through Supabase Edge Functions (`dynamic-responder`) with server-side key management. Routine sessions don't need API keys.
 
-### 1. Supabase (storage + login) — already wired
+---
 
-The app points at the `zparx-dashboard` Supabase project. Tables
-`routiner_routines`, `routiner_runs`, and `routiner_settings` are created with
-row-level security so each account only sees its own rows. The publishable key
-in `js/app.js` is safe to expose (RLS does the protecting).
-
-**Forking this project?** Create your own Supabase project, open the **SQL
-editor**, and paste [`supabase/schema.sql`](supabase/schema.sql) — that builds
-every table + RLS policy in one go. Then drop your project URL and publishable
-key into `js/app.js` (and `netlify/functions/claude-trigger.mjs`).
-
-**One manual step for email + password login:** in the Supabase dashboard →
-**Authentication → Sign In / Providers → Email**, turn **off "Confirm email"**
-so accounts work immediately. (Leave it on if you'd rather confirm via an email
-link before the first sign-in.)
-
-### 2. Netlify (hosting + trigger) — already wired
-
-Hosted at **https://zroutiner.netlify.app**, auto-deploying from `main`.
-**Run now** calls `/.netlify/functions/claude-trigger`, which fires your routine
-server-side:
+## 📁 Project Structure
 
 ```
-POST https://api.anthropic.com/v1/claude_code/routines/<trigger-id>/fire
-  Authorization: Bearer <CLAUDE_TOKEN>
-  anthropic-version: 2023-06-01
-  anthropic-beta: experimental-cc-routine-2026-04-01
-  { "text": "<the routine's prompt>" }
+.
+├── index.html              # Main app UI
+├── usage.html              # Usage dashboard
+├── js/
+│   └── app.js              # Core application logic
+├── css/                    # Stylesheets
+├── netlify/
+│   └── functions/
+│       └── claude-trigger.mjs  # Serverless trigger function
+├── scripts/
+│   ├── glm.mjs             # GLM helper for work delegation
+│   └── usage-meter.mjs     # Usage tracking
+├── supabase/
+│   ├── schema.sql          # Database schema + RLS policies
+│   └── functions/
+│       └── dynamic-responder/  # OpenRouter proxy
+├── CLAUDE.md               # Agent delegation guide
+└── README.md               # This file
 ```
 
-**Easiest path — set it in the app.** Sign in, open **⚙ Settings**, and paste
-each Claude account's **trigger** + **token** under "Claude accounts". They save
-to your account (Supabase `routiner_settings`, RLS per user) and the function
-reads them server-side via your session — **no environment variables needed**.
+---
 
-**Or use Netlify env vars** (used as a fallback, and by the scheduler).
-Set these in **Netlify → Site settings → Environment variables**:
+## 🤝 Contributing
 
-| Var | Value |
-|---|---|
-| `CLAUDE_TRIGGER` | the routine trigger id (`trig_…`) or full `/fire` URL |
-| `CLAUDE_TOKEN` | your Anthropic bearer token (`ANTHROPIC_API_KEY` also works) |
-| `CLAUDE_TRIGGER_<ACCOUNT>` / `CLAUDE_TOKEN_<ACCOUNT>` | *(optional)* per-account overrides, e.g. `CLAUDE_TRIGGER_ZPARXMARKETING` |
-| `CLAUDE_ROUTINE_BETA` | *(optional)* override the `anthropic-beta` header |
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-With env vars the token stays server-side — never exposed to the browser. (The
-in-app option trades a little of that — your token lives in your RLS-protected
-Supabase row — for zero-config usability.)
+### Development
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
-### Locking the trigger to your login (recommended)
+### Testing
+- Test routines with the "Test Live" feature before scheduling
+- Use `node scripts/glm.mjs --ping` to verify GLM proxy connectivity
+- Check usage dashboard for token/cost tracking
 
-By default the trigger function is open. To require a sign-in (so randoms can't
-fire your routine and burn tokens), set:
+---
 
-| Where | Var | Value |
-|---|---|---|
-| Netlify env | `ROUTINER_FIRE_SECRET` | any long random string |
-| Supabase → Edge Functions → `routiner-scheduler` secrets | `ROUTINER_FIRE_SECRET` | **the same** string |
-| Netlify env | `ALLOWED_EMAILS` | *(optional)* comma-separated emails allowed to fire |
+## 📄 License
 
-Once `ROUTINER_FIRE_SECRET` is set on **both** sides:
-- The web app must send a valid Supabase access token (it does automatically
-  when you're signed in).
-- The scheduler authenticates with the shared secret.
-- If `ALLOWE
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 🆘 Support & Resources
+
+- **Documentation:** See [`CLAUDE.md`](CLAUDE.md) for the full agent delegation playbook
+- **Issues:** Report bugs via GitHub Issues
+- **Live Demo:** [zroutiner.netlify.app](https://zroutiner.netlify.app)
+
+---
+
+## 🎯 Roadmap
+
+- [ ] Calendar view for scheduled routines
+- [ ] Team collaboration features
+- [ ] Advanced scheduling (cron expressions)
+- [ ] More AI model integrations
+- [ ] Mobile app
+
+---
+
+<div align="center">
+
+**Built with ❤️ using Claude + Supabase + Netlify**
+
+[⬆ Back to Top](#claude-routine-planner)
+
+</div>
