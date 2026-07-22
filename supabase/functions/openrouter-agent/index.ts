@@ -66,19 +66,25 @@ const allowedModels = (): Set<string> => {
 
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
-const MAX_STEPS = num("AGENT_MAX_STEPS", 6);          // tool-loop turns before we stop
-const CODE_MAX_STEPS = num("AGENT_CODE_MAX_STEPS", 10); // coding needs read→fix→PR room
-// Coding runs need more turns to read the repo, write files, and open a PR.
+// Per-invocation step budget. Long jobs continue via auto-continue chains
+// (see MAX_AUTO_CONTINUES) so one fire can span several edge invocations.
+const MAX_STEPS = num("AGENT_MAX_STEPS", 5);
+const CODE_MAX_STEPS = num("AGENT_CODE_MAX_STEPS", 8);
 const stepBudgetFor = (enabled: Set<string>) => enabled.has("code") ? Math.max(MAX_STEPS, CODE_MAX_STEPS) : MAX_STEPS;
-const MAX_TOKENS = Math.min(num("AGENT_MAX_TOKENS", 4096), 8192);
-// Per-call cap. Keep well under the platform's ~150s response idle limit so a
-// multi-step coding run can finish and return JSON instead of an empty 502.
-const CALL_TIMEOUT_MS = num("AGENT_CALL_TIMEOUT_MS", 45_000);
-// Overall budget for the agent loop. Must leave slack to persist the run + respond
-// before Supabase kills the worker (empty gateway 502 → scheduler "agent HTTP 502").
-const DEADLINE_MS = num("AGENT_DEADLINE_MS", 110_000);
-const TOOL_RESULT_CAP = num("AGENT_TOOL_RESULT_CAP", 6000);
-const OUTPUT_CAP = num("AGENT_OUTPUT_CAP", 60_000);    // full-length, but sane
+const MAX_TOKENS = Math.min(num("AGENT_MAX_TOKENS", 3072), 8192);
+// Per-call cap. Reasoning models need headroom; still leave room for tools + save.
+const CALL_TIMEOUT_MS = num("AGENT_CALL_TIMEOUT_MS", 50_000);
+// Wall budget for ONE edge invocation. Must stay under Supabase's ~150s idle
+// limit so we can return JSON and/or spawn the next auto-continue segment.
+const DEADLINE_MS = num("AGENT_DEADLINE_MS", 100_000);
+// Smaller tool payloads → less context bloat → more steps fit before timeout.
+const TOOL_RESULT_CAP = num("AGENT_TOOL_RESULT_CAP", 3500);
+const OUTPUT_CAP = num("AGENT_OUTPUT_CAP", 60_000);
+// How many background segments after the first (total segments = 1 + this).
+// 5 × ~100s ≈ set-and-forget multi-minute jobs without blowing one request.
+const MAX_AUTO_CONTINUES = Math.min(num("AGENT_MAX_AUTO_CONTINUES", 5), 12);
+const AUTO_CONTINUE_PROMPT =
+  "[auto-continue] Resume the task from the transcript. Do NOT re-read files or re-list directories you already saw. Prefer finishing work (gh_propose_change / write tools) over exploring. When done, reply with a short final summary including any PR links — use no further tools if the work is complete.";
 
 // ── GitHub (the "code" tool group) ───────────────────────────────────────────
 // Lets a non-Claude instance read the repo, inspect PRs, and — the whole point —
@@ -604,58 +610,163 @@ async function runTool(
 // The system prompt that frames an instance. Shared by fresh runs and by the
 // reconstruction path for legacy runs that predate stored transcripts.
 function buildSystem(model: string, toolList: string): string {
-  return `You are a Routiner agent instance running the model ${model}. You complete the user's task and return a clear, useful written result that is saved to the Routiner History for reuse, and which the user can reply to to keep the conversation going.
+  return `You are a Routiner agent instance running the model ${model}. You complete the user's task fully — like a coding agent that keeps going until the job is done. Results are saved to Routiner History; the user can also reply later.
 You have these tool capabilities: ${toolList}.
-- Use read_* tools to ground your work in the owner's real data before acting.
-- Use web_research for anything you need current facts on.
-- Use write_note to save durable notes, and find_and_save_leads to source prospects into Command.
-- Use the gh_* tools to work on code: gh_read_file / gh_list_prs / gh_read_pr to understand the repo, gh_propose_change to fix code by opening a pull request (always read the current file first and send the COMPLETE new contents, never a partial diff), gh_comment_pr to explain your reasoning, and gh_merge_pr to merge when it's ready. Make small, focused, correct changes; if you're unsure a change is safe, open the PR but do not merge — say why and let the user decide.
-Take the actions the task calls for, then finish with a concise summary of what you found and did (include any PR links). If you need the user to clarify something or grant permission before acting, say so plainly and stop — they can reply and you'll pick up from there. Do not claim to have done something a tool did not confirm.`;
+
+Efficiency rules (critical — you have limited steps per segment):
+- Prefer acting over exploring. Guess correct path casing once (e.g. TODO.md not todo.md); on 404, try the obvious alternate once, then move on.
+- Do not re-read a file you already have in the transcript. Do not list "/" unless you truly don't know the layout.
+- For code fixes: read the target file(s) → gh_propose_change with COMPLETE file contents → stop tools and summarize with the PR URL.
+- One focused change set per task. Do not start a second unrelated fix in the same run.
+- Use read_* / web_research only when needed for the task. Skip them for pure code edits when the user already named the file/repo.
+- gh_merge_pr only if merge is enabled and the head is agent/*; when unsure, open the PR and stop.
+- When the work is done (PR opened, note saved, research answered), write a concise final summary and call NO more tools.
+
+Do not claim to have done something a tool did not confirm.`;
 }
 
-// Run the bounded tool-use loop over `messages` (mutated in place so the caller
-// keeps the full transcript, final assistant turn included). Returns the final
-// text, a recap of tool actions, accumulated cost, and step count.
+// Shrink old tool payloads so long runs don't blow the context window / latency.
+function compactMessages(messages: any[]): any[] {
+  const toolIdxs: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.role === "tool") toolIdxs.push(i);
+  }
+  // Keep the last 6 tool results full; older ones get truncated.
+  const keepFull = new Set(toolIdxs.slice(-6));
+  return messages.map((m, i) => {
+    if (m?.role !== "tool" || keepFull.has(i)) return m;
+    const c = String(m.content || "");
+    if (c.length <= 500) return m;
+    return { ...m, content: c.slice(0, 500) + "\n…[truncated for context]" };
+  });
+}
+
+function isBudgetStop(text: string): boolean {
+  return /time budget|maximum number of tool steps|mid-tools/i.test(text || "");
+}
+
+function isHardError(text: string): boolean {
+  return /^⚠\s*Model error/i.test(text || "");
+}
+
+
+// Persist transcript mid-run so History shows progress and auto-continue can resume.
+async function checkpointRun(
+  runId: string | null,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  if (!runId) return;
+  await fetch(rest(`routiner_runs?id=eq.${encodeURIComponent(runId)}`), {
+    method: "PATCH", headers: { ...H(), Prefer: "return=minimal" },
+    body: JSON.stringify({ ...patch, fired_at: new Date().toISOString() }),
+  }).catch(() => {});
+}
+
+// Spawn another openrouter-agent invocation on the same run (service role).
+// Uses EdgeRuntime.waitUntil when available so work continues after we respond.
+function scheduleAutoContinue(runId: string, depth: number): boolean {
+  if (!SB_URL || !SB_KEY || !runId) return false;
+  if (depth >= MAX_AUTO_CONTINUES) return false;
+  const url = `${SB_URL}/functions/v1/openrouter-agent`;
+  const work = fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      apikey: SB_KEY,
+      authorization: `Bearer ${SB_KEY}`,
+    },
+    body: JSON.stringify({
+      runId,
+      prompt: AUTO_CONTINUE_PROMPT,
+      autoContinue: true,
+      continueDepth: depth + 1,
+    }),
+  }).then(async (r) => {
+    const t = await r.text().catch(() => "");
+    if (!r.ok) console.error("auto-continue failed", r.status, t.slice(0, 200));
+  }).catch((e) => console.error("auto-continue error", e));
+
+  const ER = (globalThis as unknown as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } }).EdgeRuntime;
+  if (ER && typeof ER.waitUntil === "function") {
+    ER.waitUntil(work);
+  }
+  // If waitUntil is missing, still fire-and-forget (best effort on this platform).
+  return true;
+}
+
+type LoopResult = {
+  finalText: string;
+  actions: string[];
+  cost: number;
+  steps: number;
+  incomplete: boolean; // true → worth auto-continuing
+  openedPr: boolean;
+};
+
+// Run the bounded tool-use loop over `messages` (mutated in place).
 async function runAgentLoop(opts: {
   key: string; model: string; tools: unknown[]; messages: any[]; maxSteps?: number;
+  runId?: string | null;
   ctx: { userId: string | null; account: string | null; triggerKey: string | null; enabled: Set<string> };
-}): Promise<{ finalText: string; actions: string[]; cost: number; steps: number }> {
+}): Promise<LoopResult> {
   const { key, model, tools, messages, ctx } = opts;
+  const runId = opts.runId || null;
   const stepBudget = Math.max(1, opts.maxSteps || MAX_STEPS);
   const actions: string[] = [];
   let cost = 0, steps = 0, finalText = "";
+  let openedPr = false;
+  let incomplete = false;
   const started = Date.now();
   const hardStop = started + DEADLINE_MS;
-  // Remaining ms before we must stop and return a JSON response (avoid empty gateway 502).
   const remaining = () => Math.max(0, hardStop - Date.now());
-  // Per outbound call: never exceed CALL_TIMEOUT_MS, leave a few seconds to wrap up.
-  const callBudget = () => Math.min(CALL_TIMEOUT_MS, Math.max(5_000, remaining() - 8_000));
+  const callBudget = () => Math.min(CALL_TIMEOUT_MS, Math.max(5_000, remaining() - 10_000));
+
+  const saveProgress = async (status: string, note: string) => {
+    const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
+    await checkpointRun(runId, {
+      status,
+      output: `${note}${recap}`.slice(0, OUTPUT_CAP),
+      messages,
+    });
+  };
+
   for (let i = 0; i < stepBudget; i++) {
     steps = i + 1;
-    if (remaining() < 10_000) {
+    if (remaining() < 12_000) {
       finalText = finalText || "Stopped: hit the time budget before a final answer.";
+      incomplete = true;
       break;
     }
-    const r = await openrouter(key, model, messages, { tools, timeoutMs: callBudget() });
+
+    const forModel = compactMessages(messages);
+    // After a PR is opened, force a text-only wrap-up (no more tools).
+    const useTools = openedPr ? [] : tools;
+    const r = await openrouter(key, model, forModel, {
+      tools: useTools.length ? useTools : undefined,
+      timeoutMs: callBudget(),
+    });
     cost += Number(r.usage?.cost) || 0;
     await logUsage(model, r.usage, ctx.account, ctx.triggerKey, r.ok, r.error ?? null);
-    if (!r.ok) { finalText = `⚠ Model error on step ${steps}: ${r.error}`; break; }
+    if (!r.ok) {
+      finalText = `⚠ Model error on step ${steps}: ${r.error}`;
+      incomplete = false;
+      break;
+    }
 
     const msg = r.message || {};
     const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
-    if (!toolCalls.length) {
-      finalText = (msg.content || "").toString().trim();
-      // Keep the final answer in the transcript so it displays and so a later
-      // continuation has the model's own last turn as context.
-      messages.push({ role: "assistant", content: msg.content || "" });
+    if (!toolCalls.length || openedPr) {
+      finalText = (msg.content || "").toString().trim() || (openedPr ? "Opened a pull request (see actions)." : "");
+      messages.push({ role: "assistant", content: msg.content || finalText });
+      incomplete = false;
       break;
     }
 
-    // Record the assistant turn (with its tool calls), then run each tool.
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls });
     for (const tc of toolCalls) {
-      if (remaining() < 6_000) {
+      if (remaining() < 8_000) {
         finalText = finalText || "Stopped: hit the time budget mid-tools; partial progress is in the transcript.";
+        incomplete = true;
         break;
       }
       const name = tc?.function?.name || "";
@@ -665,16 +776,56 @@ async function runAgentLoop(opts: {
         userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled,
         timeoutMs: callBudget(),
       })).slice(0, TOOL_RESULT_CAP);
-      actions.push(`${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`);
+      const line = `${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`;
+      actions.push(line);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+      if (/opened PR #/i.test(result)) openedPr = true;
     }
-    if (finalText || remaining() < 10_000) {
-      if (!finalText) finalText = "Stopped: hit the time budget before a final answer.";
+
+    // Checkpoint after every tool batch so History stays live.
+    await saveProgress(
+      "running",
+      openedPr
+        ? "Working… pull request opened; writing summary…"
+        : `Working… step ${steps}/${stepBudget}`,
+    );
+
+    if (openedPr) {
+      // Next loop iteration will call the model with tools disabled for a final summary.
+      continue;
+    }
+    if (finalText || remaining() < 12_000) {
+      if (!finalText) {
+        finalText = "Stopped: hit the time budget before a final answer.";
+        incomplete = true;
+      }
       break;
     }
   }
-  if (!finalText) finalText = "Stopped after the maximum number of tool steps without a final answer.";
-  return { finalText, actions, cost, steps };
+
+  if (!finalText) {
+    finalText = "Stopped after the maximum number of tool steps without a final answer.";
+    incomplete = !openedPr;
+  }
+  // Budget / step stops are incomplete unless we already landed a PR and summary.
+  if (isBudgetStop(finalText) && !openedPr) incomplete = true;
+  if (openedPr && isBudgetStop(finalText)) {
+    finalText = "Opened a pull request (see actions). Summary incomplete — check the PR link in Actions.";
+    incomplete = false;
+  }
+  if (isHardError(finalText)) incomplete = false;
+
+  return { finalText, actions, cost, steps, incomplete, openedPr };
+}
+
+async function insertRunningRun(row: Record<string, unknown>): Promise<string | null> {
+  const ins = await fetch(rest("routiner_runs"), {
+    method: "POST", headers: { ...H(), Prefer: "return=representation" },
+    body: JSON.stringify(row),
+  }).catch(() => null);
+  if (!ins || !ins.ok) return null;
+  const rows = await ins.json().catch(() => []);
+  return rows?.[0]?.id || null;
 }
 
 // ── Handler ─────────────────────────────────────────────────────────────────────
@@ -706,13 +857,16 @@ async function handleRequest(req: Request): Promise<Response> {
   const runId = typeof body.runId === "string" ? body.runId.trim()
               : (typeof body.run_id === "string" ? body.run_id.trim() : "");
 
+  const continueDepth = Math.max(0, Number(body.continueDepth) || 0);
+  const isAutoContinue = body.autoContinue === true;
+
   // ── Continuation: reopen a stored run and keep the same conversation going ──
-  // The follow-up carries only { runId, prompt }; model, account, trigger and
-  // enabled tools all come from the stored run so it resumes with the same
-  // context and capabilities. Persists back onto the same row.
+  // Human reply: { runId, prompt }. Auto-continue: { runId, prompt, autoContinue, continueDepth }.
   if (runId) {
     const prompt = typeof body.prompt === "string" ? body.prompt : "";
-    if (!prompt.trim()) return json({ ok: false, error: "Missing 'prompt' (the follow-up message)." }, 400);
+    if (!prompt.trim() && !isAutoContinue) {
+      return json({ ok: false, error: "Missing 'prompt' (the follow-up message)." }, 400);
+    }
 
     let row: any = null;
     try {
@@ -730,7 +884,7 @@ async function handleRequest(req: Request): Promise<Response> {
     const account = typeof row.account === "string" ? row.account : null;
     const triggerKey = typeof row.trigger_key === "string" ? row.trigger_key : null;
     let model = typeof row.model === "string" && row.model.trim() ? row.model.trim() : DEFAULT_MODEL;
-    if (!allow.has(model)) model = DEFAULT_MODEL;             // stored model was removed from the allowlist
+    if (!allow.has(model)) model = DEFAULT_MODEL;
     const enabled = new Set<string>(
       Array.isArray(row.tools) && row.tools.length ? row.tools.filter((t: unknown) => typeof t === "string") : ["read", "research", "write"],
     );
@@ -747,31 +901,44 @@ async function handleRequest(req: Request): Promise<Response> {
     const cap = capRaw ? Number(capRaw) : 0;
     if (cap > 0) { const spent = await todaySpend(); if (spent != null && spent >= cap) return json({ ok: false, error: `Daily spend cap reached ($${spent.toFixed(4)} of $${cap.toFixed(2)}).` }, 429); }
 
-    // Seed from the stored transcript; reconstruct a minimal one for legacy runs
-    // that predate stored messages (single assistant turn = their saved output).
     let messages: any[] = Array.isArray(row.messages) && row.messages.length ? row.messages.slice() : [];
     if (!messages.length) {
       messages = [{ role: "system", content: buildSystem(model, toolList) }];
       if (row.output) messages.push({ role: "assistant", content: String(row.output) });
     } else if (messages[0]?.role !== "system") {
       messages.unshift({ role: "system", content: buildSystem(model, toolList) });
+    } else {
+      // Refresh system prompt so efficiency rules apply to old transcripts.
+      messages[0] = { role: "system", content: buildSystem(model, toolList) };
     }
-    messages.push({ role: "user", content: prompt });
+    const userTurn = (prompt.trim() || AUTO_CONTINUE_PROMPT);
+    messages.push({ role: "user", content: userTurn });
 
-    const { finalText, actions, cost } = await runAgentLoop({
-      key, model, tools, messages, maxSteps: stepBudgetFor(enabled),
+    await checkpointRun(runId, { status: "running", output: isAutoContinue ? `Continuing… (segment ${continueDepth + 1})` : "Working…" });
+
+    const { finalText, actions, cost, steps, incomplete, openedPr } = await runAgentLoop({
+      key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId,
       ctx: { userId, account, triggerKey, enabled },
     });
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
-    const output = `${finalText}${recap}`.slice(0, OUTPUT_CAP);
-    const status = finalText.startsWith("⚠") ? "error" : "success";
 
-    await fetch(rest(`routiner_runs?id=eq.${encodeURIComponent(runId)}`), {
-      method: "PATCH", headers: { ...H(), Prefer: "return=minimal" },
-      body: JSON.stringify({ status, output, messages, model, fired_at: new Date().toISOString() }),
-    }).catch(() => {});
+    let continuing = false;
+    if (incomplete && !isHardError(finalText)) {
+      continuing = scheduleAutoContinue(runId, continueDepth);
+    }
 
-    return json({ ok: true, runId, output, cost: Number(cost.toFixed(6)), model, keySource });
+    const status = isHardError(finalText) ? "error" : (continuing ? "running" : "success");
+    const note = continuing
+      ? `${finalText}\n\n_Still working in the background (auto-continue ${continueDepth + 1}/${MAX_AUTO_CONTINUES})…_`
+      : finalText;
+    const output = `${note}${recap}`.slice(0, OUTPUT_CAP);
+
+    await checkpointRun(runId, { status, output, messages, model });
+
+    return json({
+      ok: true, runId, output, steps, cost: Number(cost.toFixed(6)), model, keySource,
+      continuing, openedPr, continueDepth,
+    });
   }
 
   // ── Fresh run ──
@@ -782,7 +949,6 @@ async function handleRequest(req: Request): Promise<Response> {
   const triggerKey = typeof body.triggerKey === "string" ? body.triggerKey : (typeof body.trigger_key === "string" ? body.trigger_key : null);
   const routineId = typeof body.routineId === "string" ? body.routineId : (typeof body.routine_id === "string" ? body.routine_id : "");
 
-  // Resolve owner: prefer authenticated user, else routineId / single-tenant fallback.
   const fromRoutine = await resolveOwner(routineId);
   const userId = auth.userId || fromRoutine.userId;
   const routineTitle = fromRoutine.title;
@@ -792,7 +958,6 @@ async function handleRequest(req: Request): Promise<Response> {
   const keySource = override ? "account" : "server";
   if (!key) return json({ ok: false, error: "No OpenRouter key: set OPENROUTER_API_KEY (edge secret) or paste a key on the account." }, 500);
 
-  // Ping: cheap reachability check for the Settings "Save & test run" button.
   if (body.ping) {
     const r = await openrouter(key, model, [{ role: "user", content: "ping" }], { maxTokens: 1 });
     await logUsage(model, r.usage, account, triggerKey, r.ok, r.error ?? null);
@@ -802,7 +967,6 @@ async function handleRequest(req: Request): Promise<Response> {
   const prompt = typeof body.prompt === "string" ? body.prompt : "";
   if (!prompt.trim()) return json({ ok: false, error: "Missing 'prompt'." }, 400);
 
-  // Optional daily spend cap (fail-open if the ledger is unreadable).
   const capRaw = Deno.env.get("MAX_DAILY_SPEND");
   const cap = capRaw ? Number(capRaw) : 0;
   if (cap > 0) {
@@ -810,40 +974,62 @@ async function handleRequest(req: Request): Promise<Response> {
     if (spent != null && spent >= cap) return json({ ok: false, error: `Daily spend cap reached ($${spent.toFixed(4)} of $${cap.toFixed(2)}).` }, 429);
   }
 
-  // Solo-friendly: trust the caller's tool list once they're authenticated.
-  // Models keep free rein to open PRs when `code` is included and GITHUB_TOKEN is set.
   const enabled = new Set<string>(
     Array.isArray(body.tools) ? body.tools.filter((t: unknown) => typeof t === "string") : ["read", "research", "write"],
   );
   const tools = toolSpecs(enabled);
   const toolList = enabled.size ? [...enabled].join(", ") : "none";
+  const title = (typeof body.title === "string" && body.title.trim()) ? body.title.trim() : (routineTitle || `${model} run`);
 
   const messages: any[] = [{ role: "system", content: buildSystem(model, toolList) }, { role: "user", content: prompt }];
-  const { finalText, actions, cost, steps } = await runAgentLoop({
-    key, model, tools, messages, maxSteps: stepBudgetFor(enabled),
+
+  // Insert the run *before* the loop so History shows "running" and auto-continue can resume.
+  let newRunId: string | null = null;
+  if (userId) {
+    newRunId = await insertRunningRun({
+      user_id: userId,
+      routine_id: routineId || null,
+      title,
+      status: "running",
+      output: "Working…",
+      messages,
+      model,
+      account,
+      trigger_key: triggerKey,
+      tools: [...enabled],
+    });
+  }
+
+  const { finalText, actions, cost, steps, incomplete, openedPr } = await runAgentLoop({
+    key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId: newRunId,
     ctx: { userId, account, triggerKey, enabled },
   });
 
-  // Compose the full-length output stored in History: the result, plus a short
-  // recap of the actions taken (so the run is auditable).
   const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
-  const output = `${finalText}${recap}`.slice(0, OUTPUT_CAP);
 
-  // Persist the run (full transcript included) — the single writer for both
-  // Run-now and the scheduler, so a run lands in History the same way regardless
-  // of trigger. return=representation so we can hand the new run id back for
-  // an immediate follow-up.
-  const status = finalText.startsWith("⚠") ? "error" : "success";
-  const title = (typeof body.title === "string" && body.title.trim()) ? body.title.trim() : (routineTitle || `${model} run`);
-  let newRunId: string | null = null;
-  if (userId) {
-    const ins = await fetch(rest("routiner_runs"), {
-      method: "POST", headers: { ...H(), Prefer: "return=representation" },
-      body: JSON.stringify({ user_id: userId, routine_id: routineId || null, title, status, output,
-        messages, model, account, trigger_key: triggerKey, tools: [...enabled] }),
-    }).catch(() => null);
-    if (ins && ins.ok) { const rows = await ins.json().catch(() => []); newRunId = rows?.[0]?.id || null; }
+  let continuing = false;
+  if (newRunId && incomplete && !isHardError(finalText)) {
+    continuing = scheduleAutoContinue(newRunId, 0);
   }
 
-  return json({ ok: true, runId: newRunId, output, steps, cost: Number(cost.toFixed(6)), model, keySource });
+  const status = isHardError(finalText) ? "error" : (continuing ? "running" : "success");
+  const note = continuing
+    ? `${finalText}\n\n_Still working in the background (auto-continue 1/${MAX_AUTO_CONTINUES})…_`
+    : finalText;
+  const output = `${note}${recap}`.slice(0, OUTPUT_CAP);
+
+  if (newRunId) {
+    await checkpointRun(newRunId, { status, output, messages, model });
+  } else if (userId) {
+    // Fallback: no early id (insert failed) — try one final insert.
+    newRunId = await insertRunningRun({
+      user_id: userId, routine_id: routineId || null, title, status, output,
+      messages, model, account, trigger_key: triggerKey, tools: [...enabled],
+    });
+  }
+
+  return json({
+    ok: true, runId: newRunId, output, steps, cost: Number(cost.toFixed(6)), model, keySource,
+    continuing, openedPr, continueDepth: 0,
+  });
 }

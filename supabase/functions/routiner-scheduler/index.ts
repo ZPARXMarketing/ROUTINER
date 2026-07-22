@@ -302,8 +302,14 @@ async function fireAgent(r: Record<string, any>, accounts: unknown): Promise<{ s
           : `agent HTTP ${f.status}`);
       return { status: "error", output: String(detail).slice(0, 2000), persisted: false };
     }
-    // The function wrote the routiner_runs row (full-length); don't log again.
-    return { status: "success", output: String(data.output || "").slice(0, 2000), persisted: true };
+    // Agent persists its own run row (and may still be auto-continuing in the background).
+    const continuing = data.continuing === true;
+    const out = String(data.output || "").slice(0, 2000);
+    return {
+      status: "success",
+      output: continuing ? (out || "Agent still working in the background — check History.") : out,
+      persisted: true,
+    };
   } catch (e) {
     const output = e instanceof DOMException && e.name === "TimeoutError" ? "Agent run timed out" : String(e);
     return { status: "error", output, persisted: false };
