@@ -290,8 +290,18 @@ async function fireAgent(r: Record<string, any>, accounts: unknown): Promise<{ s
       body: JSON.stringify({ prompt: r.prompt, model, tools, account: r.account, triggerKey: r.trigger_key, routineId: r.id, title: r.title, source: "routiner-scheduler" }),
       signal: AbortSignal.timeout(150_000),
     });
-    const data = await f.json().catch(() => ({}));
-    if (!f.ok || data.ok === false) return { status: "error", output: String(data.error || `agent HTTP ${f.status}`).slice(0, 2000), persisted: false };
+    const raw = await f.text();
+    let data: any = {};
+    try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
+    if (!f.ok || data.ok === false) {
+      // Prefer the function's error field; fall back to body text so empty gateway
+      // 502/504s aren't just "agent HTTP 502" with no clue (timeouts, crashes).
+      const detail = data.error || (raw && raw.slice(0, 400)) ||
+        (f.status === 502 || f.status === 504
+          ? `agent HTTP ${f.status} (empty body — usually the edge function timed out or was killed; try a shorter prompt / fewer tools, or redeploy openrouter-agent with a tighter deadline)`
+          : `agent HTTP ${f.status}`);
+      return { status: "error", output: String(detail).slice(0, 2000), persisted: false };
+    }
     // The function wrote the routiner_runs row (full-length); don't log again.
     return { status: "success", output: String(data.output || "").slice(0, 2000), persisted: true };
   } catch (e) {

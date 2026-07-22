@@ -67,12 +67,16 @@ const allowedModels = (): Set<string> => {
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
 const MAX_STEPS = num("AGENT_MAX_STEPS", 6);          // tool-loop turns before we stop
-const CODE_MAX_STEPS = num("AGENT_CODE_MAX_STEPS", 12); // coding needs read→fix→merge room
-// Coding runs need more turns to read the repo, write files, and open/merge a PR.
+const CODE_MAX_STEPS = num("AGENT_CODE_MAX_STEPS", 10); // coding needs read→fix→PR room
+// Coding runs need more turns to read the repo, write files, and open a PR.
 const stepBudgetFor = (enabled: Set<string>) => enabled.has("code") ? Math.max(MAX_STEPS, CODE_MAX_STEPS) : MAX_STEPS;
 const MAX_TOKENS = Math.min(num("AGENT_MAX_TOKENS", 4096), 8192);
-const CALL_TIMEOUT_MS = num("AGENT_CALL_TIMEOUT_MS", 90_000);
-const DEADLINE_MS = num("AGENT_DEADLINE_MS", 130_000); // overall wall-clock budget
+// Per-call cap. Keep well under the platform's ~150s response idle limit so a
+// multi-step coding run can finish and return JSON instead of an empty 502.
+const CALL_TIMEOUT_MS = num("AGENT_CALL_TIMEOUT_MS", 45_000);
+// Overall budget for the agent loop. Must leave slack to persist the run + respond
+// before Supabase kills the worker (empty gateway 502 → scheduler "agent HTTP 502").
+const DEADLINE_MS = num("AGENT_DEADLINE_MS", 110_000);
 const TOOL_RESULT_CAP = num("AGENT_TOOL_RESULT_CAP", 6000);
 const OUTPUT_CAP = num("AGENT_OUTPUT_CAP", 60_000);    // full-length, but sane
 
@@ -107,8 +111,9 @@ const ghPath = (p: string) => String(p).replace(/^\/+/, "").split("/").map(encod
 // UTF-8-safe base64 both directions (GitHub contents API is base64).
 const b64encode = (s: string) => btoa(unescape(encodeURIComponent(s)));
 const b64decode = (s: string) => decodeURIComponent(escape(atob(String(s).replace(/\n/g, ""))));
-async function gh(method: string, path: string, body?: unknown): Promise<{ ok: boolean; status: number; data: any }> {
+async function gh(method: string, path: string, body?: unknown, timeoutMs = CALL_TIMEOUT_MS): Promise<{ ok: boolean; status: number; data: any }> {
   const token = GH_TOKEN();
+  const tMs = Math.max(3_000, Math.min(timeoutMs, CALL_TIMEOUT_MS));
   try {
     const r = await fetch(`${GH_API}${path}`, {
       method,
@@ -120,14 +125,14 @@ async function gh(method: string, path: string, body?: unknown): Promise<{ ok: b
         ...(body ? { "content-type": "application/json" } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+      signal: AbortSignal.timeout(tMs),
     });
     const text = await r.text();
     let data: any = {};
     try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
     return { ok: r.ok, status: r.status, data };
   } catch (e) {
-    const msg = e instanceof DOMException && e.name === "TimeoutError" ? `GitHub call timed out (${CALL_TIMEOUT_MS}ms)` : (e as Error).message;
+    const msg = e instanceof DOMException && e.name === "TimeoutError" ? `GitHub call timed out (${tMs}ms)` : (e as Error).message;
     return { ok: false, status: 0, data: { message: msg } };
   }
 }
@@ -252,8 +257,9 @@ async function openrouter(
   key: string,
   model: string,
   messages: unknown[],
-  opts: { tools?: unknown[]; maxTokens?: number } = {},
+  opts: { tools?: unknown[]; maxTokens?: number; timeoutMs?: number } = {},
 ): Promise<{ ok: boolean; message?: any; usage?: any; error?: string }> {
+  const tMs = Math.max(3_000, Math.min(opts.timeoutMs ?? CALL_TIMEOUT_MS, CALL_TIMEOUT_MS));
   try {
     const resp = await fetch(OPENROUTER_URL, {
       method: "POST",
@@ -270,13 +276,13 @@ async function openrouter(
         ...(opts.tools && opts.tools.length ? { tools: opts.tools, tool_choice: "auto" } : {}),
         messages,
       }),
-      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+      signal: AbortSignal.timeout(tMs),
     });
     const data = await resp.json();
     if (!resp.ok) return { ok: false, error: data?.error?.message || `OpenRouter HTTP ${resp.status}` };
     return { ok: true, message: data?.choices?.[0]?.message || {}, usage: data?.usage || null };
   } catch (e) {
-    const msg = e instanceof DOMException && e.name === "TimeoutError" ? `OpenRouter call timed out (${CALL_TIMEOUT_MS}ms)` : (e as Error).message;
+    const msg = e instanceof DOMException && e.name === "TimeoutError" ? `OpenRouter call timed out (${tMs}ms)` : (e as Error).message;
     return { ok: false, error: msg };
   }
 }
@@ -372,7 +378,7 @@ function toolSpecs(enabled: Set<string>): unknown[] {
 async function runTool(
   name: string,
   args: Record<string, any>,
-  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string> },
+  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string>; timeoutMs?: number },
 ): Promise<string> {
   const group = toolGroupOf(name);
   if (!group || !ctx.enabled.has(group)) {
@@ -382,6 +388,7 @@ async function runTool(
   if (group === "code" && !GH_TOKEN()) {
     return "error: no GITHUB_TOKEN configured on the deployment.";
   }
+  const tMs = ctx.timeoutMs ?? CALL_TIMEOUT_MS;
   const owner = ctx.userId ? `user_id=eq.${encodeURIComponent(ctx.userId)}&` : "";
   try {
     switch (name) {
@@ -405,7 +412,7 @@ async function runTool(
         if (!query) return "error: empty query";
         const r = await openrouter(ctx.key, RESEARCH_MODEL,
           [{ role: "system", content: "You are a precise research assistant. Answer with well-sourced, specific findings." }, { role: "user", content: query }],
-          { maxTokens: 2000 });
+          { maxTokens: 2000, timeoutMs: tMs });
         await logUsage(RESEARCH_MODEL, r.usage, ctx.account, ctx.triggerKey, r.ok, r.error ?? null);
         if (!r.ok) return `error: ${r.error}`;
         return (r.message?.content || "(empty)").toString();
@@ -423,13 +430,15 @@ async function runTool(
       case "find_and_save_leads": {
         const niche = String(args.niche || "").trim();
         if (!niche) return "error: missing niche";
+        // Cap enrichment wait so a single tool can't blow the whole agent budget.
+        const enrichMs = Math.min(90_000, Math.max(10_000, tMs));
         const res = await fetch(`${SB_URL}/functions/v1/lead-enrichment`, {
           method: "POST", headers: { ...H() },
           body: JSON.stringify({
             niche, location: args.location ?? null, count: Math.min(Number(args.count) || 10, 25),
             dmTitles: Array.isArray(args.dmTitles) ? args.dmTitles : [], toCommand: true, syncAbstrax: false, report: false,
           }),
-          signal: AbortSignal.timeout(150_000),
+          signal: AbortSignal.timeout(enrichMs),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || data.ok === false) return `error: ${data.error || `enrichment HTTP ${res.status}`}`;
@@ -443,7 +452,7 @@ async function runTool(
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const path = String(args.path || "").trim(); if (!path) return "error: missing path";
         const ref = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
-        const r = await gh("GET", `/repos/${repo}/contents/${ghPath(path)}${ref}`);
+        const r = await gh("GET", `/repos/${repo}/contents/${ghPath(path)}${ref}`, undefined, tMs);
         if (!r.ok) return `error: read ${path} → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
         if (Array.isArray(r.data)) return `directory ${path}:\n` + r.data.map((e: any) => `${e.type === "dir" ? "dir " : "file"}  ${e.path}`).join("\n");
         if (r.data?.encoding !== "base64") return `error: ${path} is not a readable text file.`;
@@ -453,7 +462,7 @@ async function runTool(
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const state = ["open", "closed", "all"].includes(args.state) ? args.state : "open";
-        const r = await gh("GET", `/repos/${repo}/pulls?state=${state}&per_page=20`);
+        const r = await gh("GET", `/repos/${repo}/pulls?state=${state}&per_page=20`, undefined, tMs);
         if (!r.ok) return `error: list PRs → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
         return JSON.stringify((r.data || []).map((p: any) => ({ number: p.number, title: p.title, state: p.state, head: p.head?.ref, base: p.base?.ref, draft: p.draft, url: p.html_url })));
       }
@@ -461,9 +470,9 @@ async function runTool(
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const n = Number(args.number); if (!n) return "error: missing PR number";
-        const pr = await gh("GET", `/repos/${repo}/pulls/${n}`);
+        const pr = await gh("GET", `/repos/${repo}/pulls/${n}`, undefined, tMs);
         if (!pr.ok) return `error: read PR ${n} → ${pr.status}: ${String(pr.data?.message || "").slice(0, 160)}`;
-        const files = await gh("GET", `/repos/${repo}/pulls/${n}/files?per_page=50`);
+        const files = await gh("GET", `/repos/${repo}/pulls/${n}/files?per_page=50`, undefined, tMs);
         const fileList = (files.ok && Array.isArray(files.data))
           ? files.data.map((f: any) => ({ filename: f.filename, status: f.status, additions: f.additions, deletions: f.deletions, patch: String(f.patch || "").slice(0, 2000) }))
           : [];
@@ -478,25 +487,25 @@ async function runTool(
         if (!changes.length) return "error: no changes provided (need at least one { path, content }).";
         const title = String(args.title || "").trim() || "Routiner agent change";
         let base = String(args.base || "").trim();
-        if (!base) { const meta = await gh("GET", `/repos/${repo}`); base = meta.data?.default_branch || "main"; }
-        const baseRef = await gh("GET", `/repos/${repo}/git/ref/heads/${encodeURIComponent(base)}`);
+        if (!base) { const meta = await gh("GET", `/repos/${repo}`, undefined, tMs); base = meta.data?.default_branch || "main"; }
+        const baseRef = await gh("GET", `/repos/${repo}/git/ref/heads/${encodeURIComponent(base)}`, undefined, tMs);
         if (!baseRef.ok) return `error: base branch '${base}' not found (${baseRef.status}).`;
         const baseSha = baseRef.data?.object?.sha;
         const branch = (String(args.branch || "").trim() || `agent/${Date.now().toString(36)}`).replace(/[^a-zA-Z0-9._/-]/g, "-");
-        const mk = await gh("POST", `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: baseSha });
+        const mk = await gh("POST", `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: baseSha }, tMs);
         if (!mk.ok && mk.status !== 422) return `error: create branch '${branch}' → ${mk.status}: ${String(mk.data?.message || "").slice(0, 160)}`;
         for (const c of changes) {
           const p = String(c.path || "").replace(/^\/+/, "");
-          const cur = await gh("GET", `/repos/${repo}/contents/${ghPath(p)}?ref=${encodeURIComponent(branch)}`);
+          const cur = await gh("GET", `/repos/${repo}/contents/${ghPath(p)}?ref=${encodeURIComponent(branch)}`, undefined, tMs);
           const sha = (cur.ok && !Array.isArray(cur.data)) ? cur.data.sha : undefined;
           const put = await gh("PUT", `/repos/${repo}/contents/${ghPath(p)}`, {
             message: `${title} — ${p}`, branch, content: b64encode(String(c.content ?? "")), ...(sha ? { sha } : {}),
-          });
+          }, tMs);
           if (!put.ok) return `error: write ${p} → ${put.status}: ${String(put.data?.message || "").slice(0, 160)}`;
         }
         const pr = await gh("POST", `/repos/${repo}/pulls`, {
           title, head: branch, base, body: `${String(args.body || "")}\n\n— proposed by a Routiner OpenRouter agent`.trim(),
-        });
+        }, tMs);
         if (!pr.ok) return `error: open PR → ${pr.status}: ${String(pr.data?.message || "").slice(0, 200)}`;
         return `opened PR #${pr.data.number}: ${pr.data.html_url} (branch ${branch} → ${base}, ${changes.length} file(s))`;
       }
@@ -505,7 +514,7 @@ async function runTool(
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const n = Number(args.number); if (!n) return "error: missing PR/issue number";
         const bodyText = String(args.body || "").trim(); if (!bodyText) return "error: empty comment";
-        const r = await gh("POST", `/repos/${repo}/issues/${n}/comments`, { body: bodyText });
+        const r = await gh("POST", `/repos/${repo}/issues/${n}/comments`, { body: bodyText }, tMs);
         return r.ok ? `commented on #${n}: ${r.data?.html_url || "ok"}` : `error: comment #${n} → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
       }
       case "gh_merge_pr": {
@@ -514,7 +523,7 @@ async function runTool(
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const n = Number(args.number); if (!n) return "error: missing PR number";
         const method = ["squash", "merge", "rebase"].includes(args.method) ? args.method : "squash";
-        const r = await gh("PUT", `/repos/${repo}/pulls/${n}/merge`, { merge_method: method });
+        const r = await gh("PUT", `/repos/${repo}/pulls/${n}/merge`, { merge_method: method }, tMs);
         if (!r.ok) return `error: merge #${n} → ${r.status}: ${String(r.data?.message || "").slice(0, 200)}`;
         return `merged PR #${n} (${method})${r.data?.sha ? ` — commit ${String(r.data.sha).slice(0, 7)}` : ""}.`;
       }
@@ -551,9 +560,18 @@ async function runAgentLoop(opts: {
   const actions: string[] = [];
   let cost = 0, steps = 0, finalText = "";
   const started = Date.now();
+  const hardStop = started + DEADLINE_MS;
+  // Remaining ms before we must stop and return a JSON response (avoid empty gateway 502).
+  const remaining = () => Math.max(0, hardStop - Date.now());
+  // Per outbound call: never exceed CALL_TIMEOUT_MS, leave a few seconds to wrap up.
+  const callBudget = () => Math.min(CALL_TIMEOUT_MS, Math.max(5_000, remaining() - 8_000));
   for (let i = 0; i < stepBudget; i++) {
     steps = i + 1;
-    const r = await openrouter(key, model, messages, { tools });
+    if (remaining() < 10_000) {
+      finalText = finalText || "Stopped: hit the time budget before a final answer.";
+      break;
+    }
+    const r = await openrouter(key, model, messages, { tools, timeoutMs: callBudget() });
     cost += Number(r.usage?.cost) || 0;
     await logUsage(model, r.usage, ctx.account, ctx.triggerKey, r.ok, r.error ?? null);
     if (!r.ok) { finalText = `⚠ Model error on step ${steps}: ${r.error}`; break; }
@@ -571,16 +589,24 @@ async function runAgentLoop(opts: {
     // Record the assistant turn (with its tool calls), then run each tool.
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls });
     for (const tc of toolCalls) {
+      if (remaining() < 6_000) {
+        finalText = finalText || "Stopped: hit the time budget mid-tools; partial progress is in the transcript.";
+        break;
+      }
       const name = tc?.function?.name || "";
       let args: Record<string, any> = {};
       try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
       const result = (await runTool(name, args, {
         userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled,
+        timeoutMs: callBudget(),
       })).slice(0, TOOL_RESULT_CAP);
       actions.push(`${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
     }
-    if (Date.now() - started > DEADLINE_MS) { finalText = (finalText || "Stopped: hit the time budget before a final answer.").toString(); break; }
+    if (finalText || remaining() < 10_000) {
+      if (!finalText) finalText = "Stopped: hit the time budget before a final answer.";
+      break;
+    }
   }
   if (!finalText) finalText = "Stopped after the maximum number of tool steps without a final answer.";
   return { finalText, actions, cost, steps };
@@ -588,6 +614,15 @@ async function runAgentLoop(opts: {
 
 // ── Handler ─────────────────────────────────────────────────────────────────────
 Deno.serve(async (req: Request) => {
+  try {
+    return await handleRequest(req);
+  } catch (e) {
+    // Uncaught throws become empty gateway 502s; always return JSON for the scheduler.
+    return json({ ok: false, error: `Agent crashed: ${(e as Error).message || String(e)}` }, 500);
+  }
+});
+
+async function handleRequest(req: Request): Promise<Response> {
   if (req.method === "OPTIONS") return new Response("", { status: 204, headers: cors });
   if (req.method !== "POST") return json({ ok: false, error: "Use POST." }, 405);
 
@@ -746,4 +781,4 @@ Deno.serve(async (req: Request) => {
   }
 
   return json({ ok: true, runId: newRunId, output, steps, cost: Number(cost.toFixed(6)), model, keySource });
-});
+}
