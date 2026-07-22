@@ -23,6 +23,8 @@
 //   --ping                 send a fixed health-check prompt and assert PONG
 //   --model <id>           model id (default z-ai/glm-4.7 — the coding default)
 //   --max-tokens <n>       token budget (default 1024; --ping uses 512)
+//   --reasoning <level>    low|medium|high|off|default (default low — caps GLM
+//                          hidden reasoning so max_tokens is left for the answer)
 //   --account <a>          spend-attribution account (default sparks9679)
 //   --trigger-key <k>      spend-attribution trigger  (default t_a)
 //   --stdin                read the prompt body from stdin, appended to argv text
@@ -58,6 +60,7 @@ const val = (f, d) => {
 const FLAGS_WITH_VALUE = new Set([
   "--model",
   "--max-tokens",
+  "--reasoning",
   "--account",
   "--trigger-key",
   "--url",
@@ -79,6 +82,9 @@ const opts = {
   // the whole budget on hidden reasoning tokens, returning "(empty)" (see
   // CLAUDE.md's ">=512" note). Too low a cap makes the health check flap.
   maxTokens: Number(val("--max-tokens", has("--ping") ? "512" : "1024")) || 1024,
+  // Cap hidden reasoning so max_tokens is left for the answer. "default"/"unset"
+  // omits the field (legacy proxy behavior). Forwarded as body.reasoning.
+  reasoning: val("--reasoning", "low"),
   // Attribution: honor the deployed ROUTINER_ACCOUNT/ROUTINER_TRIGGER contract
   // (the zparx env sets ROUTINER_ACCOUNT), with the older ROUTINER_GLM_* names
   // kept as fallbacks. Default trigger t_a matches the routines in the DB.
@@ -154,6 +160,9 @@ async function callProxy(prompt) {
     account: opts.account,
     trigger_key: opts.triggerKey,
     prompt,
+    // Always forward so the proxy's default and the CLI default stay aligned.
+    // "default" / "unset" tell the proxy to omit the OpenRouter field entirely.
+    reasoning: opts.reasoning,
   };
   const headers = { "Content-Type": "application/json" };
   // Forward the proxy's shared secret when the env provides one. Harmless when

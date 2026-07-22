@@ -52,6 +52,10 @@ OUT=$(node scripts/glm.mjs "Write a regex for E.164 phone numbers. Output only i
 node scripts/glm.mjs --model z-ai/glm-5 "<a genuinely hard sub-task>"   # harder
 echo "<long prompt>" | node scripts/glm.mjs                            # via stdin
 node scripts/glm.mjs --ping   # end-to-end self-test: proxy reachable + logging works
+# Reasoning control (default low — keeps GLM from burning max_tokens thinking):
+node scripts/glm.mjs --reasoning low "…"     # default
+node scripts/glm.mjs --reasoning off "…"     # disable reasoning entirely
+node scripts/glm.mjs --reasoning default "…" # omit the field (legacy behavior)
 ```
 
 **Raw curl (fallback / non-Node contexts).**
@@ -63,15 +67,18 @@ OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
   ${RESPONDER_SECRET:+-H "x-responder-secret: $RESPONDER_SECRET"} \
   -d '{"model":"z-ai/glm-4.7","max_tokens":1024,
        "account":"sparks9679","trigger_key":"t_a",
+       "reasoning":"low",
        "prompt":"<the sub-task prompt>"}' | jq -r '.content')
 # `account`/`trigger_key` are optional — they just attribute the spend in the
 # usage meter (see below). Every call is logged with its token + dollar cost.
+# `reasoning` is optional (string or object): low|medium|high|off|unset —
+# defaults to RESPONDER_REASONING_EFFORT env (default low) on the proxy.
 # The x-responder-secret header is only needed if the proxy is gated
 # (RESPONDER_SECRET edge secret set); the ${VAR:+…} expansion omits it otherwise.
 # $OUT now holds the draft — you read it, fix/verify it, then fold it into the real work.
 # Errors come back as {"ok":false,"error":"…"}; if it fails, just do the work yourself.
-# If .content is "(empty)", the model spent the budget before emitting text —
-# raise max_tokens (>=512) and/or add "Output only the answer." to the prompt.
+# If .content is "(empty)" or "(empty — hit max_tokens)", the model spent the
+# budget before emitting text — raise max_tokens and/or use reasoning:low (default).
 ```
 
 > **Heads-up (network policy):** the proxy only works if the routine session is
@@ -81,8 +88,9 @@ OUT=$(curl -s "$SUPA" -H "Content-Type: application/json" \
 
 More `glm.mjs` flags: `--stdin` (append piped text), `--json` (raw proxy
 response), `--quiet` (only the model's text), `--account`/`--trigger-key`
-(override attribution). `--ping` exits `0` only when the proxy answers `PONG`,
-`1` on proxy/network error, `2` if it answers but the assertion fails — using a
+(override attribution), `--reasoning <low|medium|high|off|default>` (default
+`low`). `--ping` exits `0` only when the proxy answers `PONG`, `1` on
+proxy/network error, `2` if it answers but the assertion fails — using a
 512-token budget so GLM's reasoning tokens don't starve the reply into "(empty)".
 
 Model picks (pass as `"model"`): `z-ai/glm-4.7` (**coding default** — fast &
@@ -92,29 +100,54 @@ cheap), `z-ai/glm-5` (harder coding / most capable), `moonshotai/kimi-k2.7-code`
 result is raw material, not a finished deliverable — you own the final output.
 
 **Field notes (measured through this proxy — trust these over the labels above
-for short offloads):** the proxy has a **hard ~45s timeout**, and `z-ai/glm-4.7`
-/ `z-ai/glm-5` are *reasoning* models whose thinking tokens consume the budget
-before any answer — on a small task with `--max-tokens 800` **both returned
-`(empty)`**, and raising the budget to fix that pushes latency toward/over the
-45s cap. So despite being the nominal "coding default", GLM is a poor fit for
-quick offloads here. A benchmark on one small coding sub-task (`isValidHexColor`):
+for short offloads):** the proxy has a **hard ~45s timeout**. Earlier failures
+where `z-ai/glm-4.7` / `z-ai/glm-5` returned `(empty)` were **reasoning-token
+starvation** (they burned `max_tokens` thinking with no `reasoning` param). The
+proxy and `glm.mjs` now default to `reasoning: low` (`{ effort:"low",
+exclude:true }`), which should leave budget for real output — **re-benchmark
+before trusting GLM again**:
+
+```bash
+node scripts/glm.mjs --model z-ai/glm-4.7 --max-tokens 800 \
+  "Write isValidHexColor in JS. Output only code."
+```
+
+A prior benchmark on one small coding sub-task (`isValidHexColor`) *without*
+reasoning control:
 
 | model | latency | cost | result |
 |-------|---------|------|--------|
 | `meta-llama/llama-3.3-70b-instruct` | ~2.2s | ~$0.00002 | ✅ correct, cleanest |
 | `deepseek/deepseek-chat` | ~4s | ~$0.00004 | ✅ correct (wraps in ``` fences — strip them) |
 | `moonshotai/kimi-k2.7-code` | ~12s | ~$0.0016 | ✅ correct, clean |
-| `z-ai/glm-4.7` | ~13s | ~$0.0014 | ✗ `(empty)` at 800 tok |
-| `z-ai/glm-5` | ~28s | ~$0.0026 | ✗ `(empty)` at 800 tok |
+| `z-ai/glm-4.7` | ~13s | ~$0.0014 | ✗ `(empty)` at 800 tok (pre–reasoning fix) |
+| `z-ai/glm-5` | ~28s | ~$0.0026 | ✗ `(empty)` at 800 tok (pre–reasoning fix) |
 
-**Practical default: reach for `deepseek/deepseek-chat` or
-`meta-llama/llama-3.3-70b-instruct` for fast, cheap, mechanical offloads.** Keep
-GLM only for sub-tasks where quality clearly justifies a large `--max-tokens`
-budget and the timeout risk. And **always review the output** — offloaded drafts
-have shipped subtle bugs (e.g. an HTML-escaper that omitted `&`); you own every
-line before it ships. (Numbers are one run; re-benchmark if models change —
-`scripts/glm.mjs --model <id> --max-tokens 800 "<task>"` and watch the stderr
-`latency ($cost)` line.)
+**Practical default for agent / reliable offloads: still prefer
+`moonshotai/kimi-k2.7-code` or `deepseek/deepseek-chat` until GLM is
+re-benchmarked with `reasoning: low`.** `meta-llama/llama-3.3-70b-instruct`
+stays a good cheap pick for mechanical text. And **always review the output** —
+offloaded drafts have shipped subtle bugs (e.g. an HTML-escaper that omitted
+`&`); you own every line before it ships.
+
+### Agent reliability knobs (edge secrets)
+
+See `docs/AGENT_RELIABILITY_PLAN.md` for the full design. After deploy, these
+optional secrets tune the agent path:
+
+| secret | default | role |
+|--------|---------|------|
+| `AGENT_REASONING_EFFORT` | `low` | OpenRouter `reasoning` on agent model calls (`low`/`medium`/`high`/`off`/`unset`) |
+| `RESPONDER_REASONING_EFFORT` | `low` | Same for `dynamic-responder` (body `reasoning` wins) |
+| `AGENT_MAX_STEPS` | `5` | Tool-loop steps per edge invocation (non-code) |
+| `AGENT_CODE_MAX_STEPS` | `12` | Tool-loop steps when the `code` tool group is enabled |
+| `AGENT_MAX_NO_PROGRESS` | `2` | Consecutive auto-continue segments with no tools/text before the chain stops with `error` |
+| `SCHEDULER_REAP_RUN_MIN` | `10` | Minutes of silence on a `status=running` row before the scheduler marks it `error` (stale-run reaper) |
+
+A run silent longer than `SCHEDULER_REAP_RUN_MIN` is auto-marked `error` (transcript
+kept); open it in History and **Retry** (or reply `continue`) to resume. The
+History UI also shows **"May have stalled"** for running rows past the same
+threshold before the reaper fires.
 
 ### Tracking spend — the usage meter
 
@@ -149,6 +182,8 @@ balance via `/api/v1/key`, key-side so it never leaves Supabase):
 > - `ALLOWED_MODELS` — comma-separated allowlist that replaces the built-in one
 >   (the documented GLM/DeepSeek/Kimi/Llama set + `openrouter/auto`). Requests
 >   for any other model are rejected 400.
+> - `RESPONDER_REASONING_EFFORT` — default `low`. Caps GLM hidden reasoning so
+>   `max_tokens` is left for the answer; body field `reasoning` overrides.
 
 ## If you're a routine session, or asked to "process the board" / "plan" / "schedule work"
 
@@ -231,10 +266,19 @@ to send the **complete** new file contents, never a partial diff.
 - `AGENT_ALLOW_MERGE` *(optional)* — set to `true` to let `gh_merge_pr` actually
   merge. **Off by default**: until you set it, the agent opens PRs for you to
   review and merge, and merging returns a clear "disabled" message.
+- `AGENT_MAX_STEPS` *(optional, default 5)* — tool-loop steps per edge
+  invocation when the `code` group is **not** enabled.
 - `AGENT_CODE_MAX_STEPS` *(optional, default 12)* — coding runs get a bigger
-  tool-loop budget than the 6-step default so read→fix→open→merge fits.
+  tool-loop budget so read→fix→open→merge fits in one (or a few) segments.
+- `AGENT_REASONING_EFFORT` *(optional, default `low`)* — OpenRouter reasoning
+  control for agent model calls; keeps GLM from returning `(empty)`.
+- `AGENT_MAX_NO_PROGRESS` *(optional, default 2)* — stop auto-continue after
+  this many consecutive segments with no tool use and no real text.
+- `SCHEDULER_REAP_RUN_MIN` *(optional, default 10)* — minutes of silence before
+  the scheduler reaper marks a stuck `running` row as `error` (resumable).
 
-Then redeploy: `supabase functions deploy openrouter-agent`.
+Then redeploy: `supabase functions deploy openrouter-agent dynamic-responder
+routiner-scheduler` (edge functions do not auto-deploy from git).
 
 **Use it:** in the app, add an **OpenRouter agent** account, pick a coding model
 (Kimi K2.7 Code is the default and a good, cheap fit), check **Fix code

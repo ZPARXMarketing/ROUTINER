@@ -1,10 +1,11 @@
 # Agent Reliability Plan — fixing timeouts, "(empty)" runs, and runs that never end
 
-**Status: plan only — not yet implemented.** This is the agreed fix design for
-the OpenRouter agent problems: GLM-class models time out or return `(empty)`
-and accomplish nothing, and runs appear to "keep going forever" in History.
-Once landed, agent runs either finish or fail honestly within minutes — the
-prerequisite for letting the code-capable agents fix things themselves.
+**Status: implemented** on `claude/agent-timeout-performance-omk9vl`. This is
+the agreed fix design for the OpenRouter agent problems: GLM-class models time
+out or return `(empty)` and accomplish nothing, and runs appear to "keep going
+forever" in History. Once deployed (`openrouter-agent`, `dynamic-responder`,
+`routiner-scheduler`), agent runs either finish or fail honestly within minutes
+— the prerequisite for letting the code-capable agents fix things themselves.
 
 ## Root causes (verified in the source)
 

@@ -938,6 +938,14 @@ const FRIENDLY_STATUS = {
   success: 'Completed', ran: 'Ran', dryrun: 'Test run', running: 'Still working',
   error: 'Had a problem', missed: 'Missed its time',
 };
+// Client-side mirror of SCHEDULER_REAP_RUN_MIN (10 min). A running row quieter
+// than this is almost certainly a dead edge invocation; show "May have stalled"
+// until the scheduler reaper flips it to error.
+const RUN_STALE_MS = 10 * 60 * 1000;
+const RETRY_PROMPT = '[retry] Resume the task from the transcript and finish it.';
+function isRunStale(it) {
+  return !!(it && it.status === 'running' && it.time && (Date.now() - new Date(it.time).getTime()) > RUN_STALE_MS);
+}
 /* Strip an output down to readable prose: drop code blocks, URLs, markdown
    syntax and JSON noise, keep the sentences. */
 function friendlyText(raw) {
@@ -975,16 +983,19 @@ function renderHistory() {
   const row = (it) => {
     const ok = !(it.status === 'error' || it.status === 'missed');
     const busy = it.status === 'running';
+    const stale = isRunStale(it);
     const text = friendlyText(it.output);
     const can = isContinuable(it);
+    const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status);
+    const statusClass = stale ? 'is-warn' : (busy ? 'is-busy' : (ok ? 'is-ok' : 'is-bad'));
     const meta = [
       it.model ? modelLabel(it.model) : '',
-      busy ? 'Working in background…' : (can ? 'Reply to continue' : ''),
+      stale ? 'Open to retry' : (busy ? 'Working in background…' : (can ? 'Reply to continue' : '')),
     ].filter(Boolean).join(' · ');
-    return `<div class="hist hist--click ${ok ? '' : 'hist--bad'}${busy ? ' hist--busy' : ''}" data-hist="${esc(it.id)}" role="button" tabindex="0">
+    return `<div class="hist hist--click ${ok ? '' : 'hist--bad'}${busy ? ' hist--busy' : ''}${stale ? ' hist--stale' : ''}" data-hist="${esc(it.id)}" role="button" tabindex="0">
       <div class="hist__head">
         <span class="hist__title">${esc(it.title || 'Untitled')}</span>
-        <span class="hist__status ${busy ? 'is-busy' : (ok ? 'is-ok' : 'is-bad')}">${esc(FRIENDLY_STATUS[it.status] || it.status)}</span>
+        <span class="hist__status ${statusClass}">${esc(statusLabel)}</span>
         <span class="hist__time">${it.time ? fmt(it.time) : ''}</span>
       </div>
       ${text ? `<p class="hist__text">${esc(text)}</p>` : `<p class="hist__text hist__text--none">No summary was returned for this run — open it for the full details.</p>`}
@@ -1039,7 +1050,6 @@ function transcriptTurns(it) {
 }
 
 function runModalHtml(it) {
-  const ok = !(it.status === 'error' || it.status === 'missed');
   const turns = transcriptTurns(it);
   const bubbles = turns.map((t) => {
     if (t.kind === 'user') return `<div class="chatmsg chatmsg--user">${esc(t.content)}</div>`;
@@ -1048,15 +1058,23 @@ function runModalHtml(it) {
     return `<div class="chatmsg chatmsg--bot">${renderRunBody(t.content)}</div>`;
   }).join('') || `<div class="empty"><h3>Nothing was recorded</h3><p>This run has no saved output.</p></div>`;
   const can = isContinuable(it);
+  const stale = isRunStale(it);
+  // Retry: error runs + stale "running" rows — same continue path, fixed prompt.
+  const showRetry = can && !runModalBusy && (it.status === 'error' || stale);
+  const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status || 'ran');
+  const chipStatus = stale ? 'missed' : (it.status || 'ran'); // warning-ish chip for stale
   const compose = can
     ? `<div class="modal__compose">
         <textarea class="textarea chat__input" id="run-input" placeholder="Reply to the model — answer its question, grant permission, or ask for more… (Enter to send)" ${runModalBusy ? 'disabled' : ''}></textarea>
-        <button class="btn btn--primary" id="run-send" ${runModalBusy ? 'disabled' : ''}>Send</button>
+        <div class="modal__compose-actions">
+          ${showRetry ? `<button class="btn btn--secondary" id="run-retry" type="button">Retry</button>` : ''}
+          <button class="btn btn--primary" id="run-send" ${runModalBusy ? 'disabled' : ''}>Send</button>
+        </div>
       </div>`
     : `<div class="modal__note">This run isn't an interactive model chat, so it can't be continued here — it's shown for the record.</div>`;
   return `<div class="modal">
     <div class="modal__head">
-      <span class="chip chip--${esc(it.status || 'ran')}">${esc(FRIENDLY_STATUS[it.status] || it.status || 'ran')}</span>
+      <span class="chip chip--${esc(chipStatus)}">${esc(statusLabel)}</span>
       <h2 class="modal__title">${esc(it.title || 'Untitled')}</h2>
       <span class="modal__time">${it.time ? fmt(it.time) : ''}</span>
       <button class="drawer__close" id="run-close" aria-label="Close">×</button>
@@ -1091,6 +1109,8 @@ function openRunModal(it) {
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
     if (!runModalBusy) setTimeout(() => input.focus(), 30);
   }
+  // One-click resume: same agentPost path as a normal reply (simple-CORS text/plain).
+  $('#run-retry', ov)?.addEventListener('click', () => continueRun(it, RETRY_PROMPT));
 }
 function closeRunModal() { runModalId = null; $('#runOverlay')?.classList.remove('is-open'); }
 // Re-open the currently-open run from fresh data (after a follow-up round-trips).

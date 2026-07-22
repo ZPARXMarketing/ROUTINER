@@ -523,11 +523,15 @@ a { color: var(--periwinkle); }
   padding: var(--sp-3) var(--sp-4);
 }
 .hist--bad { border-left-color: var(--danger); }
+.hist--stale { border-left-color: var(--yellow); }
+.hist--busy .hist__status.is-busy { color: var(--periwinkle); }
 .hist__head { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
 .hist__title { font-family: var(--font-display); font-weight: 600; font-size: 15px; flex: 1; }
 .hist__status { font-size: 12px; font-weight: 700; }
 .hist__status.is-ok { color: var(--lime); }
 .hist__status.is-bad { color: var(--danger); }
+.hist__status.is-warn { color: var(--yellow); }
+.hist__status.is-busy { color: var(--periwinkle); }
 .hist__time { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); }
 .hist__text { font-size: 13.5px; line-height: 1.55; color: var(--text-mid); margin-top: var(--sp-2); }
 .hist__text--none { color: var(--text-low); font-style: italic; }
@@ -641,8 +645,9 @@ a { color: var(--periwinkle); }
   border-top: 1px solid var(--hairline);
   background: var(--bg-base);
 }
-.modal__compose .chat__input { min-height: 52px; }
+.modal__compose .chat__input { min-height: 52px; flex: 1; }
 .modal__compose .btn { flex: 0 0 auto; }
+.modal__compose-actions { display: flex; gap: var(--sp-2); flex: 0 0 auto; align-items: flex-end; }
 .modal__note {
   padding: var(--sp-4) var(--sp-5);
   border-top: 1px solid var(--hairline);

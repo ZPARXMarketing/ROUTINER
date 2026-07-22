@@ -49,6 +49,11 @@ const MAX_RETRIES = num("SCHEDULER_MAX_RETRIES", 1);  // transient one-off fire 
 const RETRY_BACKOFF_MIN = num("SCHEDULER_RETRY_BACKOFF_MIN", 2); // 2,4,8… minutes
 const MAX_STALE_MIN = num("SCHEDULER_MAX_STALE_MIN", 360); // >6h past due → mark missed, don't fire
 const FIRE_TIMEOUT_MS = num("SCHEDULER_FIRE_TIMEOUT_MS", 30_000); // don't let one hung fire stall the run
+// Agent runs insert status=running and bump fired_at each checkpoint (~≤3 min while alive).
+// Silent longer than this → edge function died mid-flight; flip to error so History is honest.
+const REAP_RUN_MIN = num("SCHEDULER_REAP_RUN_MIN", 10);
+const REAP_DIED_MSG =
+  "⚠ Run died mid-flight — the edge function was killed before it could finish. Partial progress is saved; open this run and Retry (or reply 'continue') to resume.";
 
 // Anthropic headers for firing a routine /fire directly (same values the Netlify
 // forwarder uses). Lets the scheduler fire with the owner's in-app token instead
@@ -338,6 +343,52 @@ async function logRun(r: Record<string, unknown>, status: string, output: string
   });
 }
 
+// Mark agent runs that stayed status=running with no fired_at bump for REAP_RUN_MIN
+// as error. Only openrouter-agent writes status=running (scheduler logRun writes
+// success/error/missed), so this cannot touch Claude-trigger rows. Does not auto-
+// resume — wall-clock death often means the model was timing out; UI Retry resumes.
+async function reapStaleRuns(): Promise<number> {
+  const cutoff = new Date(Date.now() - REAP_RUN_MIN * 60_000).toISOString();
+  let rows: Array<{ id: string; title?: string; output?: string }> = [];
+  try {
+    const res = await fetch(
+      rest(
+        `routiner_runs?status=eq.running&fired_at=lt.${encodeURIComponent(cutoff)}` +
+          `&select=id,title,output&order=fired_at.asc&limit=20`,
+      ),
+      { headers: dbHeaders },
+    );
+    if (!res.ok) return 0;
+    rows = await res.json();
+  } catch {
+    return 0;
+  }
+  if (!Array.isArray(rows) || !rows.length) return 0;
+
+  let n = 0;
+  for (const row of rows) {
+    const prev = String(row.output || "");
+    // Agent rows can hold up to ~60k of output; keep partial progress when prepending.
+    const output = (REAP_DIED_MSG + (prev ? "\n\n" + prev : "")).slice(0, 60_000);
+    // Conditional PATCH — same atomic-claim pattern as processOne: only flips if
+    // the row is still running and still past the cutoff (a live checkpoint can win).
+    const claimUrl = rest(
+      `routiner_runs?id=eq.${encodeURIComponent(row.id)}` +
+        `&status=eq.running&fired_at=lt.${encodeURIComponent(cutoff)}`,
+    );
+    try {
+      const res = await fetch(claimUrl, {
+        method: "PATCH",
+        headers: { ...dbHeaders, Prefer: "return=representation" },
+        body: JSON.stringify({ status: "error", output }),
+      });
+      const claimed = res.ok ? await res.json().catch(() => []) : [];
+      if (Array.isArray(claimed) && claimed.length > 0) n++;
+    } catch { /* next row */ }
+  }
+  return n;
+}
+
 // A permanent failure is a misconfiguration or a rejected credential: it will
 // fail identically on every retry, so re-arming it just spams the Log with the
 // same error "over and over" (issue #48 — a mis-typed openrouter account with no
@@ -517,6 +568,14 @@ async function processOne(
 }
 
 Deno.serve(async () => {
+  // Reap stuck agent runs first (never block routine firing if this fails).
+  let reaped = 0;
+  try {
+    reaped = await reapStaleRuns();
+  } catch (e) {
+    console.error("reapStaleRuns failed", e);
+  }
+
   const nowIso = new Date().toISOString();
   const dueRes = await fetch(
     rest(
@@ -527,7 +586,7 @@ Deno.serve(async () => {
   );
   if (!dueRes.ok) {
     return new Response(
-      JSON.stringify({ ok: false, error: `query ${dueRes.status}` }),
+      JSON.stringify({ ok: false, error: `query ${dueRes.status}`, reaped }),
       { status: 500, headers: { "Content-Type": "application/json" } },
     );
   }
@@ -573,7 +632,7 @@ Deno.serve(async () => {
   }));
   const fired = results.filter((r) => r.status === "success").length;
 
-  return new Response(JSON.stringify({ ok: true, due: due.length, fired, results }), {
+  return new Response(JSON.stringify({ ok: true, due: due.length, fired, reaped, results }), {
     headers: { "Content-Type": "application/json" },
   });
 });
