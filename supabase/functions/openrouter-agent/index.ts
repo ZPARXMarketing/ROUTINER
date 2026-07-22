@@ -55,8 +55,8 @@ const AGENT_DEFAULT_ALLOWED = [
   "openrouter/auto",
   "openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna",
   "google/gemini-3.1-pro-preview", "google/gemini-3.5-flash", "google/gemini-3-flash-preview",
-  "deepseek/deepseek-chat", "moonshotai/kimi-k2.7-code",
-  "meta-llama/llama-3.3-70b-instruct", "z-ai/glm-4.7", "z-ai/glm-5",
+  "deepseek/deepseek-chat", "moonshotai/kimi-k2.7-code", "moonshotai/kimi-k3",
+  "meta-llama/llama-3.3-70b-instruct", "z-ai/glm-4.7", "z-ai/glm-5", "z-ai/glm-5.2",
 ];
 const allowedModels = (): Set<string> => {
   const raw = Deno.env.get("AGENT_ALLOWED_MODELS");
