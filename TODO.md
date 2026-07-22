@@ -44,25 +44,25 @@ Related code: `supabase/functions/openrouter-agent/index.ts`, `js/app.js` (`agen
 
 ### Write surface
 
-- [ ] **Path policy for `gh_propose_change`**
-  - Deny (or require an explicit “dangerous paths” override): `.github/**`, env/secret-like paths, other high-risk globs.
-  - Cap number of files and total bytes per propose call.
+- [x] **Path policy for `gh_propose_change`** *(shipped — awaiting merge/deploy)*
+  - Blocks `.github/**`, `.env*`, key/cert and credential-like paths; rejects `..` segments.
+  - Caps files per PR (`AGENT_GH_MAX_FILES`, default 10) and chars per file (`AGENT_GH_MAX_FILE_CHARS`, default 400k).
 
-- [ ] **Safer branch handling**
-  - Force branch prefix e.g. `agent/<runId>/…`.
-  - On branch create `422`, **fail** unless the branch was created by this run (do not silently write onto existing branches).
-  - Refuse `base` outside the configured default branch unless explicitly allowlisted.
+- [x] **Safer branch handling** *(shipped — awaiting merge/deploy)*
+  - Forces `agent/` branch prefix via `normalizeAgentBranch`.
+  - On create `422`, **fails** (no silent overwrite of existing branches).
+  - Base branch must be the repo **default** branch only.
 
-- [ ] **Safer merge (`gh_merge_pr`)**
-  - Keep `AGENT_ALLOW_MERGE` **off** by default (already).
-  - If enabled: only merge PRs whose head matches `agent/*`, opened by this PAT, and optionally green checks / max diff size.
-  - Prefer never auto-merging from untrusted prompt/issue content without a human gate.
+- [x] **Safer merge (`gh_merge_pr`)** *(shipped — awaiting merge/deploy)*
+  - `AGENT_ALLOW_MERGE` still **off** by default.
+  - When enabled: only merges PRs whose head ref starts with `agent/` and is open.
+  - Still no CI-green check (GitHub branch protection remains the backstop).
 
 ### Defaults & product
 
-- [ ] **Default tools: `code` off**
-  - New OpenRouter agent instances should not enable “Fix code (GitHub)” by default (`NEW_AGENT_ACCOUNT` / `AGENT_TOOL_IDS` defaults).
-  - Require explicit enable; optional second confirmation in Settings when `GITHUB_TOKEN` is present.
+- [x] **Default tools: `code` off** *(shipped — awaiting merge/deploy)*
+  - New agent accounts/instances default to `DEFAULT_AGENT_TOOLS` (read/research/write only).
+  - Explicit Settings checkbox still enables GitHub when you want PRs.
 
 ---
 

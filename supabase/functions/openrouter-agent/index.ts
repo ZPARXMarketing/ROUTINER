@@ -89,6 +89,9 @@ const GH_API = "https://api.github.com";
 const GH_TOKEN = () => Deno.env.get("GITHUB_TOKEN") || Deno.env.get("GH_TOKEN") || "";
 const GH_DEFAULT_REPO = () => (Deno.env.get("GITHUB_REPO") || "").trim();
 const GH_ALLOW_MERGE = () => /^(1|true|yes|on)$/i.test(Deno.env.get("AGENT_ALLOW_MERGE") || "");
+// Caps on agent writes (gh_propose_change) — keep PRs reviewable and limit blast radius.
+const GH_MAX_FILES = Math.min(num("AGENT_GH_MAX_FILES", 10), 30);
+const GH_MAX_FILE_CHARS = Math.min(num("AGENT_GH_MAX_FILE_CHARS", 400_000), 1_000_000);
 // null = "only the default repo is allowed"; a set = that explicit allowlist.
 const ghAllowedRepos = (): Set<string> | null => {
   const raw = Deno.env.get("GITHUB_ALLOWED_REPOS");
@@ -106,6 +109,34 @@ function resolveRepo(arg?: unknown): { repo?: string; error?: string } {
   if (allow) { if (!allow.has(want.toLowerCase())) return { error: `repo '${want}' is not in GITHUB_ALLOWED_REPOS.` }; }
   else if (def && want.toLowerCase() !== def.toLowerCase()) return { error: `repo '${want}' not allowed (only '${def}'); set GITHUB_ALLOWED_REPOS to widen.` };
   return { repo: want };
+}
+// Block high-risk write paths (CI secrets exfil, env keys, credential dumps). Reads stay open.
+function deniedWritePath(rawPath: string): string | null {
+  const path = String(rawPath || "").replace(/^\/+/, "").replace(/\\/g, "/");
+  if (!path || path.split("/").some((seg) => seg === ".." || seg === "")) {
+    return "invalid path (empty segment or '..' not allowed)";
+  }
+  const lower = path.toLowerCase();
+  if (lower === ".github" || lower.startsWith(".github/")) {
+    return "writes under .github/ are blocked (workflows can exfiltrate secrets)";
+  }
+  if (/(^|\/)\.env($|\.|\/)/.test(lower) || lower.endsWith(".env")) {
+    return ".env files are blocked";
+  }
+  if (/\.(pem|key|p12|pfx|jks)$/i.test(path)) return "key/cert files are blocked";
+  if (/(^|\/)(id_rsa|id_ed25519|id_ecdsa|credentials\.json|service[-_]?account)/i.test(path)) {
+    return "credential-like files are blocked";
+  }
+  return null;
+}
+// Agent branches must live under agent/ so merges can't target arbitrary long-lived branches.
+function normalizeAgentBranch(raw: string): string {
+  let b = String(raw || "").trim().replace(/[^a-zA-Z0-9._/-]/g, "-");
+  if (!b || b.includes("..")) b = `agent/${Date.now().toString(36)}`;
+  if (!b.startsWith("agent/")) b = `agent/${b}`;
+  // Collapse accidental agent/agent/…
+  b = b.replace(/^(agent\/)+/, "agent/");
+  return b.slice(0, 200);
 }
 const ghPath = (p: string) => String(p).replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/");
 // UTF-8-safe base64 both directions (GitHub contents API is base64).
@@ -485,17 +516,41 @@ async function runTool(
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const changes = Array.isArray(args.changes) ? args.changes.filter((c: any) => c && c.path) : [];
         if (!changes.length) return "error: no changes provided (need at least one { path, content }).";
+        if (changes.length > GH_MAX_FILES) {
+          return `error: too many files (${changes.length}); max is ${GH_MAX_FILES} per PR. Split the work.`;
+        }
+        for (const c of changes) {
+          const p = String(c.path || "").replace(/^\/+/, "").replace(/\\/g, "/");
+          const deny = deniedWritePath(p);
+          if (deny) return `error: blocked path '${p}': ${deny}`;
+          const content = String(c.content ?? "");
+          if (content.length > GH_MAX_FILE_CHARS) {
+            return `error: '${p}' is too large (${content.length} chars); max is ${GH_MAX_FILE_CHARS}.`;
+          }
+        }
         const title = String(args.title || "").trim() || "Routiner agent change";
-        let base = String(args.base || "").trim();
-        if (!base) { const meta = await gh("GET", `/repos/${repo}`, undefined, tMs); base = meta.data?.default_branch || "main"; }
+        // Resolve default branch; only allow PRs targeting that branch (not release/* etc.).
+        const meta = await gh("GET", `/repos/${repo}`, undefined, tMs);
+        const defaultBranch = (meta.ok && meta.data?.default_branch) ? String(meta.data.default_branch) : "main";
+        let base = String(args.base || "").trim() || defaultBranch;
+        if (base.toLowerCase() !== defaultBranch.toLowerCase()) {
+          return `error: base branch must be the repo default ('${defaultBranch}'); got '${base}'.`;
+        }
+        base = defaultBranch; // use canonical casing from GitHub
         const baseRef = await gh("GET", `/repos/${repo}/git/ref/heads/${encodeURIComponent(base)}`, undefined, tMs);
         if (!baseRef.ok) return `error: base branch '${base}' not found (${baseRef.status}).`;
         const baseSha = baseRef.data?.object?.sha;
-        const branch = (String(args.branch || "").trim() || `agent/${Date.now().toString(36)}`).replace(/[^a-zA-Z0-9._/-]/g, "-");
+        // Always under agent/; never silently write onto a pre-existing branch (422).
+        const branch = normalizeAgentBranch(String(args.branch || "").trim() || `agent/${Date.now().toString(36)}`);
         const mk = await gh("POST", `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: baseSha }, tMs);
-        if (!mk.ok && mk.status !== 422) return `error: create branch '${branch}' → ${mk.status}: ${String(mk.data?.message || "").slice(0, 160)}`;
+        if (!mk.ok) {
+          if (mk.status === 422) {
+            return `error: branch '${branch}' already exists — pick a new name (or omit branch for an auto name). Refusing to overwrite.`;
+          }
+          return `error: create branch '${branch}' → ${mk.status}: ${String(mk.data?.message || "").slice(0, 160)}`;
+        }
         for (const c of changes) {
-          const p = String(c.path || "").replace(/^\/+/, "");
+          const p = String(c.path || "").replace(/^\/+/, "").replace(/\\/g, "/");
           const cur = await gh("GET", `/repos/${repo}/contents/${ghPath(p)}?ref=${encodeURIComponent(branch)}`, undefined, tMs);
           const sha = (cur.ok && !Array.isArray(cur.data)) ? cur.data.sha : undefined;
           const put = await gh("PUT", `/repos/${repo}/contents/${ghPath(p)}`, {
@@ -522,6 +577,16 @@ async function runTool(
         if (!GH_ALLOW_MERGE()) return "error: merging is disabled. Set the AGENT_ALLOW_MERGE edge secret to 'true' to allow it.";
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const n = Number(args.number); if (!n) return "error: missing PR number";
+        // Only merge agent-created branches — never an arbitrary open PR in the repo.
+        const prMeta = await gh("GET", `/repos/${repo}/pulls/${n}`, undefined, tMs);
+        if (!prMeta.ok) return `error: read PR #${n} → ${prMeta.status}: ${String(prMeta.data?.message || "").slice(0, 160)}`;
+        const headRef = String(prMeta.data?.head?.ref || "");
+        if (!headRef.startsWith("agent/")) {
+          return `error: can only merge PRs whose head branch starts with 'agent/' (PR #${n} head is '${headRef || "?"}'). Open a new agent PR or merge manually.`;
+        }
+        if (prMeta.data?.state && prMeta.data.state !== "open") {
+          return `error: PR #${n} is not open (state: ${prMeta.data.state}).`;
+        }
         const method = ["squash", "merge", "rebase"].includes(args.method) ? args.method : "squash";
         const r = await gh("PUT", `/repos/${repo}/pulls/${n}/merge`, { merge_method: method }, tMs);
         if (!r.ok) return `error: merge #${n} → ${r.status}: ${String(r.data?.message || "").slice(0, 200)}`;
