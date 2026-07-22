@@ -141,6 +141,9 @@ After deploy, these optional secrets tune the agent path:
 | `AGENT_MAX_STEPS` | `5` | Tool-loop steps per edge invocation (non-code) |
 | `AGENT_CODE_MAX_STEPS` | `12` | Tool-loop steps when the `code` tool group is enabled |
 | `AGENT_MAX_NO_PROGRESS` | `2` | Consecutive auto-continue segments with no tools/text before the chain stops with `error` |
+| `AGENT_TOOL_RESULT_CAP` | `8000` | Max chars returned for non-file tool results |
+| `AGENT_GH_READ_RESULT_CAP` | `120000` | Max chars for a single `gh_read_file` window (was 3500 and made agents claim files were too large) |
+| `AGENT_GH_READ_DEFAULT_LINES` | `400` | Line window when auto-paging or when only `start_line` is set |
 | `SCHEDULER_REAP_RUN_MIN` | `10` | Minutes of silence on a `status=running` row before the scheduler marks it `error` (stale-run reaper) |
 
 A run silent longer than `SCHEDULER_REAP_RUN_MIN` is auto-marked `error` (transcript
@@ -273,11 +276,13 @@ to send the **complete** new file contents, never a partial diff.
   control for agent model calls; keeps GLM from returning `(empty)`.
 - `AGENT_MAX_NO_PROGRESS` *(optional, default 2)* — stop auto-continue after
   this many consecutive segments with no tool use and no real text.
+- `AGENT_GH_READ_RESULT_CAP` *(optional, default 120000)* — max chars per
+  `gh_read_file` result. Large files auto-page; pass `start_line`/`max_lines`.
 - `SCHEDULER_REAP_RUN_MIN` *(optional, default 10)* — minutes of silence before
   the scheduler reaper marks a stuck `running` row as `error` (resumable).
 
-Then redeploy: `supabase functions deploy openrouter-agent dynamic-responder
-routiner-scheduler` (edge functions do not auto-deploy from git).
+Then redeploy: `supabase functions deploy openrouter-agent` (or merge the
+auto-deploy workflow and let Actions push it).
 
 **Use it:** in the app, add an **OpenRouter agent** account, pick a coding model
 (Kimi K2.7 Code is the default and a good, cheap fit), check **Fix code
