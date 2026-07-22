@@ -74,6 +74,9 @@ const stepBudgetFor = (enabled: Set<string>) => enabled.has("code") ? Math.max(M
 const MAX_TOKENS = Math.min(num("AGENT_MAX_TOKENS", 3072), 8192);
 // Per-call cap. Reasoning models need headroom; still leave room for tools + save.
 const CALL_TIMEOUT_MS = num("AGENT_CALL_TIMEOUT_MS", 50_000);
+// Never start a model call with less than this — a 5s timeout always fails on
+// Kimi/GLM and was being treated as a hard error (killing auto-continue).
+const MIN_MODEL_CALL_MS = Math.min(num("AGENT_MIN_MODEL_CALL_MS", 25_000), CALL_TIMEOUT_MS);
 // Wall budget for ONE edge invocation. Must stay under Supabase's ~150s idle
 // limit so we can return JSON and/or spawn the next auto-continue segment.
 const DEADLINE_MS = num("AGENT_DEADLINE_MS", 100_000);
@@ -642,11 +645,18 @@ function compactMessages(messages: any[]): any[] {
 }
 
 function isBudgetStop(text: string): boolean {
-  return /time budget|maximum number of tool steps|mid-tools/i.test(text || "");
+  return /time budget|maximum number of tool steps|mid-tools|Paused on step|will continue|Continuing in the background/i.test(text || "");
 }
 
 function isHardError(text: string): boolean {
-  return /^⚠\s*Model error/i.test(text || "");
+  if (!/^⚠\s*Model error/i.test(text || "")) return false;
+  // Timeouts / rate limits are recoverable — auto-continue should still fire.
+  if (/timed out|timeout|rate.?limit|overloaded|temporar/i.test(text)) return false;
+  return true;
+}
+
+function isTransientModelError(err: string): boolean {
+  return /timed out|timeout|rate.?limit|overloaded|temporar|529|502|503|504/i.test(err || "");
 }
 
 
@@ -719,7 +729,13 @@ async function runAgentLoop(opts: {
   const started = Date.now();
   const hardStop = started + DEADLINE_MS;
   const remaining = () => Math.max(0, hardStop - Date.now());
-  const callBudget = () => Math.min(CALL_TIMEOUT_MS, Math.max(5_000, remaining() - 10_000));
+  // Reserve 8s to checkpoint + spawn auto-continue; never go below MIN_MODEL_CALL_MS
+  // (a 5s model call always fails on Kimi/GLM and used to kill the chain).
+  const callBudget = () => {
+    const raw = remaining() - 8_000;
+    if (raw < MIN_MODEL_CALL_MS) return 0;
+    return Math.min(CALL_TIMEOUT_MS, raw);
+  };
 
   const saveProgress = async (status: string, note: string) => {
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
@@ -732,7 +748,8 @@ async function runAgentLoop(opts: {
 
   for (let i = 0; i < stepBudget; i++) {
     steps = i + 1;
-    if (remaining() < 12_000) {
+    const budget = callBudget();
+    if (budget < MIN_MODEL_CALL_MS) {
       finalText = finalText || "Stopped: hit the time budget before a final answer.";
       incomplete = true;
       break;
@@ -743,13 +760,20 @@ async function runAgentLoop(opts: {
     const useTools = openedPr ? [] : tools;
     const r = await openrouter(key, model, forModel, {
       tools: useTools.length ? useTools : undefined,
-      timeoutMs: callBudget(),
+      timeoutMs: budget,
     });
     cost += Number(r.usage?.cost) || 0;
     await logUsage(model, r.usage, ctx.account, ctx.triggerKey, r.ok, r.error ?? null);
     if (!r.ok) {
-      finalText = `⚠ Model error on step ${steps}: ${r.error}`;
-      incomplete = false;
+      const err = String(r.error || "unknown");
+      if (isTransientModelError(err)) {
+        // Soft stop — checkpoint + auto-continue (do not mark as hard failure).
+        finalText = `Paused on step ${steps}: ${err}. Continuing in the background if possible.`;
+        incomplete = true;
+      } else {
+        finalText = `⚠ Model error on step ${steps}: ${err}`;
+        incomplete = false;
+      }
       break;
     }
 
@@ -764,7 +788,8 @@ async function runAgentLoop(opts: {
 
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls });
     for (const tc of toolCalls) {
-      if (remaining() < 8_000) {
+      const toolBudget = callBudget();
+      if (toolBudget < 5_000) {
         finalText = finalText || "Stopped: hit the time budget mid-tools; partial progress is in the transcript.";
         incomplete = true;
         break;
@@ -774,7 +799,7 @@ async function runAgentLoop(opts: {
       try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
       const result = (await runTool(name, args, {
         userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled,
-        timeoutMs: callBudget(),
+        timeoutMs: toolBudget,
       })).slice(0, TOOL_RESULT_CAP);
       const line = `${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`;
       actions.push(line);
@@ -794,7 +819,7 @@ async function runAgentLoop(opts: {
       // Next loop iteration will call the model with tools disabled for a final summary.
       continue;
     }
-    if (finalText || remaining() < 12_000) {
+    if (finalText || callBudget() < MIN_MODEL_CALL_MS) {
       if (!finalText) {
         finalText = "Stopped: hit the time budget before a final answer.";
         incomplete = true;
