@@ -8,9 +8,12 @@
 //   • read the owner's Routiner data (routines / notes / staged leads),
 //   • do web / deep research (Perplexity via OpenRouter),
 //   • write into the owner's apps (a Routiner note, or find+save leads into
-//     Command's Review tab via the lead-enrichment engine).
-// It is NOT a coding agent (no files/git/shell) — that needs a compute sandbox
-// this app doesn't have.
+//     Command's Review tab via the lead-enrichment engine),
+//   • work on code (the "code" tool group): read repo files, inspect PRs, and
+//     propose a fix as a pull request / merge it — via the GitHub REST API, so
+//     a non-Claude model can fix & merge code with no Claude session and no
+//     shell/sandbox. Gated on a GITHUB_TOKEN edge secret (merge additionally on
+//     AGENT_ALLOW_MERGE); see the code-tools section below.
 //
 // Key resolution (per call): the account's own OpenRouter key
 // (routiner_settings.accounts[account].key) if the owner set one, else the
@@ -22,7 +25,7 @@
 // same model those functions use. An optional RESPONDER_SECRET gate is honored.
 //
 // Request (POST JSON):
-//   Fresh run:  { prompt, model?, tools?: ("read"|"research"|"write")[], account?,
+//   Fresh run:  { prompt, model?, tools?: ("read"|"research"|"write"|"code")[], account?,
 //                 triggerKey?, routineId?, title?, source?, ping? }
 //   Continue:   { runId, prompt }   — resumes that stored run's transcript with
 //               its own model/account/trigger/tools; the follow-up is `prompt`.
@@ -60,11 +63,70 @@ const allowedModels = (): Set<string> => {
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
 const MAX_STEPS = num("AGENT_MAX_STEPS", 6);          // tool-loop turns before we stop
+const CODE_MAX_STEPS = num("AGENT_CODE_MAX_STEPS", 12); // coding needs read→fix→merge room
+// Coding runs need more turns to read the repo, write files, and open/merge a PR.
+const stepBudgetFor = (enabled: Set<string>) => enabled.has("code") ? Math.max(MAX_STEPS, CODE_MAX_STEPS) : MAX_STEPS;
 const MAX_TOKENS = Math.min(num("AGENT_MAX_TOKENS", 4096), 8192);
 const CALL_TIMEOUT_MS = num("AGENT_CALL_TIMEOUT_MS", 90_000);
 const DEADLINE_MS = num("AGENT_DEADLINE_MS", 130_000); // overall wall-clock budget
 const TOOL_RESULT_CAP = num("AGENT_TOOL_RESULT_CAP", 6000);
 const OUTPUT_CAP = num("AGENT_OUTPUT_CAP", 60_000);    // full-length, but sane
+
+// ── GitHub (the "code" tool group) ───────────────────────────────────────────
+// Lets a non-Claude instance read the repo, inspect PRs, and — the whole point —
+// propose a fix as a PR and merge it, entirely through the GitHub REST API (no
+// shell/sandbox needed). Guard-railed: it only works when GITHUB_TOKEN is set,
+// only touches allowed repos, and won't merge unless AGENT_ALLOW_MERGE is on.
+const GH_API = "https://api.github.com";
+const GH_TOKEN = () => Deno.env.get("GITHUB_TOKEN") || Deno.env.get("GH_TOKEN") || "";
+const GH_DEFAULT_REPO = () => (Deno.env.get("GITHUB_REPO") || "").trim();
+const GH_ALLOW_MERGE = () => /^(1|true|yes|on)$/i.test(Deno.env.get("AGENT_ALLOW_MERGE") || "");
+// null = "only the default repo is allowed"; a set = that explicit allowlist.
+const ghAllowedRepos = (): Set<string> | null => {
+  const raw = Deno.env.get("GITHUB_ALLOWED_REPOS");
+  if (!raw) return null;
+  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return list.length ? new Set(list) : null;
+};
+// Resolve + authorize the repo for a code tool call.
+function resolveRepo(arg?: unknown): { repo?: string; error?: string } {
+  const def = GH_DEFAULT_REPO();
+  const allow = ghAllowedRepos();
+  const want = (typeof arg === "string" && arg.trim()) ? arg.trim() : def;
+  if (!want) return { error: "no repo: set the GITHUB_REPO edge secret or pass repo as 'owner/name'." };
+  if (!/^[^/\s]+\/[^/\s]+$/.test(want)) return { error: `bad repo '${want}' — want 'owner/name'.` };
+  if (allow) { if (!allow.has(want)) return { error: `repo '${want}' is not in GITHUB_ALLOWED_REPOS.` }; }
+  else if (def && want !== def) return { error: `repo '${want}' not allowed (only '${def}'); set GITHUB_ALLOWED_REPOS to widen.` };
+  return { repo: want };
+}
+const ghPath = (p: string) => String(p).replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/");
+// UTF-8-safe base64 both directions (GitHub contents API is base64).
+const b64encode = (s: string) => btoa(unescape(encodeURIComponent(s)));
+const b64decode = (s: string) => decodeURIComponent(escape(atob(String(s).replace(/\n/g, ""))));
+async function gh(method: string, path: string, body?: unknown): Promise<{ ok: boolean; status: number; data: any }> {
+  const token = GH_TOKEN();
+  try {
+    const r = await fetch(`${GH_API}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "user-agent": "routiner-openrouter-agent",
+        "x-github-api-version": "2022-11-28",
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+    });
+    const text = await r.text();
+    let data: any = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    const msg = e instanceof DOMException && e.name === "TimeoutError" ? `GitHub call timed out (${CALL_TIMEOUT_MS}ms)` : (e as Error).message;
+    return { ok: false, status: 0, data: { message: msg } };
+  }
+}
 
 const cors = {
   "access-control-allow-origin": "*",
@@ -208,6 +270,34 @@ function toolSpecs(enabled: Set<string>): unknown[] {
         } } } },
     );
   }
+  // Code (GitHub) — only offered when a token is configured, so the model never
+  // reaches for a capability the deployment can't back.
+  if (enabled.has("code") && GH_TOKEN()) {
+    const repoProp = { repo: { type: "string", description: "owner/name; omit to use the configured default repo" } };
+    specs.push(
+      { type: "function", function: { name: "gh_read_file", description: "Read a file (or list a directory) from the repo. Returns the text and its blob sha. Use this to understand code before changing it.",
+        parameters: { type: "object", required: ["path"], properties: { ...repoProp,
+          path: { type: "string", description: "path within the repo, e.g. js/app.js (a directory path returns a listing)" },
+          ref: { type: "string", description: "branch, tag, or commit sha (default: the repo's default branch)" } } } } },
+      { type: "function", function: { name: "gh_list_prs", description: "List pull requests in the repo (number, title, state, branches).",
+        parameters: { type: "object", properties: { ...repoProp, state: { type: "string", enum: ["open", "closed", "all"], description: "default open" } } } } },
+      { type: "function", function: { name: "gh_read_pr", description: "Read one pull request: its metadata, mergeability, and per-file diffs (patches).",
+        parameters: { type: "object", required: ["number"], properties: { ...repoProp, number: { type: "number", description: "the PR number" } } } } },
+      { type: "function", function: { name: "gh_propose_change", description: "Fix code: create a branch off the base, write the given file(s) in full, and open a pull request. Provide the COMPLETE new content of each file, not a diff.",
+        parameters: { type: "object", required: ["title", "changes"], properties: { ...repoProp,
+          title: { type: "string", description: "PR title / commit message" },
+          body: { type: "string", description: "PR description (markdown)" },
+          base: { type: "string", description: "base branch to target (default: the repo's default branch)" },
+          branch: { type: "string", description: "new branch name (default: an auto-generated agent/… name)" },
+          changes: { type: "array", description: "files to write", items: { type: "object", required: ["path", "content"],
+            properties: { path: { type: "string" }, content: { type: "string", description: "the FULL new file contents" } } } } } } } },
+      { type: "function", function: { name: "gh_comment_pr", description: "Post a comment on a pull request or issue (e.g. to explain a proposed fix or leave review notes).",
+        parameters: { type: "object", required: ["number", "body"], properties: { ...repoProp, number: { type: "number" }, body: { type: "string" } } } } },
+      { type: "function", function: { name: "gh_merge_pr", description: "Merge a pull request. Only works when the deployment has enabled merging (AGENT_ALLOW_MERGE). Prefer squash.",
+        parameters: { type: "object", required: ["number"], properties: { ...repoProp, number: { type: "number" },
+          method: { type: "string", enum: ["squash", "merge", "rebase"], description: "default squash" } } } } },
+    );
+  }
   return specs;
 }
 
@@ -267,6 +357,89 @@ async function runTool(name: string, args: Record<string, any>, ctx: { userId: s
         const t = data.totals || {};
         return `saved ${t.inserted ?? 0} new lead(s) to Command's Review tab (~$${Number(t.cost || 0).toFixed(4)}).`;
       }
+
+      // ── Code (GitHub) ─────────────────────────────────────────────────────
+      case "gh_read_file": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const path = String(args.path || "").trim(); if (!path) return "error: missing path";
+        const ref = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
+        const r = await gh("GET", `/repos/${repo}/contents/${ghPath(path)}${ref}`);
+        if (!r.ok) return `error: read ${path} → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
+        if (Array.isArray(r.data)) return `directory ${path}:\n` + r.data.map((e: any) => `${e.type === "dir" ? "dir " : "file"}  ${e.path}`).join("\n");
+        if (r.data?.encoding !== "base64") return `error: ${path} is not a readable text file.`;
+        return `path: ${r.data.path}\nsha: ${r.data.sha}\n\n${b64decode(r.data.content)}`;
+      }
+      case "gh_list_prs": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const state = ["open", "closed", "all"].includes(args.state) ? args.state : "open";
+        const r = await gh("GET", `/repos/${repo}/pulls?state=${state}&per_page=20`);
+        if (!r.ok) return `error: list PRs → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
+        return JSON.stringify((r.data || []).map((p: any) => ({ number: p.number, title: p.title, state: p.state, head: p.head?.ref, base: p.base?.ref, draft: p.draft, url: p.html_url })));
+      }
+      case "gh_read_pr": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const n = Number(args.number); if (!n) return "error: missing PR number";
+        const pr = await gh("GET", `/repos/${repo}/pulls/${n}`);
+        if (!pr.ok) return `error: read PR ${n} → ${pr.status}: ${String(pr.data?.message || "").slice(0, 160)}`;
+        const files = await gh("GET", `/repos/${repo}/pulls/${n}/files?per_page=50`);
+        const fileList = (files.ok && Array.isArray(files.data))
+          ? files.data.map((f: any) => ({ filename: f.filename, status: f.status, additions: f.additions, deletions: f.deletions, patch: String(f.patch || "").slice(0, 2000) }))
+          : [];
+        return JSON.stringify({ number: pr.data.number, title: pr.data.title, body: String(pr.data.body || "").slice(0, 1000),
+          state: pr.data.state, mergeable: pr.data.mergeable, mergeable_state: pr.data.mergeable_state,
+          head: pr.data.head?.ref, base: pr.data.base?.ref, files: fileList });
+      }
+      case "gh_propose_change": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const changes = Array.isArray(args.changes) ? args.changes.filter((c: any) => c && c.path) : [];
+        if (!changes.length) return "error: no changes provided (need at least one { path, content }).";
+        const title = String(args.title || "").trim() || "Routiner agent change";
+        let base = String(args.base || "").trim();
+        if (!base) { const meta = await gh("GET", `/repos/${repo}`); base = meta.data?.default_branch || "main"; }
+        const baseRef = await gh("GET", `/repos/${repo}/git/ref/heads/${encodeURIComponent(base)}`);
+        if (!baseRef.ok) return `error: base branch '${base}' not found (${baseRef.status}).`;
+        const baseSha = baseRef.data?.object?.sha;
+        const branch = (String(args.branch || "").trim() || `agent/${Date.now().toString(36)}`).replace(/[^a-zA-Z0-9._/-]/g, "-");
+        const mk = await gh("POST", `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: baseSha });
+        if (!mk.ok && mk.status !== 422) return `error: create branch '${branch}' → ${mk.status}: ${String(mk.data?.message || "").slice(0, 160)}`;
+        for (const c of changes) {
+          const p = String(c.path || "").replace(/^\/+/, "");
+          const cur = await gh("GET", `/repos/${repo}/contents/${ghPath(p)}?ref=${encodeURIComponent(branch)}`);
+          const sha = (cur.ok && !Array.isArray(cur.data)) ? cur.data.sha : undefined;
+          const put = await gh("PUT", `/repos/${repo}/contents/${ghPath(p)}`, {
+            message: `${title} — ${p}`, branch, content: b64encode(String(c.content ?? "")), ...(sha ? { sha } : {}),
+          });
+          if (!put.ok) return `error: write ${p} → ${put.status}: ${String(put.data?.message || "").slice(0, 160)}`;
+        }
+        const pr = await gh("POST", `/repos/${repo}/pulls`, {
+          title, head: branch, base, body: `${String(args.body || "")}\n\n— proposed by a Routiner OpenRouter agent`.trim(),
+        });
+        if (!pr.ok) return `error: open PR → ${pr.status}: ${String(pr.data?.message || "").slice(0, 200)}`;
+        return `opened PR #${pr.data.number}: ${pr.data.html_url} (branch ${branch} → ${base}, ${changes.length} file(s))`;
+      }
+      case "gh_comment_pr": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const n = Number(args.number); if (!n) return "error: missing PR/issue number";
+        const bodyText = String(args.body || "").trim(); if (!bodyText) return "error: empty comment";
+        const r = await gh("POST", `/repos/${repo}/issues/${n}/comments`, { body: bodyText });
+        return r.ok ? `commented on #${n}: ${r.data?.html_url || "ok"}` : `error: comment #${n} → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
+      }
+      case "gh_merge_pr": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        if (!GH_ALLOW_MERGE()) return "error: merging is disabled. Set the AGENT_ALLOW_MERGE edge secret to 'true' to allow it.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const n = Number(args.number); if (!n) return "error: missing PR number";
+        const method = ["squash", "merge", "rebase"].includes(args.method) ? args.method : "squash";
+        const r = await gh("PUT", `/repos/${repo}/pulls/${n}/merge`, { merge_method: method });
+        if (!r.ok) return `error: merge #${n} → ${r.status}: ${String(r.data?.message || "").slice(0, 200)}`;
+        return `merged PR #${n} (${method})${r.data?.sha ? ` — commit ${String(r.data.sha).slice(0, 7)}` : ""}.`;
+      }
+
       default:
         return `error: unknown tool '${name}'`;
     }
@@ -283,21 +456,23 @@ You have these tool capabilities: ${toolList}.
 - Use read_* tools to ground your work in the owner's real data before acting.
 - Use web_research for anything you need current facts on.
 - Use write_note to save durable notes, and find_and_save_leads to source prospects into Command.
-Take the actions the task calls for, then finish with a concise summary of what you found and did. If you need the user to clarify something or grant permission before acting, say so plainly and stop — they can reply and you'll pick up from there. Do not claim to have done something a tool did not confirm.`;
+- Use the gh_* tools to work on code: gh_read_file / gh_list_prs / gh_read_pr to understand the repo, gh_propose_change to fix code by opening a pull request (always read the current file first and send the COMPLETE new contents, never a partial diff), gh_comment_pr to explain your reasoning, and gh_merge_pr to merge when it's ready. Make small, focused, correct changes; if you're unsure a change is safe, open the PR but do not merge — say why and let the user decide.
+Take the actions the task calls for, then finish with a concise summary of what you found and did (include any PR links). If you need the user to clarify something or grant permission before acting, say so plainly and stop — they can reply and you'll pick up from there. Do not claim to have done something a tool did not confirm.`;
 }
 
 // Run the bounded tool-use loop over `messages` (mutated in place so the caller
 // keeps the full transcript, final assistant turn included). Returns the final
 // text, a recap of tool actions, accumulated cost, and step count.
 async function runAgentLoop(opts: {
-  key: string; model: string; tools: unknown[]; messages: any[];
+  key: string; model: string; tools: unknown[]; messages: any[]; maxSteps?: number;
   ctx: { userId: string | null; account: string | null; triggerKey: string | null };
 }): Promise<{ finalText: string; actions: string[]; cost: number; steps: number }> {
   const { key, model, tools, messages, ctx } = opts;
+  const stepBudget = Math.max(1, opts.maxSteps || MAX_STEPS);
   const actions: string[] = [];
   let cost = 0, steps = 0, finalText = "";
   const started = Date.now();
-  for (let i = 0; i < MAX_STEPS; i++) {
+  for (let i = 0; i < stepBudget; i++) {
     steps = i + 1;
     const r = await openrouter(key, model, messages, { tools });
     cost += Number(r.usage?.cost) || 0;
@@ -392,7 +567,7 @@ Deno.serve(async (req: Request) => {
     }
     messages.push({ role: "user", content: prompt });
 
-    const { finalText, actions, cost } = await runAgentLoop({ key, model, tools, messages, ctx: { userId, account, triggerKey } });
+    const { finalText, actions, cost } = await runAgentLoop({ key, model, tools, messages, maxSteps: stepBudgetFor(enabled), ctx: { userId, account, triggerKey } });
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
     const output = `${finalText}${recap}`.slice(0, OUTPUT_CAP);
     const status = finalText.startsWith("⚠") ? "error" : "success";
@@ -446,7 +621,7 @@ Deno.serve(async (req: Request) => {
   const toolList = enabled.size ? [...enabled].join(", ") : "none";
 
   const messages: any[] = [{ role: "system", content: buildSystem(model, toolList) }, { role: "user", content: prompt }];
-  const { finalText, actions, cost, steps } = await runAgentLoop({ key, model, tools, messages, ctx: { userId, account, triggerKey } });
+  const { finalText, actions, cost, steps } = await runAgentLoop({ key, model, tools, messages, maxSteps: stepBudgetFor(enabled), ctx: { userId, account, triggerKey } });
 
   // Compose the full-length output stored in History: the result, plus a short
   // recap of the actions taken (so the run is auditable).

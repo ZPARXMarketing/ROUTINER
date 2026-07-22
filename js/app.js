@@ -82,6 +82,7 @@ const AGENT_TOOLS = [
   { id: 'read', label: 'Read your data' },
   { id: 'research', label: 'Web research' },
   { id: 'write', label: 'Write to apps' },
+  { id: 'code', label: 'Fix code (GitHub)' },
 ];
 const AGENT_TOOL_IDS = AGENT_TOOLS.map((t) => t.id);
 /* Coerce whatever's stored (array of ids, or a {read:true,…} object) into the
@@ -1803,6 +1804,7 @@ function renderCfgAccounts() {
         <button class="iconbtn" title="Remove account" data-act="del-acct" data-ai="${ai}">✕</button>
       </div>
       <input class="input cfg-akey" data-ai="${ai}" type="password" autocomplete="off" placeholder="${a.key ? '•••• key saved — blank to keep' : 'OpenRouter API key (sk-or-…) — blank = use server key'}" />
+      <div class="hint" style="padding:4px 2px"><b>Fix code (GitHub)</b> lets this non-Claude model read the repo and open/merge pull requests — no Claude session. It needs a <code>GITHUB_TOKEN</code> edge secret (and <code>GITHUB_REPO</code>); merging also needs <code>AGENT_ALLOW_MERGE=true</code>. Without them the checkbox is inert.</div>
       <div class="trig-list">${a.triggers.map((t, ti) => `
         <div class="trig-cfg">
           <div class="trig-cfg__top">
