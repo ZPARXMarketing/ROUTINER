@@ -1106,7 +1106,7 @@ async function continueRun(it, raw) {
     });
     const data = await r.json().catch(() => ({}));
     runModalBusy = false;
-    if (!r.ok || data.ok === false) { toast(`Reply failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); refreshRunModal(); return; }
+    if (!r.ok || data.ok === false) { toast(`Reply failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); refreshRunModal(); restoreRunInput(text); return; }
     const cost = Number(data.cost || 0);
     toast(`Replied — ${modelLabel(data.model || it.model)}${cost ? ` (~$${cost.toFixed(4)})` : ''}.`);
     try { await loadAll(); } catch { /* the row is saved regardless */ }
@@ -1115,7 +1115,14 @@ async function continueRun(it, raw) {
     runModalBusy = false;
     toast(`Reply request failed: ${e.message}`, 'error');
     refreshRunModal();
+    restoreRunInput(text);        // never lose what the user typed on a failed send
   }
+}
+/* Put the user's text back in the reply box after a failed send so a network
+   hiccup never eats it — they can just hit Send again. */
+function restoreRunInput(text) {
+  const inp = $('#run-input');
+  if (inp) { inp.value = text; inp.focus(); }
 }
 
 /* ---------- Chat (test a model directly) ----------
