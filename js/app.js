@@ -85,18 +85,21 @@ const AGENT_TOOLS = [
   { id: 'code', label: 'Fix code (GitHub)' },
 ];
 const AGENT_TOOL_IDS = AGENT_TOOLS.map((t) => t.id);
+/* Default tools for new agent instances — GitHub write is opt-in (checkbox). */
+const DEFAULT_AGENT_TOOLS = AGENT_TOOL_IDS.filter((id) => id !== 'code');
 /* Coerce whatever's stored (array of ids, or a {read:true,…} object) into the
-   canonical ordered array of enabled tool ids. */
+   canonical ordered array of enabled tool ids. Missing tools → safe default
+   (no code); explicit arrays (including ones with code) are kept as-is. */
 const normalizeTools = (t) => {
   const arr = Array.isArray(t) ? t : (t && typeof t === 'object' ? Object.keys(t).filter((k) => t[k]) : null);
-  return AGENT_TOOL_IDS.filter((id) => (arr || AGENT_TOOL_IDS).includes(id));
+  return AGENT_TOOL_IDS.filter((id) => (arr || DEFAULT_AGENT_TOOLS).includes(id));
 };
 /* OpenRouter chat models an agent instance can run — every non-Claude,
    non-perplexity, non-auto id in the shared catalog. */
 const AGENT_MODELS = () => MODELS.filter((m) => !m.auto && !isClaudeModel(m.id) && !/^perplexity\//.test(m.id));
 /* A fresh OpenRouter agent account for the "Add OpenRouter account" button. */
 const NEW_AGENT_ACCOUNT = () => ({ id: genId('acc'), label: 'Kimi', kind: 'openrouter-agent', key: '',
-  triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '', model: DEFAULT_AGENT_MODEL, tools: [...AGENT_TOOL_IDS] }] });
+  triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '', model: DEFAULT_AGENT_MODEL, tools: [...DEFAULT_AGENT_TOOLS] }] });
 
 let accountsCfg = DEFAULT_ACCOUNTS();
 let settingsPolicy = null; // the user's saved auto-routing policy (null = built-in default)
@@ -1894,7 +1897,7 @@ function renderCfgAccounts() {
     else if (act === 'add-trig') {
       const a = cfgModel[ai];
       const base = { id: genId('t'), label: nextTrigLabel(a), trigger: '', token: '' };
-      if (kindOf(a) === 'openrouter-agent') { base.model = DEFAULT_AGENT_MODEL; base.tools = [...AGENT_TOOL_IDS]; }
+      if (kindOf(a) === 'openrouter-agent') { base.model = DEFAULT_AGENT_MODEL; base.tools = [...DEFAULT_AGENT_TOOLS]; }
       a.triggers.push(base);
     }
     else if (act === 'del-trig') cfgModel[ai].triggers.splice(ti, 1);
