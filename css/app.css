@@ -337,6 +337,7 @@ a { color: var(--periwinkle); }
 .chip--recurring { background: rgba(255,106,31,0.14); color: var(--orange-bright); border-color: rgba(255,106,31,0.4); }
 .chip--due { background: var(--lime); color: var(--ink); }
 .chip--success { background: rgba(188,239,47,0.12); color: var(--lime); border-color: rgba(188,239,47,0.35); }
+.chip--running { background: rgba(61,90,241,0.16); color: var(--periwinkle); border-color: rgba(61,90,241,0.4); }
 .chip--error { background: rgba(255,77,94,0.14); color: var(--danger); border-color: rgba(255,77,94,0.4); }
 .chip--missed { background: rgba(245,211,59,0.10); color: var(--yellow); border-color: rgba(245,211,59,0.3); }
 .chip--dryrun { background: rgba(245,211,59,0.14); color: var(--yellow); border-color: rgba(245,211,59,0.4); }

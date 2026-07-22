@@ -580,7 +580,11 @@ async function fireAgent(routine) {
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) { toast(`Agent run failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); return; }
     const cost = Number(data.cost || 0);
-    toast(`Done — ${modelLabel(model)} finished${data.steps ? ` in ${data.steps} step(s)` : ''}${cost ? ` (~$${cost.toFixed(4)})` : ''}. Open it in History to read the full reply or continue.`);
+    if (data.continuing) {
+      toast(`${modelLabel(model)} is still working in the background — watch History for progress${cost ? ` (~$${cost.toFixed(4)} so far)` : ''}.`);
+    } else {
+      toast(`Done — ${modelLabel(model)} finished${data.steps ? ` in ${data.steps} step(s)` : ''}${cost ? ` (~$${cost.toFixed(4)})` : ''}. Open it in History to read the full reply or continue.`);
+    }
     try { await loadAll(); render(); } catch { /* non-fatal: the row is saved regardless */ }
   } catch (e) {
     toast(`Agent request failed: ${e.message}`, 'error');
@@ -931,7 +935,7 @@ function renderBoard() {
    what the model returned (issue #51), and — for agent runs — reply to keep the
    conversation going with the same model and tools. */
 const FRIENDLY_STATUS = {
-  success: 'Completed', ran: 'Ran', dryrun: 'Test run',
+  success: 'Completed', ran: 'Ran', dryrun: 'Test run', running: 'Still working',
   error: 'Had a problem', missed: 'Missed its time',
 };
 /* Strip an output down to readable prose: drop code blocks, URLs, markdown
@@ -970,13 +974,17 @@ function renderHistory() {
     </div>`;
   const row = (it) => {
     const ok = !(it.status === 'error' || it.status === 'missed');
+    const busy = it.status === 'running';
     const text = friendlyText(it.output);
     const can = isContinuable(it);
-    const meta = [it.model ? modelLabel(it.model) : '', can ? 'Reply to continue' : ''].filter(Boolean).join(' · ');
-    return `<div class="hist hist--click ${ok ? '' : 'hist--bad'}" data-hist="${esc(it.id)}" role="button" tabindex="0">
+    const meta = [
+      it.model ? modelLabel(it.model) : '',
+      busy ? 'Working in background…' : (can ? 'Reply to continue' : ''),
+    ].filter(Boolean).join(' · ');
+    return `<div class="hist hist--click ${ok ? '' : 'hist--bad'}${busy ? ' hist--busy' : ''}" data-hist="${esc(it.id)}" role="button" tabindex="0">
       <div class="hist__head">
         <span class="hist__title">${esc(it.title || 'Untitled')}</span>
-        <span class="hist__status ${ok ? 'is-ok' : 'is-bad'}">${esc(FRIENDLY_STATUS[it.status] || it.status)}</span>
+        <span class="hist__status ${busy ? 'is-busy' : (ok ? 'is-ok' : 'is-bad')}">${esc(FRIENDLY_STATUS[it.status] || it.status)}</span>
         <span class="hist__time">${it.time ? fmt(it.time) : ''}</span>
       </div>
       ${text ? `<p class="hist__text">${esc(text)}</p>` : `<p class="hist__text hist__text--none">No summary was returned for this run — open it for the full details.</p>`}
