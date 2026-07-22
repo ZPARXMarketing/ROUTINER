@@ -132,8 +132,7 @@ offloaded drafts have shipped subtle bugs (e.g. an HTML-escaper that omitted
 
 ### Agent reliability knobs (edge secrets)
 
-See `docs/AGENT_RELIABILITY_PLAN.md` for the full design. After deploy, these
-optional secrets tune the agent path:
+After deploy, these optional secrets tune the agent path:
 
 | secret | default | role |
 |--------|---------|------|
