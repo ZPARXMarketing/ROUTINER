@@ -464,8 +464,43 @@ async function sessionForFire() {
   return { session: s };
 }
 
+/* Claim a routine the same way the scheduler does after a successful fire, so a
+   manual "Run now" doesn't leave status=scheduled + scheduled_at=now for pg_cron
+   to pick up a minute later (that was creating two identical agent History rows).
+   One-offs park in the library; recurring advance to the next future occurrence. */
+async function claimManualFire(routine) {
+  if (!routine?.id) return routine;
+  const nowIso = new Date().toISOString();
+  const rec = routine.recurrence || 'none';
+  if (rec === 'none') {
+    return (await dbUpdate(routine.id, Object.assign({}, routine, {
+      status: 'library', scheduledAt: null, lastRun: nowIso,
+    }))) || routine;
+  }
+  const seed = routine.scheduledAt || nowIso;
+  const next = nextOccurrence(seed, rec);
+  return (await dbUpdate(routine.id, Object.assign({}, routine, next
+    ? { status: 'scheduled', scheduledAt: next, lastRun: nowIso }
+    : { status: 'library', scheduledAt: null, lastRun: nowIso }))) || routine;
+}
+
+// Debounce double-clicks on Run now (same routine).
+const fireInFlight = new Set();
+
 async function fireTrigger(routine) {
   if (!settings.firing) { toast('Firing is paused on this site (top-right switch). Toggle it live to fire.', 'error'); return; }
+  if (routine?.id) {
+    if (fireInFlight.has(routine.id)) { toast('Already firing this routine…'); return; }
+    fireInFlight.add(routine.id);
+  }
+  try {
+    return await fireTriggerInner(routine);
+  } finally {
+    if (routine?.id) fireInFlight.delete(routine.id);
+  }
+}
+
+async function fireTriggerInner(routine) {
   // OpenRouter account → run the Perplexity enrichment engine directly (no Claude).
   if (accountKind(routine?.account) === 'openrouter') return fireEnrichment(routine);
   // OpenRouter agent account → run the model + tool loop (no Claude).
@@ -850,7 +885,9 @@ function bindCards() {
       if (act === 'edit') return openDrawer(r);
       if (act === 'schedule') return openDrawer(r, { forceSchedule: true });
       if (act === 'run') {
-        await dbUpdate(r.id, Object.assign({}, r, { status: 'scheduled', scheduledAt: new Date().toISOString() }));
+        // Claim first (advance recurrence / park one-off) so the scheduler won't
+        // also fire this due-now slot — that was creating duplicate agent runs.
+        await claimManualFire(r);
         render(); await fireTrigger(r); return;
       }
       if (act === 'duplicate') {
@@ -936,7 +973,7 @@ function renderBoard() {
    conversation going with the same model and tools. */
 const FRIENDLY_STATUS = {
   success: 'Completed', ran: 'Ran', dryrun: 'Test run', running: 'Still working',
-  error: 'Had a problem', missed: 'Missed its time',
+  error: 'Had a problem', missed: 'Missed its time', cancelled: 'Stopped',
 };
 // Client-side mirror of SCHEDULER_REAP_RUN_MIN (10 min). A running row quieter
 // than this is almost certainly a dead edge invocation; show "May have stalled"
@@ -945,6 +982,38 @@ const RUN_STALE_MS = 10 * 60 * 1000;
 const RETRY_PROMPT = '[retry] Resume the task from the transcript and finish it.';
 function isRunStale(it) {
   return !!(it && it.status === 'running' && it.time && (Date.now() - new Date(it.time).getTime()) > RUN_STALE_MS);
+}
+function isRunBusy(it) {
+  return !!(it && it.status === 'running' && !isRunStale(it));
+}
+// Live-refresh History while any run is working so the spinner + step text stay honest.
+let historyPollTimer = null;
+function ensureHistoryPoll() {
+  if (historyPollTimer) return;
+  historyPollTimer = setInterval(async () => {
+    if (currentView !== 'history' && !runModalId) {
+      clearInterval(historyPollTimer); historyPollTimer = null; return;
+    }
+    const hasRunning = runs.some((r) => r.status === 'running');
+    if (!hasRunning && !runModalBusy) return;
+    try {
+      await loadAll();
+      if (runModalId) refreshRunModal();
+    } catch { /* transient */ }
+  }, 8_000);
+}
+function assistantThoughtText(m) {
+  if (!m || typeof m !== 'object') return '';
+  if (typeof m.reasoning === 'string' && m.reasoning.trim()) return m.reasoning.trim();
+  if (typeof m.reasoning_content === 'string' && m.reasoning_content.trim()) return m.reasoning_content.trim();
+  if (Array.isArray(m.reasoning_details)) {
+    return m.reasoning_details
+      .map((d) => (typeof d?.text === 'string' ? d.text : (typeof d?.summary === 'string' ? d.summary : '')))
+      .filter(Boolean)
+      .join('\n\n')
+      .trim();
+  }
+  return '';
 }
 /* Strip an output down to readable prose: drop code blocks, URLs, markdown
    syntax and JSON noise, keep the sentences. */
@@ -981,22 +1050,27 @@ function renderHistory() {
       <button class="btn btn--sm ${historyFilter === 'failures' ? 'btn--secondary' : 'btn--ghost'}" data-histf="failures">Failures (${failures.length})</button>
     </div>`;
   const row = (it) => {
-    const ok = !(it.status === 'error' || it.status === 'missed');
-    const busy = it.status === 'running';
+    const ok = !(it.status === 'error' || it.status === 'missed' || it.status === 'cancelled');
+    const busy = isRunBusy(it);
     const stale = isRunStale(it);
     const text = friendlyText(it.output);
     const can = isContinuable(it);
     const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status);
     const statusClass = stale ? 'is-warn' : (busy ? 'is-busy' : (ok ? 'is-ok' : 'is-bad'));
+    const spin = busy ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
     const meta = [
       it.model ? modelLabel(it.model) : '',
-      stale ? 'Open to retry' : (busy ? 'Working in background…' : (can ? 'Reply to continue' : '')),
+      stale ? 'Open to retry' : (busy ? 'Working… open for live transcript' : (can ? 'Reply to continue' : '')),
     ].filter(Boolean).join(' · ');
+    const stopBtn = (busy || stale) && can
+      ? `<button type="button" class="btn btn--danger-ghost btn--sm hist__stop" data-stop="${esc(it.id)}" title="Stop this agent">Stop</button>`
+      : '';
     return `<div class="hist hist--click ${ok ? '' : 'hist--bad'}${busy ? ' hist--busy' : ''}${stale ? ' hist--stale' : ''}" data-hist="${esc(it.id)}" role="button" tabindex="0">
       <div class="hist__head">
         <span class="hist__title">${esc(it.title || 'Untitled')}</span>
-        <span class="hist__status ${statusClass}">${esc(statusLabel)}</span>
+        <span class="hist__status ${statusClass}">${spin}${esc(statusLabel)}</span>
         <span class="hist__time">${it.time ? fmt(it.time) : ''}</span>
+        ${stopBtn}
       </div>
       ${text ? `<p class="hist__text">${esc(text)}</p>` : `<p class="hist__text hist__text--none">No summary was returned for this run — open it for the full details.</p>`}
       ${meta ? `<div class="hist__meta">${esc(meta)} <span class="hist__open">Open →</span></div>` : `<div class="hist__meta"><span class="hist__open">Open →</span></div>`}
@@ -1010,9 +1084,20 @@ function renderHistory() {
   view.querySelectorAll('[data-histf]').forEach((b) => b.addEventListener('click', () => { historyFilter = b.dataset.histf; renderHistory(); }));
   const open = (id) => { const it = historyItems().find((x) => x.id === id); if (it) openRunModal(it); };
   view.querySelectorAll('[data-hist]').forEach((el) => {
-    el.addEventListener('click', () => open(el.dataset.hist));
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-stop]')) return; // Stop handled separately
+      open(el.dataset.hist);
+    });
     el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(el.dataset.hist); } });
   });
+  view.querySelectorAll('[data-stop]').forEach((b) => {
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const it = historyItems().find((x) => x.id === b.dataset.stop);
+      if (it) stopRun(it);
+    });
+  });
+  ensureHistoryPoll();
 }
 
 /* ---------- Run detail modal (full exchange + continue) ----------
@@ -1037,6 +1122,9 @@ function transcriptTurns(it) {
     if (m.role === 'user') { turns.push({ kind: 'user', content: String(m.content || '') }); continue; }
     if (m.role === 'tool') { turns.push({ kind: 'toolresult', content: String(m.content || '') }); continue; }
     if (m.role === 'assistant') {
+      // Thoughts stay collapsible and separate from the visible answer.
+      const thought = assistantThoughtText(m);
+      if (thought) turns.push({ kind: 'thought', content: thought });
       if (m.content && String(m.content).trim()) turns.push({ kind: 'assistant', content: String(m.content) });
       (Array.isArray(m.tool_calls) ? m.tool_calls : []).forEach((tc) => {
         const name = tc?.function?.name || 'tool';
@@ -1055,18 +1143,25 @@ function runModalHtml(it) {
     if (t.kind === 'user') return `<div class="chatmsg chatmsg--user">${esc(t.content)}</div>`;
     if (t.kind === 'tool') return `<div class="transcript__tool">⚙ ${esc(t.content)}</div>`;
     if (t.kind === 'toolresult') return `<details class="transcript__res"><summary>tool result</summary><pre>${esc(t.content.slice(0, 4000))}</pre></details>`;
+    if (t.kind === 'thought') {
+      return `<details class="transcript__thought"><summary><span class="transcript__thought-icon" aria-hidden="true">💭</span> Thoughts</summary><pre class="transcript__thought-body">${esc(t.content.slice(0, 12_000))}</pre></details>`;
+    }
     return `<div class="chatmsg chatmsg--bot">${renderRunBody(t.content)}</div>`;
   }).join('') || `<div class="empty"><h3>Nothing was recorded</h3><p>This run has no saved output.</p></div>`;
   const can = isContinuable(it);
+  const busy = isRunBusy(it);
   const stale = isRunStale(it);
-  // Retry: error runs + stale "running" rows — same continue path, fixed prompt.
-  const showRetry = can && !runModalBusy && (it.status === 'error' || stale);
+  // Retry: error/cancelled + stale "running" rows — same continue path, fixed prompt.
+  const showRetry = can && !runModalBusy && (it.status === 'error' || it.status === 'cancelled' || stale);
+  const showStop = can && !runModalBusy && (busy || stale || it.status === 'running');
   const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status || 'ran');
-  const chipStatus = stale ? 'missed' : (it.status || 'ran'); // warning-ish chip for stale
+  const chipStatus = stale ? 'missed' : (it.status === 'cancelled' ? 'archived' : (it.status || 'ran')); // archived chip = muted "stopped"
+  const spin = (busy || runModalBusy) ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
   const compose = can
     ? `<div class="modal__compose">
         <textarea class="textarea chat__input" id="run-input" placeholder="Reply to the model — answer its question, grant permission, or ask for more… (Enter to send)" ${runModalBusy ? 'disabled' : ''}></textarea>
         <div class="modal__compose-actions">
+          ${showStop ? `<button class="btn btn--danger-ghost" id="run-stop" type="button">Stop</button>` : ''}
           ${showRetry ? `<button class="btn btn--secondary" id="run-retry" type="button">Retry</button>` : ''}
           <button class="btn btn--primary" id="run-send" ${runModalBusy ? 'disabled' : ''}>Send</button>
         </div>
@@ -1074,14 +1169,14 @@ function runModalHtml(it) {
     : `<div class="modal__note">This run isn't an interactive model chat, so it can't be continued here — it's shown for the record.</div>`;
   return `<div class="modal">
     <div class="modal__head">
-      <span class="chip chip--${esc(chipStatus)}">${esc(statusLabel)}</span>
+      <span class="chip chip--${esc(chipStatus)}">${spin}${esc(statusLabel)}</span>
       <h2 class="modal__title">${esc(it.title || 'Untitled')}</h2>
       <span class="modal__time">${it.time ? fmt(it.time) : ''}</span>
       <button class="drawer__close" id="run-close" aria-label="Close">×</button>
     </div>
     <div class="modal__thread" id="run-thread">
       ${bubbles}
-      ${runModalBusy ? '<div class="chatmsg chatmsg--bot chatmsg--busy">Thinking…</div>' : ''}
+      ${runModalBusy || busy ? '<div class="chatmsg chatmsg--bot chatmsg--busy"><span class="hist__spin" aria-hidden="true"></span> Working…</div>' : ''}
     </div>
     ${compose}
   </div>`;
@@ -1111,6 +1206,29 @@ function openRunModal(it) {
   }
   // One-click resume: same agentPost path as a normal reply (simple-CORS text/plain).
   $('#run-retry', ov)?.addEventListener('click', () => continueRun(it, RETRY_PROMPT));
+  $('#run-stop', ov)?.addEventListener('click', () => stopRun(it));
+  ensureHistoryPoll();
+}
+
+async function stopRun(it) {
+  if (!it?.runId || runModalBusy) return;
+  const { error } = await sessionForFire();
+  if (error) { toast(error, 'error'); return; }
+  toast('Stopping…');
+  try {
+    const r = await agentPost({ runId: it.runId, action: 'stop' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) {
+      toast(`Stop failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error');
+      return;
+    }
+    toast('Stopped — open the run and Retry to resume from the transcript.');
+    try { await loadAll(); } catch { /* */ }
+    if (runModalId) refreshRunModal();
+    else if (currentView === 'history') renderHistory();
+  } catch (e) {
+    toast(`Stop request failed: ${e.message}`, 'error');
+  }
 }
 function closeRunModal() { runModalId = null; $('#runOverlay')?.classList.remove('is-open'); }
 // Re-open the currently-open run from fresh data (after a follow-up round-trips).
@@ -1817,9 +1935,16 @@ async function submitDrawer(action) {
     closeDrawer(); calRef = new Date(scheduledAt); currentView = 'calendar'; syncTabs(); render(); toast(`Scheduled — fires ${relative(scheduledAt)}. Added to the calendar.`); return;
   }
   if (action === 'now') {
-    const r = await persist(Object.assign(base, { status: 'scheduled', scheduledAt: new Date().toISOString() }));
+    // Don't leave a due-now scheduled row — fire immediately and claim like the
+    // scheduler would (next recurrence, or library for one-offs).
+    const nowIso = new Date().toISOString();
+    const rec = d.recurrence || 'none';
+    const next = rec === 'none' ? null : nextOccurrence(nowIso, rec);
+    const r = await persist(Object.assign(base, next
+      ? { status: 'scheduled', scheduledAt: next, lastRun: nowIso }
+      : { status: 'library', scheduledAt: null, lastRun: nowIso }));
     if (fromNote) await dbUpdateNote(fromNote, { status: 'planned' });
-    closeDrawer(); calRef = new Date(); currentView = 'calendar'; syncTabs(); render();
+    closeDrawer(); calRef = new Date(); currentView = next ? 'calendar' : 'history'; syncTabs(); render();
     if (r) await fireTrigger(r);
   }
 }

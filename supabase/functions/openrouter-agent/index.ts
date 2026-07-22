@@ -306,8 +306,38 @@ function parseReasoningEffort(v: string): Record<string, unknown> | null {
   const s = String(v || "").toLowerCase().trim();
   if (!s || s === "unset" || s === "default") return null;
   if (s === "off" || s === "none") return { enabled: false };
-  if (s === "low" || s === "medium" || s === "high") return { effort: s, exclude: true };
-  return { effort: "low", exclude: true };
+  // exclude:false so reasoning text is returned for the History "Thoughts" panel.
+  // Effort still caps hidden-token spend; low is the default.
+  if (s === "low" || s === "medium" || s === "high") return { effort: s, exclude: false };
+  return { effort: "low", exclude: false };
+}
+
+// Pull human-readable thoughts from an OpenRouter assistant message.
+function extractReasoning(msg: any): string {
+  if (!msg || typeof msg !== "object") return "";
+  if (typeof msg.reasoning === "string" && msg.reasoning.trim()) return msg.reasoning.trim();
+  if (typeof msg.reasoning_content === "string" && msg.reasoning_content.trim()) return msg.reasoning_content.trim();
+  if (Array.isArray(msg.reasoning_details)) {
+    return msg.reasoning_details
+      .map((d: any) => (typeof d?.text === "string" ? d.text : (typeof d?.summary === "string" ? d.summary : "")))
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+  }
+  return "";
+}
+
+// Build the assistant transcript entry, preserving reasoning for the UI + tool loops.
+function assistantTurn(msg: any, toolCalls?: any[]): Record<string, unknown> {
+  const content = (msg?.content ?? "").toString();
+  const turn: Record<string, unknown> = { role: "assistant", content };
+  if (toolCalls && toolCalls.length) turn.tool_calls = toolCalls;
+  const reasoning = extractReasoning(msg);
+  if (reasoning) turn.reasoning = reasoning;
+  if (Array.isArray(msg?.reasoning_details) && msg.reasoning_details.length) {
+    turn.reasoning_details = msg.reasoning_details;
+  }
+  return turn;
 }
 // Resolve per-call reasoning: explicit opts.reasoning wins (string | object | null).
 // null = omit; undefined = use AGENT_REASONING_EFFORT env (default low).
@@ -698,15 +728,38 @@ function isTransientModelError(err: string): boolean {
 
 
 // Persist transcript mid-run so History shows progress and auto-continue can resume.
+// Never overwrites a user-cancelled run (status=cancelled) with running/success/error.
 async function checkpointRun(
   runId: string | null,
   patch: Record<string, unknown>,
 ): Promise<void> {
   if (!runId) return;
-  await fetch(rest(`routiner_runs?id=eq.${encodeURIComponent(runId)}`), {
+  const id = encodeURIComponent(runId);
+  // Cancelling always wins; other patches only apply while not cancelled.
+  const filter = patch.status === "cancelled"
+    ? `routiner_runs?id=eq.${id}`
+    : `routiner_runs?id=eq.${id}&status=neq.cancelled`;
+  await fetch(rest(filter), {
     method: "PATCH", headers: { ...H(), Prefer: "return=minimal" },
     body: JSON.stringify({ ...patch, fired_at: new Date().toISOString() }),
   }).catch(() => {});
+}
+
+async function getRunStatus(runId: string | null): Promise<string | null> {
+  if (!runId) return null;
+  try {
+    const rows = await sbGet(
+      `routiner_runs?id=eq.${encodeURIComponent(runId)}&select=status&limit=1`,
+    );
+    return rows?.[0]?.status ? String(rows[0].status) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function isRunCancelled(runId: string | null): Promise<boolean> {
+  const s = await getRunStatus(runId);
+  return s === "cancelled";
 }
 
 // Spawn another openrouter-agent invocation on the same run (service role).
@@ -833,17 +886,29 @@ async function runAgentLoop(opts: {
       break;
     }
 
-    const msg = r.message || {};
-    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
-    if (!toolCalls.length || openedPr) {
-      finalText = (msg.content || "").toString().trim() || (openedPr ? "Opened a pull request (see actions)." : "");
-      messages.push({ role: "assistant", content: msg.content || finalText });
+    // Honour Stop: user (or UI) flipped the row to cancelled mid-loop.
+    if (await isRunCancelled(runId)) {
+      finalText = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
       incomplete = false;
       break;
     }
 
-    messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls });
+    const msg = r.message || {};
+    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    if (!toolCalls.length || openedPr) {
+      finalText = (msg.content || "").toString().trim() || (openedPr ? "Opened a pull request (see actions)." : "");
+      messages.push(assistantTurn({ ...msg, content: msg.content || finalText }));
+      incomplete = false;
+      break;
+    }
+
+    messages.push(assistantTurn(msg, toolCalls));
     for (const tc of toolCalls) {
+      if (await isRunCancelled(runId)) {
+        finalText = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
+        incomplete = false;
+        break;
+      }
       const toolBudget = callBudget();
       if (toolBudget < 5_000) {
         finalText = finalText || "Stopped: hit the time budget mid-tools; partial progress is in the transcript.";
@@ -862,6 +927,7 @@ async function runAgentLoop(opts: {
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       if (/opened PR #/i.test(result)) openedPr = true;
     }
+    if (finalText && !incomplete && /Stopped by you/i.test(finalText)) break;
 
     // Checkpoint after every tool batch so History stays live.
     await saveProgress(
@@ -895,6 +961,11 @@ async function runAgentLoop(opts: {
     incomplete = false;
   }
   if (isHardError(finalText)) incomplete = false;
+  // Final cancel check so we never auto-continue a stopped run.
+  if (await isRunCancelled(runId)) {
+    finalText = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
+    incomplete = false;
+  }
 
   return { finalText, actions, cost, steps, incomplete, openedPr };
 }
@@ -943,11 +1014,13 @@ async function handleRequest(req: Request): Promise<Response> {
   const noProgressIn = Math.max(0, Number(body.noProgress) || 0);
   const isAutoContinue = body.autoContinue === true;
 
-  // ── Continuation: reopen a stored run and keep the same conversation going ──
+  // ── Continuation / stop: reopen a stored run ──
   // Human reply: { runId, prompt }. Auto-continue: { runId, prompt, autoContinue, continueDepth, noProgress }.
+  // Stop: { runId, action: "stop" } — flips status to cancelled so the live loop + chain halt.
   if (runId) {
+    const wantStop = body.action === "stop" || body.stop === true;
     const prompt = typeof body.prompt === "string" ? body.prompt : "";
-    if (!prompt.trim() && !isAutoContinue) {
+    if (!wantStop && !prompt.trim() && !isAutoContinue) {
       return json({ ok: false, error: "Missing 'prompt' (the follow-up message)." }, 400);
     }
 
@@ -961,6 +1034,31 @@ async function handleRequest(req: Request): Promise<Response> {
     // Signed-in callers may only continue their own runs (service/secret may continue any).
     if (auth.via === "user-jwt" && auth.userId && row.user_id && row.user_id !== auth.userId) {
       return json({ ok: false, error: "Unauthorized — that run belongs to another user." }, 403);
+    }
+
+    if (wantStop) {
+      const stopMsg = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
+      const prev = String(row.output || "");
+      const output = (stopMsg + (prev && !prev.startsWith("⏹") ? "\n\n" + prev : "")).slice(0, OUTPUT_CAP);
+      // Unconditional cancel (even if already error/success — idempotent enough).
+      await fetch(rest(`routiner_runs?id=eq.${encodeURIComponent(runId)}`), {
+        method: "PATCH", headers: { ...H(), Prefer: "return=minimal" },
+        body: JSON.stringify({
+          status: "cancelled",
+          output,
+          fired_at: new Date().toISOString(),
+        }),
+      }).catch(() => {});
+      return json({ ok: true, runId, stopped: true, status: "cancelled", output });
+    }
+
+    // Already stopped — don't resurrect via auto-continue (human Retry still works with a prompt).
+    if (isAutoContinue && row.status === "cancelled") {
+      return json({
+        ok: true, runId, stopped: true, status: "cancelled",
+        output: row.output || "⏹ Stopped by you.",
+        continuing: false,
+      });
     }
 
     const userId = row.user_id || auth.userId || null;
@@ -1010,9 +1108,11 @@ async function handleRequest(req: Request): Promise<Response> {
     const baseStreak = isAutoContinue ? noProgressIn : 0;
     const nextNoProgress = segmentMadeProgress(actions, finalText) ? 0 : baseStreak + 1;
 
+    const wasCancelled = /Stopped by you/i.test(finalText) || (await isRunCancelled(runId));
+
     let continuing = false;
     let noProgressStop = false;
-    if (incomplete && !isHardError(finalText)) {
+    if (!wasCancelled && incomplete && !isHardError(finalText)) {
       if (nextNoProgress >= MAX_NO_PROGRESS) {
         noProgressStop = true;
         finalText = noProgressStopMessage(nextNoProgress);
@@ -1021,7 +1121,9 @@ async function handleRequest(req: Request): Promise<Response> {
       }
     }
 
-    const status = (isHardError(finalText) || noProgressStop) ? "error" : (continuing ? "running" : "success");
+    const status = wasCancelled
+      ? "cancelled"
+      : (isHardError(finalText) || noProgressStop) ? "error" : (continuing ? "running" : "success");
     const note = continuing
       ? `${finalText}\n\n_Still working in the background (auto-continue ${continueDepth + 1}/${MAX_AUTO_CONTINUES})…_`
       : finalText;
@@ -1032,6 +1134,7 @@ async function handleRequest(req: Request): Promise<Response> {
     return json({
       ok: true, runId, output, steps, cost: Number(cost.toFixed(6)), model, keySource,
       continuing, openedPr, continueDepth, noProgress: nextNoProgress,
+      stopped: wasCancelled,
     });
   }
 
@@ -1104,10 +1207,11 @@ async function handleRequest(req: Request): Promise<Response> {
 
   // Fresh run: streak starts at 0; no progress → 1 and may continue once more.
   const nextNoProgress = segmentMadeProgress(actions, finalText) ? 0 : 1;
+  const wasCancelled = /Stopped by you/i.test(finalText) || (newRunId ? await isRunCancelled(newRunId) : false);
 
   let continuing = false;
   let noProgressStop = false;
-  if (newRunId && incomplete && !isHardError(finalText)) {
+  if (newRunId && !wasCancelled && incomplete && !isHardError(finalText)) {
     if (nextNoProgress >= MAX_NO_PROGRESS) {
       noProgressStop = true;
       finalText = noProgressStopMessage(nextNoProgress);
@@ -1116,7 +1220,9 @@ async function handleRequest(req: Request): Promise<Response> {
     }
   }
 
-  const status = (isHardError(finalText) || noProgressStop) ? "error" : (continuing ? "running" : "success");
+  const status = wasCancelled
+    ? "cancelled"
+    : (isHardError(finalText) || noProgressStop) ? "error" : (continuing ? "running" : "success");
   const note = continuing
     ? `${finalText}\n\n_Still working in the background (auto-continue 1/${MAX_AUTO_CONTINUES})…_`
     : finalText;
@@ -1135,5 +1241,6 @@ async function handleRequest(req: Request): Promise<Response> {
   return json({
     ok: true, runId: newRunId, output, steps, cost: Number(cost.toFixed(6)), model, keySource,
     continuing, openedPr, continueDepth: 0, noProgress: nextNoProgress,
+    stopped: wasCancelled,
   });
 }

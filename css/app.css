@@ -527,12 +527,24 @@ a { color: var(--periwinkle); }
 .hist--busy .hist__status.is-busy { color: var(--periwinkle); }
 .hist__head { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
 .hist__title { font-family: var(--font-display); font-weight: 600; font-size: 15px; flex: 1; }
-.hist__status { font-size: 12px; font-weight: 700; }
+.hist__status { font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; gap: 6px; }
 .hist__status.is-ok { color: var(--lime); }
 .hist__status.is-bad { color: var(--danger); }
 .hist__status.is-warn { color: var(--yellow); }
 .hist__status.is-busy { color: var(--periwinkle); }
 .hist__time { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); }
+.hist__stop { flex: 0 0 auto; margin-left: auto; }
+.hist__spin {
+  display: inline-block;
+  width: 11px; height: 11px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: hist-spin .7s linear infinite;
+  vertical-align: -1px;
+  flex-shrink: 0;
+}
+@keyframes hist-spin { to { transform: rotate(360deg); } }
 .hist__text { font-size: 13.5px; line-height: 1.55; color: var(--text-mid); margin-top: var(--sp-2); }
 .hist__text--none { color: var(--text-low); font-style: italic; }
 .hist__meta {
@@ -636,7 +648,43 @@ a { color: var(--periwinkle); }
   word-break: break-word;
   color: var(--text-mid);
 }
+/* Model thoughts: collapsible, muted — separate from the answer bubble (Claude-style). */
+.transcript__thought {
+  align-self: stretch;
+  max-width: 100%;
+  font-size: 12.5px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: rgba(124, 135, 158, 0.08);
+  padding: var(--sp-2) var(--sp-3);
+}
+.transcript__thought summary {
+  cursor: pointer;
+  color: var(--text-low);
+  font-weight: 600;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+}
+.transcript__thought summary::-webkit-details-marker { display: none; }
+.transcript__thought-icon { opacity: 0.85; }
+.transcript__thought[open] summary { margin-bottom: var(--sp-2); color: var(--text-mid); }
+.transcript__thought-body {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-mid);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow-y: auto;
+}
 .modal__thread .chatmsg { max-width: 88%; }
+.modal__thread .chatmsg--busy { display: inline-flex; align-items: center; gap: 8px; }
+.chip .hist__spin { margin-right: 4px; }
 .modal__thread .chatmsg--bot a { color: var(--accent); text-decoration: underline; word-break: break-all; }
 .modal__thread .chatmsg--bot strong { color: var(--text-high); font-weight: 600; }
 .modal__compose {
