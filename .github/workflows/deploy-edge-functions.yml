@@ -1,0 +1,207 @@
+# Deploy Supabase Edge Functions when function code lands on main
+# (i.e. after a PR merges) or on manual dispatch.
+#
+# Secrets (repo → Settings → Secrets and variables → Actions):
+#   SUPABASE_ACCESS_TOKEN  — personal access token from
+#                            https://supabase.com/dashboard/account/tokens
+#   SUPABASE_PROJECT_ID    — project ref (e.g. vonfdzttupyemtomsojy). Optional if
+#                            you keep the default below; prefer the secret so a
+#                            fork can't accidentally deploy to prod.
+#
+# Auth model: these functions do their own gates (RESPONDER_SECRET, user JWT in
+# body, service-role Bearer, etc.), so we deploy with --no-verify-jwt to match
+# production. Change the NO_JWT list if a function should require gateway JWT.
+
+name: Deploy Edge Functions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "supabase/functions/**"
+      - ".github/workflows/deploy-edge-functions.yml"
+  workflow_dispatch:
+    inputs:
+      functions:
+        description: 'Functions to deploy (space- or comma-separated), or "all"'
+        required: false
+        default: "all"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-edge-functions-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Supabase functions
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      # Prefer secret; fall back to the known Routiner project ref (public in-repo).
+      SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID || 'vonfdzttupyemtomsojy' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Resolve which functions to deploy
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ALL=(
+            dynamic-responder
+            openrouter-agent
+            openrouter-usage
+            routiner-admin
+            routiner-scheduler
+            lead-enrichment
+          )
+
+          emit() {
+            # GitHub Actions outputs: space-separated list
+            echo "list=$*" >> "$GITHUB_OUTPUT"
+            echo "Resolved deploy list: $*"
+          }
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            raw="${{ github.event.inputs.functions }}"
+            raw="${raw//,/ }"
+            if [[ -z "${raw// /}" || "$raw" == "all" ]]; then
+              emit "${ALL[@]}"
+            else
+              emit $raw
+            fi
+            exit 0
+          fi
+
+          # Push to main: only deploy function dirs that changed.
+          # _shared/ or this workflow → deploy everything (shared code / flags).
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+            emit "${ALL[@]}"
+            exit 0
+          fi
+
+          mapfile -t CHANGED < <(git diff --name-only "$BEFORE" "$AFTER" -- \
+            supabase/functions \
+            .github/workflows/deploy-edge-functions.yml \
+            || true)
+
+          printf 'Changed paths:\n'
+          printf '  %s\n' "${CHANGED[@]:-(none)}"
+
+          shared=0
+          for p in "${CHANGED[@]}"; do
+            case "$p" in
+              supabase/functions/_shared/*|.github/workflows/deploy-edge-functions.yml)
+                shared=1
+                break
+                ;;
+            esac
+          done
+          if [[ "$shared" -eq 1 ]]; then
+            emit "${ALL[@]}"
+            exit 0
+          fi
+
+          declare -A want=()
+          for p in "${CHANGED[@]}"; do
+            # supabase/functions/<name>/...
+            if [[ "$p" =~ ^supabase/functions/([^/]+)/ ]]; then
+              name="${BASH_REMATCH[1]}"
+              [[ "$name" == "_shared" ]] && continue
+              want["$name"]=1
+            fi
+          done
+
+          list=()
+          for f in "${ALL[@]}"; do
+            [[ -n "${want[$f]:-}" ]] && list+=("$f")
+          done
+
+          if [[ ${#list[@]} -eq 0 ]]; then
+            emit ""
+            echo "No deployable function directories changed — skipping."
+          else
+            emit "${list[@]}"
+          fi
+
+      - name: Require secrets
+        if: steps.resolve.outputs.list != ''
+        run: |
+          if [[ -z "${SUPABASE_ACCESS_TOKEN:-}" ]]; then
+            echo "::error::Missing repo secret SUPABASE_ACCESS_TOKEN. Create one at https://supabase.com/dashboard/account/tokens and add it under Settings → Secrets → Actions."
+            exit 1
+          fi
+          if [[ -z "${SUPABASE_PROJECT_ID:-}" ]]; then
+            echo "::error::Missing SUPABASE_PROJECT_ID."
+            exit 1
+          fi
+          echo "Project ref: $SUPABASE_PROJECT_ID"
+
+      - name: Deploy functions
+        if: steps.resolve.outputs.list != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # App-level auth; gateway JWT verification stays off (matches CLAUDE.md / live setup).
+          NO_JWT=(
+            dynamic-responder
+            openrouter-agent
+            openrouter-usage
+            routiner-admin
+            routiner-scheduler
+            lead-enrichment
+          )
+
+          needs_no_jwt() {
+            local f="$1"
+            for n in "${NO_JWT[@]}"; do
+              [[ "$f" == "$n" ]] && return 0
+            done
+            return 1
+          }
+
+          failed=0
+          for fn in ${{ steps.resolve.outputs.list }}; do
+            if [[ ! -d "supabase/functions/$fn" ]]; then
+              echo "::error::Unknown function '$fn' (no supabase/functions/$fn directory)"
+              failed=1
+              continue
+            fi
+            echo "::group::Deploy $fn"
+            args=(functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_ID")
+            if needs_no_jwt "$fn"; then
+              args+=(--no-verify-jwt)
+            fi
+            if supabase "${args[@]}"; then
+              echo "✓ $fn"
+            else
+              echo "::error::Deploy failed for $fn"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+
+          if [[ "$failed" -ne 0 ]]; then
+            exit 1
+          fi
+          echo "All selected functions deployed."
+
+      - name: Nothing to deploy
+        if: steps.resolve.outputs.list == ''
+        run: echo "No edge functions to deploy for this push."

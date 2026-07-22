@@ -132,6 +132,11 @@ Already configured! Just sign in and use.
 
 **Live at:** https://zroutiner.netlify.app (auto-deploys from `main`)
 
+**Supabase edge functions** also auto-deploy from `main` when
+`supabase/functions/**` changes (GitHub Action *Deploy Edge Functions*). Add
+repo secret `SUPABASE_ACCESS_TOKEN` (and optional `SUPABASE_PROJECT_ID`) once —
+see CLAUDE.md.
+
 #### Option A: In-App Configuration (Easiest)
 
 1. Sign in to the app
