@@ -25,6 +25,40 @@ Netlify function, passing the prompt straight into the routine's session.
 - **⚡ Test live** — optional instant preview via the Messages API (needs an
   Anthropic key).
 
+## Quickstart
+
+1. Open the live app at **https://zroutiner.netlify.app**.
+2. Sign in (email/password — Supabase handles auth).
+3. Click **New routine**, write a prompt, and either **Run now** or **Schedule** it.
+4. (Optional) Open **⚙ Settings** and add your Claude Code **trigger** + **token**
+   so the app can fire routines on your behalf.
+
+> **Forking?** See the [Setup](#setup) section below to wire your own Supabase
+> project and Netlify site.
+
+## Architecture
+
+Routiner is a static single-page app backed entirely by Supabase:
+
+```
+┌─────────────┐      auth / CRUD      ┌───────────────────────────────┐
+│  index.html │  ───────────────────► │  Supabase                       │
+│  js/app.js  │                      │  • routiner_routines            │
+└─────────────┘                      │  • routiner_runs                │
+       │                             │  • routiner_settings            │
+       │ Run now                     │  (RLS: one user per row)        │
+       ▼                             └───────────────────────────────┘
+┌─────────────────────────┐
+│  Netlify Function       │
+│  claude-trigger.mjs     │────────────────────►  Claude Code routine  
+│  (server-side token)    │                           /fire
+└─────────────────────────┘
+```
+
+Scheduled runs are handled by a Supabase Edge Function,
+`supabase/functions/routiner-scheduler/index.ts`, which calls the same trigger
+function on your behalf.
+
 ## Agents that delegate their own work
 
 Routiner isn't one assistant — it's a **swarm of scheduled Claude agents that
@@ -60,9 +94,9 @@ You set the intent; the swarm plans, splits, executes, and reports back. See
 
 ## Setup
 
-### 1. Supabase (storage + login) — already wired
+### 1. Supabase (storage + login)
 
-The app points at the `zparx-dashboard` Supabase project. Tables
+The live app points at the `zparx-dashboard` Supabase project. Tables
 `routiner_routines`, `routiner_runs`, and `routiner_settings` are created with
 row-level security so each account only sees its own rows. The publishable key
 in `js/app.js` is safe to expose (RLS does the protecting).
@@ -77,7 +111,7 @@ key into `js/app.js` (and `netlify/functions/claude-trigger.mjs`).
 so accounts work immediately. (Leave it on if you'd rather confirm via an email
 link before the first sign-in.)
 
-### 2. Netlify (hosting + trigger) — already wired
+### 2. Netlify (hosting + trigger)
 
 Hosted at **https://zroutiner.netlify.app**, auto-deploying from `main`.
 **Run now** calls `/.netlify/functions/claude-trigger`, which fires your routine
@@ -96,7 +130,7 @@ each Claude account's **trigger** + **token** under "Claude accounts". They save
 to your account (Supabase `routiner_settings`, RLS per user) and the function
 reads them server-side via your session — **no environment variables needed**.
 
-**Or use Netlify env vars** (used as a fallback, and by the scheduler).
+**Or use Netlify env vars** (used as a fallback, and required by the scheduler).
 Set these in **Netlify → Site settings → Environment variables**:
 
 | Var | Value |
@@ -110,7 +144,7 @@ With env vars the token stays server-side — never exposed to the browser. (The
 in-app option trades a little of that — your token lives in your RLS-protected
 Supabase row — for zero-config usability.)
 
-### Locking the trigger to your login (recommended)
+### 3. Locking the trigger to your login (recommended)
 
 By default the trigger function is open. To require a sign-in (so randoms can't
 fire your routine and burn tokens), set:
@@ -124,5 +158,35 @@ fire your routine and burn tokens), set:
 Once `ROUTINER_FIRE_SECRET` is set on **both** sides:
 - The web app must send a valid Supabase access token (it does automatically
   when you're signed in).
-- The scheduler authenticates with the shared secret.
-- If `ALLOWE
+- The scheduler authenticates with the shared secret when it fires routines.
+- Unauthenticated or unauthorized requests are rejected.
+- If `ALLOWED_EMAILS` is set, only those comma-separated emails can fire; if it
+  is left blank, any signed-in user can fire (as long as they pass the secret
+  check).
+
+## Repo structure
+
+```
+.
+├── index.html              # App shell
+├── css/                    # Tokens + app styles
+├── js/app.js               # Main UI logic, Supabase client, routing
+├── netlify/functions/      # Serverless triggers
+├── supabase/functions/     # Edge functions (scheduler, OpenRouter proxy)
+├── supabase/schema.sql     # Database + RLS setup
+├── scripts/                # Usage meter, GLM helper
+├── usage.html              # Live spend dashboard
+└── CLAUDE.md               # Delegation playbook for Claude routines
+```
+
+## Contributing
+
+This is an internal ZPARX project, but if you're working in the repo:
+
+- Keep the README the single source of truth for "how do I run this?"
+- Update [`CLAUDE.md`](CLAUDE.md) when you change the delegation or OpenRouter flow.
+- Add env vars to the Netlify **and** Supabase secret lists when they cross both systems.
+
+## License
+
+Internal / proprietary — see the ZPARX team for usage terms.
