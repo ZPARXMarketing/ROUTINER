@@ -567,17 +567,13 @@ async function fireAgent(routine) {
   const model = triggerModel(account, triggerKey);
   const tools = triggerTools(account, triggerKey);
   if (!routine?.prompt || !routine.prompt.trim()) { toast('This routine has no directions.', 'error'); return; }
-  const { session, error } = await sessionForFire();
+  const { error } = await sessionForFire();
   if (error) { toast(error, 'error'); return; }
   const who = `${accountLabel(account)}/${triggerLabel(account, triggerKey) || 'instance'}`;
   toast(`Running ${modelLabel(model)} — ${who}… this can take a minute.`);
   try {
-    const r = await fetch(`${SUPABASE_URL}/functions/v1/openrouter-agent`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}` },
-      body: JSON.stringify({ account, triggerKey, model, tools, prompt: routine.prompt,
-        routineId: routine?.id, title: routine?.title, report: true, source: 'planner' }),
-    });
+    const r = await agentPost({ account, triggerKey, model, tools, prompt: routine.prompt,
+      routineId: routine?.id, title: routine?.title, report: true, source: 'planner' });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) { toast(`Agent run failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); return; }
     const cost = Number(data.cost || 0);
@@ -1089,21 +1085,32 @@ function closeRunModal() { runModalId = null; $('#runOverlay')?.classList.remove
 // Re-open the currently-open run from fresh data (after a follow-up round-trips).
 function refreshRunModal() { if (!runModalId) return; const it = historyItems().find((x) => x.id === runModalId); if (it) openRunModal(it); else closeRunModal(); }
 
+// POST to the openrouter-agent edge function as a *simple* CORS request:
+// text/plain content-type and no apikey/Authorization headers, so the browser
+// sends it WITHOUT a CORS preflight. The Supabase edge gateway currently returns
+// 500 on the OPTIONS preflight for every function on this project, which blocks
+// any browser fetch that would preflight (that's why History replies failed with
+// "Load failed"). openrouter-agent runs with verify_jwt=false and ignores caller
+// auth headers, so dropping them is safe — the POST reaches the function directly.
+function agentPost(body) {
+  return fetch(`${SUPABASE_URL}/functions/v1/openrouter-agent`, {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain;charset=UTF-8' },
+    body: JSON.stringify(body),
+  });
+}
+
 async function continueRun(it, raw) {
   const text = (raw || '').trim();
   if (!text || runModalBusy || !isContinuable(it)) return;
-  const { session, error } = await sessionForFire();
+  const { error } = await sessionForFire();
   if (error) { toast(error, 'error'); return; }
   runModalBusy = true;
   // Optimistically show the user's message + a thinking bubble.
   const optimistic = { ...it, messages: [...(Array.isArray(it.messages) ? it.messages : []), { role: 'user', content: text }] };
   openRunModal(optimistic);
   try {
-    const r = await fetch(`${SUPABASE_URL}/functions/v1/openrouter-agent`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}` },
-      body: JSON.stringify({ runId: it.runId, prompt: text }),
-    });
+    const r = await agentPost({ runId: it.runId, prompt: text });
     const data = await r.json().catch(() => ({}));
     runModalBusy = false;
     if (!r.ok || data.ok === false) { toast(`Reply failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); refreshRunModal(); return; }
@@ -1112,10 +1119,37 @@ async function continueRun(it, raw) {
     try { await loadAll(); } catch { /* the row is saved regardless */ }
     refreshRunModal();
   } catch (e) {
+    // A long agent reply can outlast the platform's request timeout: the browser
+    // fetch throws ("Load failed" / "Failed to fetch") even though the function
+    // finished and persisted the reply onto the run row. Don't cry failure yet —
+    // poll the row; if it advanced, the reply actually landed.
+    const landed = await pollReplyLanded(it.runId, it.time);
     runModalBusy = false;
-    toast(`Reply request failed: ${e.message}`, 'error');
+    if (landed) {
+      toast('Reply completed.');
+      try { await loadAll(); } catch { /* the row is saved regardless */ }
+    } else {
+      toast(`Reply request failed: ${e.message}`, 'error');
+    }
     refreshRunModal();
   }
+}
+
+// After a reply request drops at the network layer, check whether the server
+// actually finished: the openrouter-agent function persists the continued run
+// (and bumps fired_at) whether or not the HTTP response made it back. Returns
+// true once the row's fired_at advances past when the reply started.
+async function pollReplyLanded(runId, sinceTime) {
+  if (!runId) return false;
+  const since = sinceTime ? new Date(sinceTime).getTime() : 0;
+  for (let i = 0; i < 15; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    try {
+      const { data } = await sb.from('routiner_runs').select('fired_at').eq('id', runId).maybeSingle();
+      if (data && data.fired_at && new Date(data.fired_at).getTime() > since) return true;
+    } catch { /* transient — keep polling */ }
+  }
+  return false;
 }
 
 /* ---------- Chat (test a model directly) ----------
@@ -1900,14 +1934,10 @@ async function testAgentRun(ai, ti) {
   const saved = await dbSaveAccountCreds(cfgModel);
   accountsCfg = normalizeAccounts(cfgModel, false);
   if (!saved) { statusEl.textContent = 'Couldn’t save settings.'; statusEl.className = 'trig-status is-err'; return; }
-  const { session, error } = await sessionForFire();
+  const { error } = await sessionForFire();
   if (error) { statusEl.textContent = `✕ ${error}`; statusEl.className = 'trig-status is-err'; return; }
   try {
-    const r = await fetch(`${SUPABASE_URL}/functions/v1/openrouter-agent`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}` },
-      body: JSON.stringify({ ping: true, account: acc.id, triggerKey: t.id, model: t.model || DEFAULT_AGENT_MODEL }),
-    });
+    const r = await agentPost({ ping: true, account: acc.id, triggerKey: t.id, model: t.model || DEFAULT_AGENT_MODEL });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || data.ok === false) { statusEl.textContent = `✕ ${data.error || `HTTP ${r.status}`}`; statusEl.className = 'trig-status is-err'; return; }
     statusEl.textContent = `✓ ${modelLabel(t.model || DEFAULT_AGENT_MODEL)} reachable${data.keySource ? ` (${data.keySource} key)` : ''}.`;
