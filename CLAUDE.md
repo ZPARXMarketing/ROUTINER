@@ -276,8 +276,17 @@ to send the **complete** new file contents, never a partial diff.
 - `SCHEDULER_REAP_RUN_MIN` *(optional, default 10)* — minutes of silence before
   the scheduler reaper marks a stuck `running` row as `error` (resumable).
 
-Then redeploy: `supabase functions deploy openrouter-agent dynamic-responder
-routiner-scheduler` (edge functions do not auto-deploy from git).
+Edge functions **auto-deploy from `main`** via
+[`.github/workflows/deploy-edge-functions.yml`](.github/workflows/deploy-edge-functions.yml)
+when `supabase/functions/**` changes (after a PR merges). Manual run:
+Actions → *Deploy Edge Functions* → Run workflow.
+
+One-time secrets (repo → Settings → Secrets → Actions):
+- `SUPABASE_ACCESS_TOKEN` — from [Supabase account tokens](https://supabase.com/dashboard/account/tokens)
+- `SUPABASE_PROJECT_ID` — project ref (optional; defaults to this project's ref)
+
+Local / emergency: `supabase functions deploy openrouter-agent dynamic-responder
+routiner-scheduler --no-verify-jwt`.
 
 **Use it:** in the app, add an **OpenRouter agent** account, pick a coding model
 (Kimi K2.7 Code is the default and a good, cheap fit), check **Fix code
