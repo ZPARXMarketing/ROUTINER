@@ -90,7 +90,7 @@ const ghAllowedRepos = (): Set<string> | null => {
   const raw = Deno.env.get("GITHUB_ALLOWED_REPOS");
   if (!raw) return null;
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  return list.length ? new Set(list) : null;
+  return list.length ? new Set(list.map((s) => s.toLowerCase())) : null;
 };
 // Resolve + authorize the repo for a code tool call.
 function resolveRepo(arg?: unknown): { repo?: string; error?: string } {
@@ -99,8 +99,8 @@ function resolveRepo(arg?: unknown): { repo?: string; error?: string } {
   const want = (typeof arg === "string" && arg.trim()) ? arg.trim() : def;
   if (!want) return { error: "no repo: set the GITHUB_REPO edge secret or pass repo as 'owner/name'." };
   if (!/^[^/\s]+\/[^/\s]+$/.test(want)) return { error: `bad repo '${want}' — want 'owner/name'.` };
-  if (allow) { if (!allow.has(want)) return { error: `repo '${want}' is not in GITHUB_ALLOWED_REPOS.` }; }
-  else if (def && want !== def) return { error: `repo '${want}' not allowed (only '${def}'); set GITHUB_ALLOWED_REPOS to widen.` };
+  if (allow) { if (!allow.has(want.toLowerCase())) return { error: `repo '${want}' is not in GITHUB_ALLOWED_REPOS.` }; }
+  else if (def && want.toLowerCase() !== def.toLowerCase()) return { error: `repo '${want}' not allowed (only '${def}'); set GITHUB_ALLOWED_REPOS to widen.` };
   return { repo: want };
 }
 const ghPath = (p: string) => String(p).replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/");
