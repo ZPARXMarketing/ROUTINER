@@ -202,6 +202,49 @@ the exact Supabase REST recipes. The loop:
 5. **Mark each note** `planned` (or `done` if you handled it on the spot) so it
    isn't re-planned.
 
+## Fixing & merging code without Claude — the code-capable OpenRouter agent
+
+The whole point of reducing Claude-reliance: a **non-Claude** model (Kimi K2.7
+Code, GLM-5, GPT-5.6, Gemini…) can now **read the repo, propose a fix as a pull
+request, and merge it** — no Claude Code session in the hot path. This is the
+`code` tool group on an **OpenRouter agent account** (kind `openrouter-agent`),
+executed by the `openrouter-agent` edge function through the **GitHub REST API**
+(no shell/sandbox needed — GitHub *is* the sandbox).
+
+**Tools the model gets** (when `code` is checked on the instance and a token is
+configured): `gh_read_file` (read a file or list a dir, returns the blob sha),
+`gh_list_prs`, `gh_read_pr` (metadata + per-file patches), `gh_propose_change`
+(branch → write full file(s) → open PR — the *fix* path), `gh_comment_pr`, and
+`gh_merge_pr` (the *merge* path). The agent is told to read before it writes and
+to send the **complete** new file contents, never a partial diff.
+
+**Setup (one-time, human — Supabase → Edge Functions → secrets):**
+
+- `GITHUB_TOKEN` — a fine-grained PAT with **Contents** + **Pull requests**
+  read/write on the repo(s) you want the agent to touch. Without it the `code`
+  checkbox is inert (the tools aren't even offered to the model).
+- `GITHUB_REPO` — the default `owner/name` (e.g. `zparxmarketing/routiner`) the
+  agent works on when a call doesn't name one.
+- `GITHUB_ALLOWED_REPOS` *(optional)* — comma-separated allowlist. Omitted →
+  only `GITHUB_REPO` is reachable (safe default; the agent can't wander to other
+  repos your token happens to reach).
+- `AGENT_ALLOW_MERGE` *(optional)* — set to `true` to let `gh_merge_pr` actually
+  merge. **Off by default**: until you set it, the agent opens PRs for you to
+  review and merge, and merging returns a clear "disabled" message.
+- `AGENT_CODE_MAX_STEPS` *(optional, default 12)* — coding runs get a bigger
+  tool-loop budget than the 6-step default so read→fix→open→merge fits.
+
+Then redeploy: `supabase functions deploy openrouter-agent`.
+
+**Use it:** in the app, add an **OpenRouter agent** account, pick a coding model
+(Kimi K2.7 Code is the default and a good, cheap fit), check **Fix code
+(GitHub)**, and schedule a routine on it — e.g. *"Read issue #57, fix it, open a
+PR, and if the change is small and obviously correct, merge it."* The run lands
+in **History** (full transcript, resumable) like any other agent run, and every
+model call is metered in `routiner_openrouter_usage`. This is the path to *"I
+can merge and fix code without Claude."* Keep merge gated until you trust a
+given model on your repo; start by letting it open PRs and reviewing them.
+
 ## Lead enrichment — the autonomous ICP flywheel
 
 Scheduled **Perplexity deep research → Command's Review tab**, with no Claude in
