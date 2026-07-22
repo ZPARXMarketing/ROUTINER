@@ -81,7 +81,12 @@ const MIN_MODEL_CALL_MS = Math.min(num("AGENT_MIN_MODEL_CALL_MS", 25_000), CALL_
 // limit so we can return JSON and/or spawn the next auto-continue segment.
 const DEADLINE_MS = num("AGENT_DEADLINE_MS", 100_000);
 // Smaller tool payloads → less context bloat → more steps fit before timeout.
-const TOOL_RESULT_CAP = num("AGENT_TOOL_RESULT_CAP", 3500);
+// Non-file tools stay modest; gh_read_file uses GH_READ_RESULT_CAP (was 3500 for
+// everything, which made the model report "file too large" on any real source file).
+const TOOL_RESULT_CAP = num("AGENT_TOOL_RESULT_CAP", 8_000);
+// File reads need room for real source (js/app.js alone is ~136k). Still capped so
+// a single blob can't explode the context window.
+const GH_READ_RESULT_CAP = Math.min(num("AGENT_GH_READ_RESULT_CAP", 120_000), 400_000);
 const OUTPUT_CAP = num("AGENT_OUTPUT_CAP", 60_000);
 // How many background segments after the first (total segments = 1 + this).
 // 5 × ~100s ≈ set-and-forget multi-minute jobs without blowing one request.
@@ -107,6 +112,8 @@ const GH_ALLOW_MERGE = () => /^(1|true|yes|on)$/i.test(Deno.env.get("AGENT_ALLOW
 // Caps on agent writes (gh_propose_change) — keep PRs reviewable and limit blast radius.
 const GH_MAX_FILES = Math.min(num("AGENT_GH_MAX_FILES", 10), 30);
 const GH_MAX_FILE_CHARS = Math.min(num("AGENT_GH_MAX_FILE_CHARS", 400_000), 1_000_000);
+// Default window when the model pages a large file with start_line/max_lines.
+const GH_READ_DEFAULT_LINES = Math.min(num("AGENT_GH_READ_DEFAULT_LINES", 400), 2_000);
 // null = "only the default repo is allowed"; a set = that explicit allowlist.
 const ghAllowedRepos = (): Set<string> | null => {
   const raw = Deno.env.get("GITHUB_ALLOWED_REPOS");
@@ -453,10 +460,12 @@ function toolSpecs(enabled: Set<string>): unknown[] {
   if (enabled.has("code") && GH_TOKEN()) {
     const repoProp = { repo: { type: "string", description: "owner/name; omit to use the configured default repo" } };
     specs.push(
-      { type: "function", function: { name: "gh_read_file", description: "Read a file (or list a directory) from the repo. Returns the text and its blob sha. Use this to understand code before changing it.",
+      { type: "function", function: { name: "gh_read_file", description: "Read a file (or list a directory) from the repo. Returns the text and its blob sha. For large files, pass start_line + max_lines to page through (do not claim the file is unreadable — page it).",
         parameters: { type: "object", required: ["path"], properties: { ...repoProp,
           path: { type: "string", description: "path within the repo, e.g. js/app.js (a directory path returns a listing)" },
-          ref: { type: "string", description: "branch, tag, or commit sha (default: the repo's default branch)" } } } } },
+          ref: { type: "string", description: "branch, tag, or commit sha (default: the repo's default branch)" },
+          start_line: { type: "number", description: "1-based line to start at (optional; use with max_lines for large files)" },
+          max_lines: { type: "number", description: `how many lines to return (default ${GH_READ_DEFAULT_LINES} when start_line is set; omit both to try the whole file up to the size cap)` } } } } },
       { type: "function", function: { name: "gh_list_prs", description: "List pull requests in the repo (number, title, state, branches).",
         parameters: { type: "object", properties: { ...repoProp, state: { type: "string", enum: ["open", "closed", "all"], description: "default open" } } } } },
       { type: "function", function: { name: "gh_read_pr", description: "Read one pull request: its metadata, mergeability, and per-file diffs (patches).",
@@ -558,12 +567,60 @@ async function runTool(
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const path = String(args.path || "").trim(); if (!path) return "error: missing path";
-        const ref = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
-        const r = await gh("GET", `/repos/${repo}/contents/${ghPath(path)}${ref}`, undefined, tMs);
+        const refQ = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
+        const r = await gh("GET", `/repos/${repo}/contents/${ghPath(path)}${refQ}`, undefined, tMs);
         if (!r.ok) return `error: read ${path} → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
-        if (Array.isArray(r.data)) return `directory ${path}:\n` + r.data.map((e: any) => `${e.type === "dir" ? "dir " : "file"}  ${e.path}`).join("\n");
-        if (r.data?.encoding !== "base64") return `error: ${path} is not a readable text file.`;
-        return `path: ${r.data.path}\nsha: ${r.data.sha}\n\n${b64decode(r.data.content)}`;
+        if (Array.isArray(r.data)) {
+          return `directory ${path}:\n` + r.data.map((e: any) => `${e.type === "dir" ? "dir " : "file"}  ${e.path}`).join("\n");
+        }
+        // Contents API omits body for files > ~1MB — fall back to the Git Blobs API.
+        let text = "";
+        const blobSha = r.data?.sha ? String(r.data.sha) : "";
+        if (r.data?.encoding === "base64" && r.data?.content) {
+          try { text = b64decode(r.data.content); } catch {
+            return `error: ${path} could not be decoded as UTF-8 text.`;
+          }
+        } else if (blobSha) {
+          const blob = await gh("GET", `/repos/${repo}/git/blobs/${blobSha}`, undefined, tMs);
+          if (!blob.ok) return `error: read blob ${path} → ${blob.status}: ${String(blob.data?.message || "").slice(0, 160)}`;
+          if (blob.data?.encoding === "base64" && blob.data?.content) {
+            try { text = b64decode(blob.data.content); } catch {
+              return `error: ${path} could not be decoded as UTF-8 text.`;
+            }
+          } else {
+            return `error: ${path} is not a readable text file (size ${r.data?.size ?? "?"}).`;
+          }
+        } else {
+          return `error: ${path} is not a readable text file.`;
+        }
+        const lines = text.split("\n");
+        const totalLines = lines.length;
+        const totalChars = text.length;
+        const hasStart = args.start_line != null && Number(args.start_line) > 0;
+        const hasMax = args.max_lines != null && Number(args.max_lines) > 0;
+        // Auto-page when the whole file would exceed the read cap and the model
+        // didn't already request a window — never return a silent partial file.
+        let start = hasStart ? Math.max(1, Math.floor(Number(args.start_line))) : 1;
+        let maxLines = hasMax
+          ? Math.max(1, Math.min(Math.floor(Number(args.max_lines)), 5_000))
+          : (hasStart ? GH_READ_DEFAULT_LINES : totalLines);
+        if (!hasStart && !hasMax && totalChars > GH_READ_RESULT_CAP) {
+          maxLines = GH_READ_DEFAULT_LINES;
+          start = 1;
+        }
+        const end = Math.min(totalLines, start + maxLines - 1);
+        const slice = lines.slice(start - 1, end).join("\n");
+        const header = [
+          `path: ${r.data.path || path}`,
+          `sha: ${blobSha}`,
+          `lines: ${start}-${end} of ${totalLines}`,
+          `chars: ${slice.length} of ${totalChars}`,
+        ].join("\n");
+        let body = `${header}\n\n${slice}`;
+        if (end < totalLines) {
+          body += `\n\n…[more content after line ${end}. Re-call gh_read_file with start_line=${end + 1} and max_lines=${GH_READ_DEFAULT_LINES} (or a larger max_lines). For a full rewrite you need the complete file — page until lines cover 1-${totalLines}, or target a smaller change.]`;
+        }
+        return body;
       }
       case "gh_list_prs": {
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
@@ -601,7 +658,7 @@ async function runTool(
           if (deny) return `error: blocked path '${p}': ${deny}`;
           const content = String(c.content ?? "");
           if (content.length > GH_MAX_FILE_CHARS) {
-            return `error: '${p}' is too large (${content.length} chars); max is ${GH_MAX_FILE_CHARS}.`;
+            return `error: '${p}' is too large to write (${content.length} chars); max is ${GH_MAX_FILE_CHARS}. Split the change or raise AGENT_GH_MAX_FILE_CHARS (hard max 1e6).`;
           }
         }
         const title = String(args.title || "").trim() || "Routiner agent change";
@@ -686,6 +743,7 @@ You have these tool capabilities: ${toolList}.
 Efficiency rules (critical — you have limited steps per segment):
 - Prefer acting over exploring. Guess correct path casing once (e.g. TODO.md not todo.md); on 404, try the obvious alternate once, then move on.
 - Do not re-read a file you already have in the transcript. Do not list "/" unless you truly don't know the layout.
+- Large files: gh_read_file supports start_line + max_lines. If a read says "more content after line N", page with start_line=N+1 — do NOT say the file is too large or unreadable. Prefer editing smaller files; for huge files, page the relevant region and still send COMPLETE file contents to gh_propose_change only when you have them (or skip and report which window you inspected).
 - For code fixes: read the target file(s) → gh_propose_change with COMPLETE file contents → stop tools and summarize with the PR URL.
 - One focused change set per task. Do not start a second unrelated fix in the same run.
 - Use read_* / web_research only when needed for the task. Skip them for pure code edits when the user already named the file/repo.
@@ -918,10 +976,15 @@ async function runAgentLoop(opts: {
       const name = tc?.function?.name || "";
       let args: Record<string, any> = {};
       try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
-      const result = (await runTool(name, args, {
+      const raw = await runTool(name, args, {
         userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled,
         timeoutMs: toolBudget,
-      })).slice(0, TOOL_RESULT_CAP);
+      });
+      // File reads get a much higher cap; other tools stay small for context.
+      const cap = name === "gh_read_file" ? GH_READ_RESULT_CAP : TOOL_RESULT_CAP;
+      const result = raw.length > cap
+        ? raw.slice(0, cap) + `\n\n…[truncated at ${cap} chars of ${raw.length}. For files, re-call gh_read_file with start_line/max_lines to page.]`
+        : raw;
       const line = `${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`;
       actions.push(line);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
