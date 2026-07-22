@@ -38,9 +38,11 @@ export const MODELS = [
   { id: 'google/gemini-3-flash-preview', label: 'Gemini 3 Flash — cheapest Gemini (OpenRouter)' },
   { id: 'deepseek/deepseek-chat', label: 'DeepSeek Chat — cheap (OpenRouter)' },
   { id: 'moonshotai/kimi-k2.7-code', label: 'Kimi K2.7 Code (OpenRouter)' },
+  { id: 'moonshotai/kimi-k3', label: 'Kimi K3 — newest Kimi (OpenRouter)' },
   { id: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B (OpenRouter)' },
   { id: 'z-ai/glm-4.7', label: 'GLM 4.7 — fast, cheap coding (OpenRouter)' },
   { id: 'z-ai/glm-5', label: 'GLM 5 — most capable GLM (OpenRouter)' },
+  { id: 'z-ai/glm-5.2', label: 'GLM 5.2 — Zhipu / Z.ai, June 2026 (OpenRouter)' },
 ];
 
 /* ---------- Cost estimation ----------
@@ -62,9 +64,11 @@ export const MODEL_PRICING = {
   'google/gemini-3-flash-preview': { in: 0.5, out: 3 },
   'deepseek/deepseek-chat': { in: 0.27, out: 1.1, approx: true },
   'moonshotai/kimi-k2.7-code': { in: 0.6, out: 2.5, approx: true },
+  'moonshotai/kimi-k3': { in: 3, out: 15, approx: true },
   'meta-llama/llama-3.3-70b-instruct': { in: 0.1, out: 0.25, approx: true },
   'z-ai/glm-4.7': { in: 0.6, out: 2.2, approx: true },
   'z-ai/glm-5': { in: 1, out: 3.2, approx: true },
+  'z-ai/glm-5.2': { in: 0.81, out: 2.56, approx: true },
 };
 
 /* Estimation knobs: ~4 chars/token for English prose; a routine run carries

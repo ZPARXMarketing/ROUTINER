@@ -55,7 +55,9 @@ const MAX_TOKENS_CAP = 8192; // guardrail against runaway cost
 const DEFAULT_ALLOWED = [
   "z-ai/glm-4.7",
   "z-ai/glm-5",
+  "z-ai/glm-5.2",
   "moonshotai/kimi-k2.7-code",
+  "moonshotai/kimi-k3",
   "deepseek/deepseek-chat",
   "meta-llama/llama-3.3-70b-instruct",
   "openrouter/auto",
