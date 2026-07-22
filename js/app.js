@@ -1086,17 +1086,26 @@ function closeRunModal() { runModalId = null; $('#runOverlay')?.classList.remove
 function refreshRunModal() { if (!runModalId) return; const it = historyItems().find((x) => x.id === runModalId); if (it) openRunModal(it); else closeRunModal(); }
 
 // POST to the openrouter-agent edge function as a *simple* CORS request:
-// text/plain content-type and no apikey/Authorization headers, so the browser
-// sends it WITHOUT a CORS preflight. The Supabase edge gateway currently returns
-// 500 on the OPTIONS preflight for every function on this project, which blocks
-// any browser fetch that would preflight (that's why History replies failed with
-// "Load failed"). openrouter-agent runs with verify_jwt=false and ignores caller
-// auth headers, so dropping them is safe — the POST reaches the function directly.
-function agentPost(body) {
+// text/plain content-type and no Authorization header, so the browser sends it
+// WITHOUT a CORS preflight (the Supabase edge gateway currently 500s OPTIONS on
+// this project — History replies used to fail with "Load failed").
+// Auth still happens: we embed the signed-in user's access token in the JSON
+// body as `accessToken`. The edge function verifies it via GoTrue and rejects
+// unauthenticated callers (so random internet can't drive GITHUB_TOKEN). The
+// scheduler instead sends the service-role Bearer, which the function also accepts.
+async function agentPost(body) {
+  const payload = { ...(body || {}) };
+  // Prefer a token the caller already resolved; else pull the current session.
+  if (!payload.accessToken && !payload.access_token) {
+    try {
+      const { data: { session } } = await sb.auth.getSession();
+      if (session?.access_token) payload.accessToken = session.access_token;
+    } catch { /* edge function will 401 */ }
+  }
   return fetch(`${SUPABASE_URL}/functions/v1/openrouter-agent`, {
     method: 'POST',
     headers: { 'content-type': 'text/plain;charset=UTF-8' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
 }
 

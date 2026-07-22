@@ -13,30 +13,30 @@ Related code: `supabase/functions/openrouter-agent/index.ts`, `js/app.js` (`agen
 
 ### Auth & exposure
 
-- [ ] **Hard-auth `openrouter-agent`**
-  - Require a verified Supabase user JWT **or** `RESPONDER_SECRET` (for scheduler/service callers).
-  - Stop relying on browser-only `sessionForFire` checks that never reach the edge function.
-  - Do not leave the function world-open when `RESPONDER_SECRET` is unset.
+- [x] **Hard-auth `openrouter-agent`** *(shipped — solo-friendly)*
+  - Accepts: valid user JWT (`Authorization` or body `accessToken`), **or** service-role Bearer (scheduler), **or** `RESPONDER_SECRET`.
+  - Unauthenticated POSTs get `401` — random internet can no longer drive `GITHUB_TOKEN` / OpenRouter.
+  - Browser still uses CORS-simple `text/plain` POST; token rides in JSON body (see `agentPost`).
+  - Continuations by user JWT are scoped to that user's run rows.
 
-- [ ] **Fix CORS properly so auth headers work**
-  - Current `agentPost` uses `text/plain` and drops `Authorization` / `apikey` to avoid OPTIONS 500s.
-  - Prefer a same-origin Netlify proxy or a working preflight path so the browser can send real auth.
-  - Teach scheduler / CLI to send `RESPONDER_SECRET` (or service identity) when the gate is on — service-role as Bearer must not be confused with the secret.
+- [x] **CORS-safe auth without preflight** *(shipped)*
+  - Kept `text/plain` body path (gateway OPTIONS still broken).
+  - `agentPost` attaches `accessToken` from the session; scheduler keeps service-role headers.
 
-- [ ] **Confirm production gate**
-  - Verify whether `RESPONDER_SECRET` is set on the live project.
-  - If unset while `GITHUB_TOKEN` is set: treat as **critical exposure** until P0 auth lands.
+- [ ] **Confirm production deploy**
+  - Redeploy `openrouter-agent` so the hard-auth code is live (`supabase functions deploy openrouter-agent`).
+  - Smoke: signed-out / no-token POST → 401; signed-in Run-now agent → works; History continue → works; scheduler agent fire → works.
 
 ### Tool authorization (server-side)
 
-- [ ] **Do not trust client-supplied `body.tools` for capability grants**
-  - Resolve `account` + `triggerKey` → `routiner_settings` tools under the **authenticated** user.
-  - Intersect requested tools with the stored allowlist.
-  - Especially never accept raw `tools: ["code"]` without settings + auth.
+- [ ] **Do not trust client-supplied `body.tools` for capability grants** *(deferred for solo use)*
+  - You want models free to open PRs with your GitHub key when `code` is enabled.
+  - Auth is the real boundary; re-binding tools to Settings is optional later if multi-user.
 
-- [ ] **Hard allowlist at `runTool` execution time**
-  - Only execute tools present in the resolved `enabled` set **and** that pass preconditions (`code` ⇒ token + allowed repo).
-  - Reject unknown / hallucinated tool names (e.g. model invents `gh_merge_pr` when `code` is off).
+- [x] **Hard allowlist at `runTool` execution time** *(shipped)*
+  - Only executes tools whose group is in the run's `enabled` set.
+  - Unknown / hallucinated names (incl. `gh_*` when `code` is off) are rejected.
+  - `code` still requires `GITHUB_TOKEN`; merge still requires `AGENT_ALLOW_MERGE`.
 
 ---
 

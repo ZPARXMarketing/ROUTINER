@@ -19,10 +19,14 @@
 // (routiner_settings.accounts[account].key) if the owner set one, else the
 // server-side OPENROUTER_API_KEY edge secret. The key never reaches the browser.
 //
-// Auth: deployed with verify_jwt=false and gated by the publishable key at the
-// gateway, exactly like routiner-admin / dynamic-responder / lead-enrichment.
-// Owner user_id is resolved from routineId (else the single-owner fallback), the
-// same model those functions use. An optional RESPONDER_SECRET gate is honored.
+// Auth (hard — the function is NOT world-callable):
+//   1. RESPONDER_SECRET (Bearer or x-responder-secret), when that edge secret is set, OR
+//   2. SUPABASE_SERVICE_ROLE_KEY as Bearer (scheduler / server callers), OR
+//   3. a valid Supabase user JWT (Authorization Bearer, or body.accessToken so the
+//      browser can authenticate without a CORS preflight — see agentPost in app.js).
+// Owner user_id is resolved from the JWT when present, else routineId, else the
+// single-owner fallback. GitHub write tools still require GITHUB_TOKEN; merge
+// still requires AGENT_ALLOW_MERGE. Models may open PRs freely once authorized.
 //
 // Request (POST JSON):
 //   Fresh run:  { prompt, model?, tools?: ("read"|"research"|"write"|"code")[], account?,
@@ -136,10 +140,62 @@ const cors = {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...cors } });
 
-function callerSecret(req: Request): string {
+function bearerToken(req: Request): string {
   const h = req.headers.get("authorization") || "";
-  const bearer = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
-  return bearer || (req.headers.get("x-responder-secret") || "").trim();
+  return h.startsWith("Bearer ") ? h.slice(7).trim() : "";
+}
+
+// Verify a Supabase user access token via GoTrue. Returns the user id or null.
+async function verifyUserJwt(token: string): Promise<string | null> {
+  if (!token || !SB_URL) return null;
+  // Service role or anon both work as apikey for /auth/v1/user when Authorization
+  // is the user's JWT; prefer service role (always present on edge functions).
+  const apikey = Deno.env.get("SUPABASE_ANON_KEY") || SB_KEY;
+  if (!apikey) return null;
+  try {
+    const r = await fetch(`${SB_URL}/auth/v1/user`, {
+      headers: { apikey, authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!r.ok) return null;
+    const u = await r.json();
+    return typeof u?.id === "string" && u.id ? u.id : null;
+  } catch {
+    return null;
+  }
+}
+
+// Hard auth for every call. Prevents the open internet from driving GITHUB_TOKEN /
+// OPENROUTER_API_KEY even though verify_jwt is false at the gateway (needed so
+// the browser can use a simple CORS POST with the token in the JSON body).
+async function authorizeCaller(
+  req: Request,
+  body: Record<string, unknown>,
+): Promise<{ ok: true; userId: string | null; via: string } | { ok: false; error: string }> {
+  const bearer = bearerToken(req);
+  const headerSecret = (req.headers.get("x-responder-secret") || "").trim();
+  const gate = (Deno.env.get("RESPONDER_SECRET") || "").trim();
+
+  if (gate && (bearer === gate || headerSecret === gate)) {
+    return { ok: true, userId: null, via: "responder-secret" };
+  }
+  if (SB_KEY && bearer === SB_KEY) {
+    return { ok: true, userId: null, via: "service-role" };
+  }
+
+  // Prefer header JWT; fall back to body.accessToken (CORS-simple browser path).
+  const bodyTok = typeof body.accessToken === "string" ? body.accessToken.trim()
+    : (typeof body.access_token === "string" ? body.access_token.trim() : "");
+  const candidates = [bearer, bodyTok].filter((t) => t && t !== SB_KEY && t !== gate);
+  for (const tok of candidates) {
+    const userId = await verifyUserJwt(tok);
+    if (userId) return { ok: true, userId, via: "user-jwt" };
+  }
+
+  return {
+    ok: false,
+    error: "Unauthorized — sign in, or call with the service role / RESPONDER_SECRET.",
+  };
 }
 
 // ── Supabase REST helpers (service role) ─────────────────────────────────────
@@ -149,6 +205,15 @@ async function sbGet(path: string): Promise<any[]> {
   const r = await fetch(rest(path), { headers: H() });
   if (!r.ok) throw new Error(`GET ${path} → ${r.status}: ${(await r.text()).slice(0, 200)}`);
   return await r.json();
+}
+
+// Map a tool function name → tool-group id (must match Settings checkboxes).
+function toolGroupOf(name: string): string | null {
+  if (name === "read_routines" || name === "read_notes" || name === "read_leads") return "read";
+  if (name === "web_research") return "research";
+  if (name === "write_note" || name === "find_and_save_leads") return "write";
+  if (name.startsWith("gh_")) return "code";
+  return null;
 }
 
 // The single owner user_id, resolved from a routineId when given (so the run row
@@ -302,7 +367,21 @@ function toolSpecs(enabled: Set<string>): unknown[] {
 }
 
 // Execute a single tool call. Returns a string result (capped by the caller).
-async function runTool(name: string, args: Record<string, any>, ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null }): Promise<string> {
+// `enabled` is re-checked here so a model cannot invoke a tool group that was
+// not offered for this run (e.g. hallucinating gh_* when code is off).
+async function runTool(
+  name: string,
+  args: Record<string, any>,
+  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string> },
+): Promise<string> {
+  const group = toolGroupOf(name);
+  if (!group || !ctx.enabled.has(group)) {
+    return `error: tool '${name}' is not enabled for this run.`;
+  }
+  // Defense in depth: never hit GitHub without a token even if code is enabled.
+  if (group === "code" && !GH_TOKEN()) {
+    return "error: no GITHUB_TOKEN configured on the deployment.";
+  }
   const owner = ctx.userId ? `user_id=eq.${encodeURIComponent(ctx.userId)}&` : "";
   try {
     switch (name) {
@@ -465,7 +544,7 @@ Take the actions the task calls for, then finish with a concise summary of what 
 // text, a recap of tool actions, accumulated cost, and step count.
 async function runAgentLoop(opts: {
   key: string; model: string; tools: unknown[]; messages: any[]; maxSteps?: number;
-  ctx: { userId: string | null; account: string | null; triggerKey: string | null };
+  ctx: { userId: string | null; account: string | null; triggerKey: string | null; enabled: Set<string> };
 }): Promise<{ finalText: string; actions: string[]; cost: number; steps: number }> {
   const { key, model, tools, messages, ctx } = opts;
   const stepBudget = Math.max(1, opts.maxSteps || MAX_STEPS);
@@ -495,7 +574,9 @@ async function runAgentLoop(opts: {
       const name = tc?.function?.name || "";
       let args: Record<string, any> = {};
       try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
-      const result = (await runTool(name, args, { userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey })).slice(0, TOOL_RESULT_CAP);
+      const result = (await runTool(name, args, {
+        userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled,
+      })).slice(0, TOOL_RESULT_CAP);
       actions.push(`${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
     }
@@ -510,11 +591,16 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("", { status: 204, headers: cors });
   if (req.method !== "POST") return json({ ok: false, error: "Use POST." }, 405);
 
-  const gate = Deno.env.get("RESPONDER_SECRET");
-  if (gate && callerSecret(req) !== gate) return json({ ok: false, error: "Unauthorized." }, 401);
-
   let body: Record<string, any> = {};
   try { body = await req.json(); } catch { /* empty ok */ }
+
+  // Never leave tokens in anything we might echo later.
+  const accessTokenForAuth = body.accessToken ?? body.access_token;
+  delete body.accessToken;
+  delete body.access_token;
+
+  const auth = await authorizeCaller(req, { accessToken: accessTokenForAuth });
+  if (!auth.ok) return json({ ok: false, error: auth.error }, 401);
 
   const allow = allowedModels();
   const runId = typeof body.runId === "string" ? body.runId.trim()
@@ -535,7 +621,12 @@ Deno.serve(async (req: Request) => {
     } catch (e) { return json({ ok: false, error: `Could not load the run: ${(e as Error).message}` }, 502); }
     if (!row) return json({ ok: false, error: "Run not found." }, 404);
 
-    const userId = row.user_id || null;
+    // Signed-in callers may only continue their own runs (service/secret may continue any).
+    if (auth.via === "user-jwt" && auth.userId && row.user_id && row.user_id !== auth.userId) {
+      return json({ ok: false, error: "Unauthorized — that run belongs to another user." }, 403);
+    }
+
+    const userId = row.user_id || auth.userId || null;
     const account = typeof row.account === "string" ? row.account : null;
     const triggerKey = typeof row.trigger_key === "string" ? row.trigger_key : null;
     let model = typeof row.model === "string" && row.model.trim() ? row.model.trim() : DEFAULT_MODEL;
@@ -567,7 +658,10 @@ Deno.serve(async (req: Request) => {
     }
     messages.push({ role: "user", content: prompt });
 
-    const { finalText, actions, cost } = await runAgentLoop({ key, model, tools, messages, maxSteps: stepBudgetFor(enabled), ctx: { userId, account, triggerKey } });
+    const { finalText, actions, cost } = await runAgentLoop({
+      key, model, tools, messages, maxSteps: stepBudgetFor(enabled),
+      ctx: { userId, account, triggerKey, enabled },
+    });
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
     const output = `${finalText}${recap}`.slice(0, OUTPUT_CAP);
     const status = finalText.startsWith("⚠") ? "error" : "success";
@@ -588,8 +682,10 @@ Deno.serve(async (req: Request) => {
   const triggerKey = typeof body.triggerKey === "string" ? body.triggerKey : (typeof body.trigger_key === "string" ? body.trigger_key : null);
   const routineId = typeof body.routineId === "string" ? body.routineId : (typeof body.routine_id === "string" ? body.routine_id : "");
 
-  // Resolve owner + the OpenRouter key (per-account override, else server secret).
-  const { userId, title: routineTitle } = await resolveOwner(routineId);
+  // Resolve owner: prefer authenticated user, else routineId / single-tenant fallback.
+  const fromRoutine = await resolveOwner(routineId);
+  const userId = auth.userId || fromRoutine.userId;
+  const routineTitle = fromRoutine.title;
   const override = await accountKeyOverride(userId, account || undefined);
   const serverKey = Deno.env.get("OPENROUTER_API_KEY") || "";
   const key = override || serverKey;
@@ -614,6 +710,8 @@ Deno.serve(async (req: Request) => {
     if (spent != null && spent >= cap) return json({ ok: false, error: `Daily spend cap reached ($${spent.toFixed(4)} of $${cap.toFixed(2)}).` }, 429);
   }
 
+  // Solo-friendly: trust the caller's tool list once they're authenticated.
+  // Models keep free rein to open PRs when `code` is included and GITHUB_TOKEN is set.
   const enabled = new Set<string>(
     Array.isArray(body.tools) ? body.tools.filter((t: unknown) => typeof t === "string") : ["read", "research", "write"],
   );
@@ -621,7 +719,10 @@ Deno.serve(async (req: Request) => {
   const toolList = enabled.size ? [...enabled].join(", ") : "none";
 
   const messages: any[] = [{ role: "system", content: buildSystem(model, toolList) }, { role: "user", content: prompt }];
-  const { finalText, actions, cost, steps } = await runAgentLoop({ key, model, tools, messages, maxSteps: stepBudgetFor(enabled), ctx: { userId, account, triggerKey } });
+  const { finalText, actions, cost, steps } = await runAgentLoop({
+    key, model, tools, messages, maxSteps: stepBudgetFor(enabled),
+    ctx: { userId, account, triggerKey, enabled },
+  });
 
   // Compose the full-length output stored in History: the result, plus a short
   // recap of the actions taken (so the run is auditable).
