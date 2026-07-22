@@ -69,7 +69,7 @@ const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
 // Per-invocation step budget. Long jobs continue via auto-continue chains
 // (see MAX_AUTO_CONTINUES) so one fire can span several edge invocations.
 const MAX_STEPS = num("AGENT_MAX_STEPS", 5);
-const CODE_MAX_STEPS = num("AGENT_CODE_MAX_STEPS", 8);
+const CODE_MAX_STEPS = num("AGENT_CODE_MAX_STEPS", 12);
 const stepBudgetFor = (enabled: Set<string>) => enabled.has("code") ? Math.max(MAX_STEPS, CODE_MAX_STEPS) : MAX_STEPS;
 const MAX_TOKENS = Math.min(num("AGENT_MAX_TOKENS", 3072), 8192);
 // Per-call cap. Reasoning models need headroom; still leave room for tools + save.
@@ -86,6 +86,12 @@ const OUTPUT_CAP = num("AGENT_OUTPUT_CAP", 60_000);
 // How many background segments after the first (total segments = 1 + this).
 // 5 × ~100s ≈ set-and-forget multi-minute jobs without blowing one request.
 const MAX_AUTO_CONTINUES = Math.min(num("AGENT_MAX_AUTO_CONTINUES", 5), 12);
+// Consecutive auto-continue segments with zero progress (no tools, no real text)
+// before we stop the chain instead of burning the full continue budget on timeouts.
+const MAX_NO_PROGRESS = Math.min(num("AGENT_MAX_NO_PROGRESS", 2), 10);
+// Reasoning-model control: GLM burns max_tokens thinking unless effort is capped.
+// low/medium/high → { effort, exclude:true }; off/none → { enabled:false }; unset → omit.
+const AGENT_REASONING_EFFORT = (Deno.env.get("AGENT_REASONING_EFFORT") || "low").trim();
 const AUTO_CONTINUE_PROMPT =
   "[auto-continue] Resume the task from the transcript. Do NOT re-read files or re-list directories you already saw. Prefer finishing work (gh_propose_change / write tools) over exploring. When done, reply with a short final summary including any PR links — use no further tools if the work is complete.";
 
@@ -293,13 +299,73 @@ async function accountKeyOverride(userId: string | null, account?: string): Prom
 }
 
 // ── OpenRouter ────────────────────────────────────────────────────────────────
+// Build OpenRouter's `reasoning` body field from an effort string (or omit).
+// OpenRouter drops unsupported params on non-reasoning models, so this is safe
+// for Kimi/DeepSeek/Llama. Returns null → omit the field entirely.
+function parseReasoningEffort(v: string): Record<string, unknown> | null {
+  const s = String(v || "").toLowerCase().trim();
+  if (!s || s === "unset" || s === "default") return null;
+  if (s === "off" || s === "none") return { enabled: false };
+  // exclude:false so reasoning text is returned for the History "Thoughts" panel.
+  // Effort still caps hidden-token spend; low is the default.
+  if (s === "low" || s === "medium" || s === "high") return { effort: s, exclude: false };
+  return { effort: "low", exclude: false };
+}
+
+// Pull human-readable thoughts from an OpenRouter assistant message.
+function extractReasoning(msg: any): string {
+  if (!msg || typeof msg !== "object") return "";
+  if (typeof msg.reasoning === "string" && msg.reasoning.trim()) return msg.reasoning.trim();
+  if (typeof msg.reasoning_content === "string" && msg.reasoning_content.trim()) return msg.reasoning_content.trim();
+  if (Array.isArray(msg.reasoning_details)) {
+    return msg.reasoning_details
+      .map((d: any) => (typeof d?.text === "string" ? d.text : (typeof d?.summary === "string" ? d.summary : "")))
+      .filter(Boolean)
+      .join("\n\n")
+      .trim();
+  }
+  return "";
+}
+
+// Build the assistant transcript entry, preserving reasoning for the UI + tool loops.
+function assistantTurn(msg: any, toolCalls?: any[]): Record<string, unknown> {
+  const content = (msg?.content ?? "").toString();
+  const turn: Record<string, unknown> = { role: "assistant", content };
+  if (toolCalls && toolCalls.length) turn.tool_calls = toolCalls;
+  const reasoning = extractReasoning(msg);
+  if (reasoning) turn.reasoning = reasoning;
+  if (Array.isArray(msg?.reasoning_details) && msg.reasoning_details.length) {
+    turn.reasoning_details = msg.reasoning_details;
+  }
+  return turn;
+}
+// Resolve per-call reasoning: explicit opts.reasoning wins (string | object | null).
+// null = omit; undefined = use AGENT_REASONING_EFFORT env (default low).
+function resolveReasoning(
+  override?: string | Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (override === null) return null;
+  if (override !== undefined) {
+    if (typeof override === "object") return override;
+    return parseReasoningEffort(String(override));
+  }
+  return parseReasoningEffort(AGENT_REASONING_EFFORT);
+}
+
 async function openrouter(
   key: string,
   model: string,
   messages: unknown[],
-  opts: { tools?: unknown[]; maxTokens?: number; timeoutMs?: number } = {},
+  opts: {
+    tools?: unknown[];
+    maxTokens?: number;
+    timeoutMs?: number;
+    /** string effort, full object, or null to omit (default: AGENT_REASONING_EFFORT) */
+    reasoning?: string | Record<string, unknown> | null;
+  } = {},
 ): Promise<{ ok: boolean; message?: any; usage?: any; error?: string }> {
   const tMs = Math.max(3_000, Math.min(opts.timeoutMs ?? CALL_TIMEOUT_MS, CALL_TIMEOUT_MS));
+  const reasoning = resolveReasoning(opts.reasoning);
   try {
     const resp = await fetch(OPENROUTER_URL, {
       method: "POST",
@@ -313,6 +379,7 @@ async function openrouter(
         model,
         max_tokens: opts.maxTokens ?? MAX_TOKENS,
         usage: { include: true },
+        ...(reasoning ? { reasoning } : {}),
         ...(opts.tools && opts.tools.length ? { tools: opts.tools, tool_choice: "auto" } : {}),
         messages,
       }),
@@ -661,20 +728,45 @@ function isTransientModelError(err: string): boolean {
 
 
 // Persist transcript mid-run so History shows progress and auto-continue can resume.
+// Never overwrites a user-cancelled run (status=cancelled) with running/success/error.
 async function checkpointRun(
   runId: string | null,
   patch: Record<string, unknown>,
 ): Promise<void> {
   if (!runId) return;
-  await fetch(rest(`routiner_runs?id=eq.${encodeURIComponent(runId)}`), {
+  const id = encodeURIComponent(runId);
+  // Cancelling always wins; other patches only apply while not cancelled.
+  const filter = patch.status === "cancelled"
+    ? `routiner_runs?id=eq.${id}`
+    : `routiner_runs?id=eq.${id}&status=neq.cancelled`;
+  await fetch(rest(filter), {
     method: "PATCH", headers: { ...H(), Prefer: "return=minimal" },
     body: JSON.stringify({ ...patch, fired_at: new Date().toISOString() }),
   }).catch(() => {});
 }
 
+async function getRunStatus(runId: string | null): Promise<string | null> {
+  if (!runId) return null;
+  try {
+    const rows = await sbGet(
+      `routiner_runs?id=eq.${encodeURIComponent(runId)}&select=status&limit=1`,
+    );
+    return rows?.[0]?.status ? String(rows[0].status) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function isRunCancelled(runId: string | null): Promise<boolean> {
+  const s = await getRunStatus(runId);
+  return s === "cancelled";
+}
+
 // Spawn another openrouter-agent invocation on the same run (service role).
 // Uses EdgeRuntime.waitUntil when available so work continues after we respond.
-function scheduleAutoContinue(runId: string, depth: number): boolean {
+// `noProgress` is the consecutive no-progress streak (carried in the POST body
+// like continueDepth — no DB state needed).
+function scheduleAutoContinue(runId: string, depth: number, noProgress = 0): boolean {
   if (!SB_URL || !SB_KEY || !runId) return false;
   if (depth >= MAX_AUTO_CONTINUES) return false;
   const url = `${SB_URL}/functions/v1/openrouter-agent`;
@@ -690,6 +782,7 @@ function scheduleAutoContinue(runId: string, depth: number): boolean {
       prompt: AUTO_CONTINUE_PROMPT,
       autoContinue: true,
       continueDepth: depth + 1,
+      noProgress,
     }),
   }).then(async (r) => {
     const t = await r.text().catch(() => "");
@@ -702,6 +795,22 @@ function scheduleAutoContinue(runId: string, depth: number): boolean {
   }
   // If waitUntil is missing, still fire-and-forget (best effort on this platform).
   return true;
+}
+
+// A segment made progress if tools actually ran OR the model produced real text
+// (not a budget-stop / "Paused on step…" / empty). GLM empty/timeout loops hit
+// the no-progress path so we don't burn the full auto-continue chain.
+function segmentMadeProgress(actions: string[], finalText: string): boolean {
+  if (actions.length > 0) return true;
+  const t = (finalText || "").trim();
+  if (!t) return false;
+  if (isBudgetStop(t)) return false;
+  if (/^\(empty/i.test(t)) return false;
+  return true;
+}
+
+function noProgressStopMessage(streak: number): string {
+  return `Stopped: ${streak} consecutive segments made no progress (model timing out or returning nothing). Try a faster model (kimi-k2.7-code, deepseek-chat) or reply to retry.`;
 }
 
 type LoopResult = {
@@ -777,17 +886,29 @@ async function runAgentLoop(opts: {
       break;
     }
 
-    const msg = r.message || {};
-    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
-    if (!toolCalls.length || openedPr) {
-      finalText = (msg.content || "").toString().trim() || (openedPr ? "Opened a pull request (see actions)." : "");
-      messages.push({ role: "assistant", content: msg.content || finalText });
+    // Honour Stop: user (or UI) flipped the row to cancelled mid-loop.
+    if (await isRunCancelled(runId)) {
+      finalText = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
       incomplete = false;
       break;
     }
 
-    messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls });
+    const msg = r.message || {};
+    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    if (!toolCalls.length || openedPr) {
+      finalText = (msg.content || "").toString().trim() || (openedPr ? "Opened a pull request (see actions)." : "");
+      messages.push(assistantTurn({ ...msg, content: msg.content || finalText }));
+      incomplete = false;
+      break;
+    }
+
+    messages.push(assistantTurn(msg, toolCalls));
     for (const tc of toolCalls) {
+      if (await isRunCancelled(runId)) {
+        finalText = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
+        incomplete = false;
+        break;
+      }
       const toolBudget = callBudget();
       if (toolBudget < 5_000) {
         finalText = finalText || "Stopped: hit the time budget mid-tools; partial progress is in the transcript.";
@@ -806,6 +927,7 @@ async function runAgentLoop(opts: {
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       if (/opened PR #/i.test(result)) openedPr = true;
     }
+    if (finalText && !incomplete && /Stopped by you/i.test(finalText)) break;
 
     // Checkpoint after every tool batch so History stays live.
     await saveProgress(
@@ -839,6 +961,11 @@ async function runAgentLoop(opts: {
     incomplete = false;
   }
   if (isHardError(finalText)) incomplete = false;
+  // Final cancel check so we never auto-continue a stopped run.
+  if (await isRunCancelled(runId)) {
+    finalText = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
+    incomplete = false;
+  }
 
   return { finalText, actions, cost, steps, incomplete, openedPr };
 }
@@ -883,13 +1010,17 @@ async function handleRequest(req: Request): Promise<Response> {
               : (typeof body.run_id === "string" ? body.run_id.trim() : "");
 
   const continueDepth = Math.max(0, Number(body.continueDepth) || 0);
+  // Consecutive no-progress streak for auto-continue (human replies start at 0).
+  const noProgressIn = Math.max(0, Number(body.noProgress) || 0);
   const isAutoContinue = body.autoContinue === true;
 
-  // ── Continuation: reopen a stored run and keep the same conversation going ──
-  // Human reply: { runId, prompt }. Auto-continue: { runId, prompt, autoContinue, continueDepth }.
+  // ── Continuation / stop: reopen a stored run ──
+  // Human reply: { runId, prompt }. Auto-continue: { runId, prompt, autoContinue, continueDepth, noProgress }.
+  // Stop: { runId, action: "stop" } — flips status to cancelled so the live loop + chain halt.
   if (runId) {
+    const wantStop = body.action === "stop" || body.stop === true;
     const prompt = typeof body.prompt === "string" ? body.prompt : "";
-    if (!prompt.trim() && !isAutoContinue) {
+    if (!wantStop && !prompt.trim() && !isAutoContinue) {
       return json({ ok: false, error: "Missing 'prompt' (the follow-up message)." }, 400);
     }
 
@@ -903,6 +1034,31 @@ async function handleRequest(req: Request): Promise<Response> {
     // Signed-in callers may only continue their own runs (service/secret may continue any).
     if (auth.via === "user-jwt" && auth.userId && row.user_id && row.user_id !== auth.userId) {
       return json({ ok: false, error: "Unauthorized — that run belongs to another user." }, 403);
+    }
+
+    if (wantStop) {
+      const stopMsg = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
+      const prev = String(row.output || "");
+      const output = (stopMsg + (prev && !prev.startsWith("⏹") ? "\n\n" + prev : "")).slice(0, OUTPUT_CAP);
+      // Unconditional cancel (even if already error/success — idempotent enough).
+      await fetch(rest(`routiner_runs?id=eq.${encodeURIComponent(runId)}`), {
+        method: "PATCH", headers: { ...H(), Prefer: "return=minimal" },
+        body: JSON.stringify({
+          status: "cancelled",
+          output,
+          fired_at: new Date().toISOString(),
+        }),
+      }).catch(() => {});
+      return json({ ok: true, runId, stopped: true, status: "cancelled", output });
+    }
+
+    // Already stopped — don't resurrect via auto-continue (human Retry still works with a prompt).
+    if (isAutoContinue && row.status === "cancelled") {
+      return json({
+        ok: true, runId, stopped: true, status: "cancelled",
+        output: row.output || "⏹ Stopped by you.",
+        continuing: false,
+      });
     }
 
     const userId = row.user_id || auth.userId || null;
@@ -941,18 +1097,33 @@ async function handleRequest(req: Request): Promise<Response> {
 
     await checkpointRun(runId, { status: "running", output: isAutoContinue ? `Continuing… (segment ${continueDepth + 1})` : "Working…" });
 
-    const { finalText, actions, cost, steps, incomplete, openedPr } = await runAgentLoop({
+    const loop = await runAgentLoop({
       key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId,
       ctx: { userId, account, triggerKey, enabled },
     });
+    let { finalText, actions, cost, steps, incomplete, openedPr } = loop;
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
 
+    // Progress streak: human follow-ups reset; auto-continue carries noProgressIn.
+    const baseStreak = isAutoContinue ? noProgressIn : 0;
+    const nextNoProgress = segmentMadeProgress(actions, finalText) ? 0 : baseStreak + 1;
+
+    const wasCancelled = /Stopped by you/i.test(finalText) || (await isRunCancelled(runId));
+
     let continuing = false;
-    if (incomplete && !isHardError(finalText)) {
-      continuing = scheduleAutoContinue(runId, continueDepth);
+    let noProgressStop = false;
+    if (!wasCancelled && incomplete && !isHardError(finalText)) {
+      if (nextNoProgress >= MAX_NO_PROGRESS) {
+        noProgressStop = true;
+        finalText = noProgressStopMessage(nextNoProgress);
+      } else {
+        continuing = scheduleAutoContinue(runId, continueDepth, nextNoProgress);
+      }
     }
 
-    const status = isHardError(finalText) ? "error" : (continuing ? "running" : "success");
+    const status = wasCancelled
+      ? "cancelled"
+      : (isHardError(finalText) || noProgressStop) ? "error" : (continuing ? "running" : "success");
     const note = continuing
       ? `${finalText}\n\n_Still working in the background (auto-continue ${continueDepth + 1}/${MAX_AUTO_CONTINUES})…_`
       : finalText;
@@ -962,7 +1133,8 @@ async function handleRequest(req: Request): Promise<Response> {
 
     return json({
       ok: true, runId, output, steps, cost: Number(cost.toFixed(6)), model, keySource,
-      continuing, openedPr, continueDepth,
+      continuing, openedPr, continueDepth, noProgress: nextNoProgress,
+      stopped: wasCancelled,
     });
   }
 
@@ -1025,19 +1197,32 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  const { finalText, actions, cost, steps, incomplete, openedPr } = await runAgentLoop({
+  const loop = await runAgentLoop({
     key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId: newRunId,
     ctx: { userId, account, triggerKey, enabled },
   });
+  let { finalText, actions, cost, steps, incomplete, openedPr } = loop;
 
   const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
 
+  // Fresh run: streak starts at 0; no progress → 1 and may continue once more.
+  const nextNoProgress = segmentMadeProgress(actions, finalText) ? 0 : 1;
+  const wasCancelled = /Stopped by you/i.test(finalText) || (newRunId ? await isRunCancelled(newRunId) : false);
+
   let continuing = false;
-  if (newRunId && incomplete && !isHardError(finalText)) {
-    continuing = scheduleAutoContinue(newRunId, 0);
+  let noProgressStop = false;
+  if (newRunId && !wasCancelled && incomplete && !isHardError(finalText)) {
+    if (nextNoProgress >= MAX_NO_PROGRESS) {
+      noProgressStop = true;
+      finalText = noProgressStopMessage(nextNoProgress);
+    } else {
+      continuing = scheduleAutoContinue(newRunId, 0, nextNoProgress);
+    }
   }
 
-  const status = isHardError(finalText) ? "error" : (continuing ? "running" : "success");
+  const status = wasCancelled
+    ? "cancelled"
+    : (isHardError(finalText) || noProgressStop) ? "error" : (continuing ? "running" : "success");
   const note = continuing
     ? `${finalText}\n\n_Still working in the background (auto-continue 1/${MAX_AUTO_CONTINUES})…_`
     : finalText;
@@ -1055,6 +1240,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
   return json({
     ok: true, runId: newRunId, output, steps, cost: Number(cost.toFixed(6)), model, keySource,
-    continuing, openedPr, continueDepth: 0,
+    continuing, openedPr, continueDepth: 0, noProgress: nextNoProgress,
+    stopped: wasCancelled,
   });
 }

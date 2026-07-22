@@ -31,9 +31,17 @@
 //
 // Request  (POST JSON): { prompt: string, model?: string, max_tokens?: number,
 //                         system?: string, temperature?: number,
+//                         reasoning?: string | object,  // effort / off / unset (optional)
 //                         account?: string, trigger_key?: string }  // optional attribution
 // Response (JSON):       { ok: true, content: string, model: string, usage?: {…} }
 //                   or   { ok: false, error: string }
+//
+// Reasoning (GLM etc.): RESPONDER_REASONING_EFFORT env default is "low"
+// ({ effort:"low", exclude:true }). Body `reasoning` wins when present:
+//   "low"|"medium"|"high" → { effort, exclude:true }
+//   "off"|"none"          → { enabled:false }
+//   "unset"|"default"     → omit the field (legacy behavior)
+//   object                → sent as-is
 //
 // Every successful call is logged (best-effort) to routiner_openrouter_usage
 // with tokens + dollar cost, so the usage meter (openrouter-usage function +
@@ -81,6 +89,25 @@ const json = (body: unknown, status = 200) =>
     status,
     headers: { "content-type": "application/json", ...cors },
   });
+
+// OpenRouter `reasoning` control. Default low keeps GLM from burning max_tokens
+// on hidden thinking. null → omit the field. Body override wins over env.
+function parseReasoningEffort(v: string): Record<string, unknown> | null {
+  const s = String(v || "").toLowerCase().trim();
+  if (!s || s === "unset" || s === "default") return null;
+  if (s === "off" || s === "none") return { enabled: false };
+  if (s === "low" || s === "medium" || s === "high") return { effort: s, exclude: true };
+  return { effort: "low", exclude: true };
+}
+function resolveReasoning(bodyField: unknown): Record<string, unknown> | null {
+  if (bodyField !== undefined && bodyField !== null) {
+    if (typeof bodyField === "object") return bodyField as Record<string, unknown>;
+    if (typeof bodyField === "string") return parseReasoningEffort(bodyField);
+  }
+  if (bodyField === null) return null;
+  const env = Deno.env.get("RESPONDER_REASONING_EFFORT") || "low";
+  return parseReasoningEffort(env);
+}
 
 // Extract a caller-supplied secret from either the bearer token or the dedicated
 // header (the header survives even if verify_jwt is later flipped on, which would
@@ -143,6 +170,9 @@ Deno.serve(async (req: Request) => {
   if (typeof body.system === "string" && body.system.trim()) messages.push({ role: "system", content: body.system });
   messages.push({ role: "user", content: prompt });
 
+  // Explicit body.reasoning wins over RESPONDER_REASONING_EFFORT (default low).
+  const reasoning = resolveReasoning(body.reasoning);
+
   try {
     const resp = await fetch(OPENROUTER_URL, {
       method: "POST",
@@ -159,6 +189,7 @@ Deno.serve(async (req: Request) => {
         // Ask OpenRouter to return token counts AND the dollar cost of this call,
         // so the usage meter can track spend without guessing per-model prices.
         usage: { include: true },
+        ...(reasoning ? { reasoning } : {}),
         messages,
       }),
     });
@@ -169,7 +200,14 @@ Deno.serve(async (req: Request) => {
       logUsage(model, null, account, triggerKey, false, msg).catch(() => {});
       return json({ ok: false, error: msg }, 502);
     }
-    const content = (data?.choices?.[0]?.message?.content || "").trim();
+    const choice = data?.choices?.[0];
+    const content = (choice?.message?.content || "").trim();
+    const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : "";
+    // Keep "(empty)" back-compat, but surface finish_reason so callers can tell
+    // reasoning-token starvation (max_tokens) from a genuine blank reply.
+    const emptyHint = finishReason
+      ? `(empty — hit ${finishReason})`
+      : "(empty)";
     const servedModel = data?.model || model;
     const usage = data?.usage || null;
 
@@ -177,7 +215,7 @@ Deno.serve(async (req: Request) => {
     // break the actual response the routine is waiting on.
     logUsage(servedModel, usage, account, triggerKey).catch(() => {});
 
-    return json({ ok: true, content: content || "(empty)", model: servedModel, usage });
+    return json({ ok: true, content: content || emptyHint, model: servedModel, usage });
   } catch (e) {
     const msg = "Request to OpenRouter failed: " + (e as Error).message;
     logUsage(model, null, account, triggerKey, false, msg).catch(() => {});
