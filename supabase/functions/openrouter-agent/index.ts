@@ -787,20 +787,36 @@ function isTransientModelError(err: string): boolean {
 
 // Persist transcript mid-run so History shows progress and auto-continue can resume.
 // Never overwrites a user-cancelled run (status=cancelled) with running/success/error.
+// Returns { cancelled } so a caller can detect a Stop for free (no separate read):
+// a non-cancel patch that updates 0 rows means the row is no longer "running" —
+// the status=neq.cancelled filter excluded it (Stop) or the row was deleted.
+// `&select=id` keeps the returned payload tiny (never the big messages/output).
 async function checkpointRun(
   runId: string | null,
   patch: Record<string, unknown>,
-): Promise<void> {
-  if (!runId) return;
+): Promise<{ cancelled: boolean }> {
+  if (!runId) return { cancelled: false };
   const id = encodeURIComponent(runId);
+  const isCancelPatch = patch.status === "cancelled";
   // Cancelling always wins; other patches only apply while not cancelled.
-  const filter = patch.status === "cancelled"
-    ? `routiner_runs?id=eq.${id}`
-    : `routiner_runs?id=eq.${id}&status=neq.cancelled`;
-  await fetch(rest(filter), {
-    method: "PATCH", headers: { ...H(), Prefer: "return=minimal" },
-    body: JSON.stringify({ ...patch, fired_at: new Date().toISOString() }),
-  }).catch(() => {});
+  const filter = isCancelPatch
+    ? `routiner_runs?id=eq.${id}&select=id`
+    : `routiner_runs?id=eq.${id}&status=neq.cancelled&select=id`;
+  try {
+    const res = await fetch(rest(filter), {
+      method: "PATCH", headers: { ...H(), Prefer: "return=representation" },
+      body: JSON.stringify({ ...patch, fired_at: new Date().toISOString() }),
+    });
+    if (isCancelPatch) return { cancelled: true };
+    // Fail open on any transport/HTTP error — don't stop a live run on a blip;
+    // the explicit isRunCancelled checks still catch a real cancel.
+    if (!res.ok) return { cancelled: false };
+    const rows = await res.json().catch(() => null);
+    if (!Array.isArray(rows)) return { cancelled: false };
+    return { cancelled: rows.length === 0 };
+  } catch {
+    return { cancelled: false };
+  }
 }
 
 async function getRunStatus(runId: string | null): Promise<string | null> {
@@ -904,13 +920,16 @@ async function runAgentLoop(opts: {
     return Math.min(CALL_TIMEOUT_MS, raw);
   };
 
-  const saveProgress = async (status: string, note: string) => {
+  // Returns true if the checkpoint revealed the run was cancelled (Stop pressed),
+  // so the loop can halt with no extra DB read.
+  const saveProgress = async (status: string, note: string): Promise<boolean> => {
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
-    await checkpointRun(runId, {
+    const { cancelled } = await checkpointRun(runId, {
       status,
       output: `${note}${recap}`.slice(0, OUTPUT_CAP),
       messages,
     });
+    return cancelled;
   };
 
   for (let i = 0; i < stepBudget; i++) {
@@ -962,11 +981,6 @@ async function runAgentLoop(opts: {
 
     messages.push(assistantTurn(msg, toolCalls));
     for (const tc of toolCalls) {
-      if (await isRunCancelled(runId)) {
-        finalText = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
-        incomplete = false;
-        break;
-      }
       const toolBudget = callBudget();
       if (toolBudget < 5_000) {
         finalText = finalText || "Stopped: hit the time budget mid-tools; partial progress is in the transcript.";
@@ -990,15 +1004,19 @@ async function runAgentLoop(opts: {
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       if (/opened PR #/i.test(result)) openedPr = true;
     }
-    if (finalText && !incomplete && /Stopped by you/i.test(finalText)) break;
-
-    // Checkpoint after every tool batch so History stays live.
-    await saveProgress(
+    // Checkpoint after every tool batch so History stays live — and reuse its
+    // result to honour a Stop pressed mid-batch, with no extra DB round-trip.
+    const cancelledMidBatch = await saveProgress(
       "running",
       openedPr
         ? "Working… pull request opened; writing summary…"
         : `Working… step ${steps}/${stepBudget}`,
     );
+    if (cancelledMidBatch) {
+      finalText = "⏹ Stopped by you. Partial progress is saved — Retry to resume.";
+      incomplete = false;
+      break;
+    }
 
     if (openedPr) {
       // Next loop iteration will call the model with tools disabled for a final summary.
