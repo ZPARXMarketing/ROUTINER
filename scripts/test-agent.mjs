@@ -19,7 +19,7 @@ src = src.replace(/^import "jsr:.*$/m, "// jsr import stripped");
 src += `
 export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudgetStop,
          normalizeAgentBranch, deniedWritePath, segmentMadeProgress, resolveReasoning,
-         parseReasoningEffort, exhaustedMessage };
+         parseReasoningEffort, exhaustedMessage, detectOpenedPr };
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
 writeFileSync(OUT, src);
@@ -102,6 +102,21 @@ eq("timeout is not a hard error", m.isHardError("⚠ Model error on step 3: Open
 eq("provider error is hard once retries are spent", m.isHardError("⚠ Model error on step 1: Provider returned error"), true);
 eq("no tools + budget stop = no progress", m.segmentMadeProgress([], "Stopped: hit the time budget before a final answer."), false);
 eq("tools ran = progress", m.segmentMadeProgress(["gh_read_file(...) → ok"], ""), true);
+
+console.log("\n— detectOpenedPr (must only fire on a real PR tool) —");
+const OK = "opened PR #123: https://github.com/o/r/pull/123 (branch agent/x → main, 1 file(s))";
+eq("propose_edit success", m.detectOpenedPr("gh_propose_edit", OK), { opened: true, url: "https://github.com/o/r/pull/123" });
+eq("propose_change success", m.detectOpenedPr("gh_propose_change", OK).opened, true);
+// The regression: reading a file (or a run log) that merely CONTAINS the phrase
+// made the agent claim it had opened a PR. This is the agent's own source line.
+eq("reading source containing the phrase", m.detectOpenedPr("gh_read_file",
+  "path: index.ts\n\nreturn `opened PR #${pr.data.number}: ${pr.data.html_url}`;").opened, false);
+eq("read_runs echoing an old PR", m.detectOpenedPr("read_runs",
+  '[{"output":"opened PR #57: https://github.com/o/r/pull/57"}]').opened, false);
+eq("gh_list_prs listing PRs", m.detectOpenedPr("gh_list_prs", OK).opened, false);
+eq("failed propose_edit", m.detectOpenedPr("gh_propose_edit", "error: open PR → 422: already exists").opened, false);
+eq("phrase not at start of a PR tool result", m.detectOpenedPr("gh_propose_edit",
+  "note: the template says opened PR #1").opened, false);
 
 console.log("\n— write-path guards (must not regress) —");
 eq("blocks .github", !!m.deniedWritePath(".github/workflows/deploy.yml"), true);

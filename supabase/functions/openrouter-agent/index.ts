@@ -1043,6 +1043,22 @@ function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET):
   return out;
 }
 
+// Did THIS tool call actually open a pull request?
+//
+// This must key off the tool that ran, not off text appearing somewhere in a
+// result. Testing `/opened PR #/` against every result meant an agent that
+// merely READ a file containing that phrase — including this very function,
+// whose success message is `opened PR #${n}` — was treated as having opened
+// one: tools were disabled and the run reported a PR that never existed.
+// Only a PR-opening tool counts, only from its own success line, and the URL
+// is taken from the tool's output so the claim is always grounded.
+const PR_OPENING_TOOLS = new Set(["gh_propose_change", "gh_propose_edit"]);
+function detectOpenedPr(toolName: string, result: string): { opened: boolean; url: string } {
+  if (!PR_OPENING_TOOLS.has(toolName)) return { opened: false, url: "" };
+  const m = /^opened PR #\d+:\s*(\S+)/i.exec(String(result || "").trim());
+  return m ? { opened: true, url: m[1] } : { opened: false, url: "" };
+}
+
 function isBudgetStop(text: string): boolean {
   return /time budget|maximum number of tool steps|mid-tools|Paused on step|will continue|Continuing in the background/i.test(text || "");
 }
@@ -1200,6 +1216,7 @@ async function runAgentLoop(opts: {
   const actions: string[] = [];
   let cost = 0, steps = 0, finalText = "";
   let openedPr = false;
+  let prUrl = ""; // captured from the PR tool's own output — never asserted without it
   let incomplete = false;
   // The model actually used right now — may switch to FALLBACK_MODEL once if the
   // configured one is failing transiently. Reported back so History is honest.
@@ -1283,7 +1300,7 @@ async function runAgentLoop(opts: {
     const msg = r.message || {};
     const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
     if (!toolCalls.length || openedPr) {
-      finalText = (msg.content || "").toString().trim() || (openedPr ? "Opened a pull request (see actions)." : "");
+      finalText = (msg.content || "").toString().trim() || (openedPr ? `Opened a pull request: ${prUrl}` : "");
       messages.push(assistantTurn({ ...msg, content: msg.content || finalText }));
       incomplete = false;
       break;
@@ -1312,7 +1329,8 @@ async function runAgentLoop(opts: {
       const line = `${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`;
       actions.push(line);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
-      if (/opened PR #/i.test(result)) openedPr = true;
+      const pr = detectOpenedPr(name, result);
+      if (pr.opened) { openedPr = true; prUrl = pr.url; }
     }
     // Checkpoint after every tool batch so History stays live — and reuse its
     // result to honour a Stop pressed mid-batch, with no extra DB round-trip.
@@ -1348,7 +1366,7 @@ async function runAgentLoop(opts: {
   // Budget / step stops are incomplete unless we already landed a PR and summary.
   if (isBudgetStop(finalText) && !openedPr) incomplete = true;
   if (openedPr && isBudgetStop(finalText)) {
-    finalText = "Opened a pull request (see actions). Summary incomplete — check the PR link in Actions.";
+    finalText = `Opened a pull request: ${prUrl} — the model ran out of budget before writing a summary.`;
     incomplete = false;
   }
   if (isHardError(finalText)) incomplete = false;
