@@ -635,11 +635,12 @@ async function callClaude(prompt, model) {
 }
 
 /* ---------- Rendering ---------- */
-/* A reusable routine is recurring — it keeps firing, so it stays in the
-   Library/Scheduled lists forever. A one-off (recurrence 'none') is a single
-   job: once it has fired (a run logged for it) or its scheduled time has
-   elapsed, it's *past* and belongs under History, not piling up in Library or
-   Scheduled. This keeps the Library reserved for reusable/recurring routines. */
+/* A one-off (recurrence 'none') is "past" once it has fired (a run logged for
+   it) or its scheduled time has elapsed. Past one-offs drop out of *Scheduled*
+   — they are no longer queued — and the run itself shows under History.
+   They do NOT drop out of the Library: the Library is a permanent shelf of
+   every routine you have made, so a one-off can always be re-run or
+   re-scheduled. Only archiving takes a routine off the shelf. */
 const isRecurringRoutine = (r) => (r.recurrence || 'none') !== 'none';
 function firedRoutineIds() {
   const s = new Set();
@@ -678,9 +679,10 @@ function counts() {
   const c = { scheduled: 0, library: 0, archived: 0, history: 0, historyFail: 0, board: notes.filter((n) => n.status === 'active').length };
   routines.forEach((r) => {
     if (r.status === 'archived') { c.archived++; return; }
-    if (isPastOneOff(r, fired)) return;              // counted under History below
-    if (r.status === 'scheduled') c.scheduled++;
-    // The Library is every non-archived routine — scheduled ones stay live in it.
+    // Scheduled counts only what is still queued; a fired one-off is not.
+    if (r.status === 'scheduled' && !isPastOneOff(r, fired)) c.scheduled++;
+    // The Library is every non-archived routine — scheduled ones stay live in
+    // it, and fired one-offs stay on the shelf. Only archiving removes one.
     c.library++;
   });
   const items = historyItems();
@@ -814,7 +816,12 @@ function render() {
     // live in the Library; only archiving takes a routine off the air).
     if (currentView === 'library' ? r.status === 'archived' : r.status !== currentView) return false;
     if (currentView === 'archived') return true;
-    return !isPastOneOff(r, fired); // Library/Scheduled: past one-offs move to History
+    // The Library is permanent: a routine you made stays on the shelf even after
+    // a one-off has fired, so you can re-run or re-schedule it. Only archiving
+    // takes one off. (Scheduled still drops past one-offs — they are no longer
+    // queued — and History still records the run itself.)
+    if (currentView === 'library') return true;
+    return !isPastOneOff(r, fired); // Scheduled: past one-offs are no longer queued
   }).sort((a, b) =>
     currentView === 'scheduled' ? new Date(a.scheduledAt || 0) - new Date(b.scheduledAt || 0) : new Date(b.updatedAt) - new Date(a.updatedAt));
   if (!items.length) return renderEmpty();
