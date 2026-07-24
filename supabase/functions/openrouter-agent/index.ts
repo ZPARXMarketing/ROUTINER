@@ -97,8 +97,20 @@ const MAX_NO_PROGRESS = Math.min(num("AGENT_MAX_NO_PROGRESS", 2), 10);
 // Reasoning-model control: GLM burns max_tokens thinking unless effort is capped.
 // low/medium/high → { effort, exclude:true }; off/none → { enabled:false }; unset → omit.
 const AGENT_REASONING_EFFORT = (Deno.env.get("AGENT_REASONING_EFFORT") || "low").trim();
+// In-call retries for a transient OpenRouter failure ("Provider returned error",
+// 5xx, timeouts). Without these ONE flaky response ended the whole run — the
+// single biggest source of "the agent never finishes" in the run log.
+const MODEL_RETRIES = Math.min(num("AGENT_MODEL_RETRIES", 2), 5);
+// When the chosen model keeps failing transiently, finish the segment on a model
+// known to be reliable rather than dying. Set to "" to disable falling back.
+const FALLBACK_MODEL = (Deno.env.get("AGENT_FALLBACK_MODEL") ?? "moonshotai/kimi-k2.7-code").trim();
+// Total characters of tool output kept at FULL size in the model's context. A
+// single gh_read_file can now return 120k chars, so "keep the last 6 in full"
+// could push ~700k chars (~180k tokens) into one request — which times out or
+// 400s. This budget is what actually protects the context window.
+const CONTEXT_TOOL_BUDGET = num("AGENT_CONTEXT_TOOL_BUDGET", 60_000);
 const AUTO_CONTINUE_PROMPT =
-  "[auto-continue] Resume the task from the transcript. Do NOT re-read files or re-list directories you already saw. Prefer finishing work (gh_propose_change / write tools) over exploring. When done, reply with a short final summary including any PR links — use no further tools if the work is complete.";
+  "[auto-continue] Resume the task from the transcript. Do NOT re-read files or re-list directories you already saw. Prefer finishing work (gh_propose_edit / write tools) over exploring — if you have read enough to make the change, make it now. When done, reply with a short final summary including any PR links — use no further tools if the work is complete.";
 
 // ── GitHub (the "code" tool group) ───────────────────────────────────────────
 // Lets a non-Claude instance read the repo, inspect PRs, and — the whole point —
@@ -190,6 +202,124 @@ async function gh(method: string, path: string, body?: unknown, timeoutMs = CALL
   }
 }
 
+// A 404 on a read is usually wrong casing, not a missing file ("todo.md" when
+// the repo has "TODO.md"). Models were burning 3-4 of their ~12 steps guessing.
+// Look the name up in its parent directory and either correct it or hand back
+// the real listing, so one wrong guess costs one step instead of several.
+async function resolveCasePath(
+  repo: string,
+  path: string,
+  ref: string | undefined,
+  tMs: number,
+): Promise<{ path?: string; candidates?: string[] }> {
+  const lastSlash = path.lastIndexOf("/");
+  const parent = lastSlash === -1 ? "" : path.slice(0, lastSlash);
+  const basename = lastSlash === -1 ? path : path.slice(lastSlash + 1);
+  const encodedParent = parent ? parent.split("/").map(encodeURIComponent).join("/") : "";
+  const url = `/repos/${repo}/contents/${encodedParent}${ref ? `?ref=${encodeURIComponent(String(ref))}` : ""}`;
+  try {
+    const res = await gh("GET", url, undefined, tMs);
+    if (!res.ok || !Array.isArray(res.data)) return {};
+    const target = basename.toLowerCase();
+    const matches = res.data.filter((e: any) => String(e?.name || "").toLowerCase() === target);
+    if (matches.length === 1) return { path: String(matches[0].path) };
+    if (matches.length > 1) return { candidates: matches.map((e: any) => String(e.path)) };
+    return { candidates: res.data.slice(0, 20).map((e: any) => String(e.path)) };
+  } catch {
+    return {};
+  }
+}
+
+// Apply literal find/replace edits to a file's text. Returns an error string
+// instead of throwing so the model gets an actionable message back as a tool
+// result (and can fix its own edit) rather than the run dying.
+function applyEdits(
+  text: string,
+  edits: Array<{ old_string?: unknown; new_string?: unknown; replace_all?: unknown }>,
+  path: string,
+): { content?: string; error?: string } {
+  let out = text;
+  for (let i = 0; i < edits.length; i++) {
+    const e = edits[i] || {};
+    const oldStr = String(e.old_string ?? "");
+    const newStr = String(e.new_string ?? "");
+    if (!oldStr) return { error: `edit ${i + 1} for '${path}' has an empty old_string.` };
+    if (oldStr === newStr) return { error: `edit ${i + 1} for '${path}' is a no-op (old_string === new_string).` };
+    const parts = out.split(oldStr);
+    const hits = parts.length - 1;
+    if (hits === 0) {
+      return {
+        error: `edit ${i + 1} for '${path}': old_string not found. It must match the file EXACTLY, including indentation and line breaks. Re-read the file and copy the text verbatim.`,
+      };
+    }
+    if (hits > 1 && e.replace_all !== true) {
+      return {
+        error: `edit ${i + 1} for '${path}': old_string matches ${hits} times. Include more surrounding lines to make it unique, or pass replace_all: true.`,
+      };
+    }
+    // Join the split parts rather than String.replace: replace() would treat
+    // "$&", "$1" etc. in new_string as substitution patterns and silently
+    // mangle any code containing a dollar sign (template literals, jQuery, …).
+    out = e.replace_all === true ? parts.join(newStr) : parts[0] + newStr + parts[1];
+  }
+  return { content: out };
+}
+
+// Branch → write files → open PR. Shared by gh_propose_change (model supplies
+// whole files) and gh_propose_edit (server derives whole files from find/replace
+// edits), so both get the same path/branch/base guard rails.
+async function openPrWithFiles(
+  repo: string,
+  args: Record<string, any>,
+  files: Array<{ path: string; content: string }>,
+  tMs: number,
+): Promise<string> {
+  if (files.length > GH_MAX_FILES) {
+    return `error: too many files (${files.length}); max is ${GH_MAX_FILES} per PR. Split the work.`;
+  }
+  for (const f of files) {
+    const deny = deniedWritePath(f.path);
+    if (deny) return `error: blocked path '${f.path}': ${deny}`;
+    if (f.content.length > GH_MAX_FILE_CHARS) {
+      return `error: '${f.path}' is too large to write (${f.content.length} chars); max is ${GH_MAX_FILE_CHARS}. Split the change or raise AGENT_GH_MAX_FILE_CHARS (hard max 1e6).`;
+    }
+  }
+  const title = String(args.title || "").trim() || "Routiner agent change";
+  // Resolve default branch; only allow PRs targeting that branch (not release/* etc.).
+  const meta = await gh("GET", `/repos/${repo}`, undefined, tMs);
+  const defaultBranch = (meta.ok && meta.data?.default_branch) ? String(meta.data.default_branch) : "main";
+  let base = String(args.base || "").trim() || defaultBranch;
+  if (base.toLowerCase() !== defaultBranch.toLowerCase()) {
+    return `error: base branch must be the repo default ('${defaultBranch}'); got '${base}'.`;
+  }
+  base = defaultBranch; // use canonical casing from GitHub
+  const baseRef = await gh("GET", `/repos/${repo}/git/ref/heads/${encodeURIComponent(base)}`, undefined, tMs);
+  if (!baseRef.ok) return `error: base branch '${base}' not found (${baseRef.status}).`;
+  const baseSha = baseRef.data?.object?.sha;
+  // Always under agent/; never silently write onto a pre-existing branch (422).
+  const branch = normalizeAgentBranch(String(args.branch || "").trim() || `agent/${Date.now().toString(36)}`);
+  const mk = await gh("POST", `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: baseSha }, tMs);
+  if (!mk.ok) {
+    if (mk.status === 422) {
+      return `error: branch '${branch}' already exists — pick a new name (or omit branch for an auto name). Refusing to overwrite.`;
+    }
+    return `error: create branch '${branch}' → ${mk.status}: ${String(mk.data?.message || "").slice(0, 160)}`;
+  }
+  for (const f of files) {
+    const cur = await gh("GET", `/repos/${repo}/contents/${ghPath(f.path)}?ref=${encodeURIComponent(branch)}`, undefined, tMs);
+    const sha = (cur.ok && !Array.isArray(cur.data)) ? cur.data.sha : undefined;
+    const put = await gh("PUT", `/repos/${repo}/contents/${ghPath(f.path)}`, {
+      message: `${title} — ${f.path}`, branch, content: b64encode(f.content), ...(sha ? { sha } : {}),
+    }, tMs);
+    if (!put.ok) return `error: write ${f.path} → ${put.status}: ${String(put.data?.message || "").slice(0, 160)}`;
+  }
+  const pr = await gh("POST", `/repos/${repo}/pulls`, {
+    title, head: branch, base, body: `${String(args.body || "")}\n\n— proposed by a Routiner OpenRouter agent`.trim(),
+  }, tMs);
+  if (!pr.ok) return `error: open PR → ${pr.status}: ${String(pr.data?.message || "").slice(0, 200)}`;
+  return `opened PR #${pr.data.number}: ${pr.data.html_url} (branch ${branch} → ${base}, ${files.length} file(s))`;
+}
+
 const cors = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "POST, OPTIONS",
@@ -267,7 +397,7 @@ async function sbGet(path: string): Promise<any[]> {
 
 // Map a tool function name → tool-group id (must match Settings checkboxes).
 function toolGroupOf(name: string): string | null {
-  if (name === "read_routines" || name === "read_notes" || name === "read_leads") return "read";
+  if (name === "read_routines" || name === "read_notes" || name === "read_leads" || name === "read_runs") return "read";
   if (name === "web_research") return "research";
   if (name === "write_note" || name === "find_and_save_leads") return "write";
   if (name.startsWith("gh_")) return "code";
@@ -359,18 +489,60 @@ function resolveReasoning(
   return parseReasoningEffort(AGENT_REASONING_EFFORT);
 }
 
+type OrOpts = {
+  tools?: unknown[];
+  maxTokens?: number;
+  timeoutMs?: number;
+  /** string effort, full object, or null to omit (default: AGENT_REASONING_EFFORT) */
+  reasoning?: string | Record<string, unknown> | null;
+  /** transient-failure retries (default 0 — callers in the loop opt in) */
+  retries?: number;
+  /** absolute epoch-ms wall deadline; no retry is started that can't fit */
+  deadlineAt?: number;
+};
+type OrResult = { ok: boolean; message?: any; usage?: any; error?: string };
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Retrying wrapper. OpenRouter routes to third-party providers, so a single call
+// failing ("Provider returned error", 502/503, a slow cold start) says nothing
+// about whether the next one will — retry before giving up on the whole run.
+// Permanent failures (bad key, spend limit, unknown model) fail fast, unretried.
 async function openrouter(
   key: string,
   model: string,
   messages: unknown[],
-  opts: {
-    tools?: unknown[];
-    maxTokens?: number;
-    timeoutMs?: number;
-    /** string effort, full object, or null to omit (default: AGENT_REASONING_EFFORT) */
-    reasoning?: string | Record<string, unknown> | null;
-  } = {},
-): Promise<{ ok: boolean; message?: any; usage?: any; error?: string }> {
+  opts: OrOpts = {},
+): Promise<OrResult> {
+  const retries = Math.max(0, opts.retries ?? 0);
+  const deadlineAt = opts.deadlineAt ?? Number.POSITIVE_INFINITY;
+  let last: OrResult = { ok: false, error: "no attempt was made" };
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const perAttempt = Math.max(3_000, Math.min(opts.timeoutMs ?? CALL_TIMEOUT_MS, CALL_TIMEOUT_MS));
+    // Only start an attempt that can actually finish inside the wall budget.
+    if (attempt > 0 && Date.now() + perAttempt > deadlineAt) break;
+
+    const r = await openrouterOnce(key, model, messages, { ...opts, timeoutMs: perAttempt });
+    if (r.ok) return r;
+    last = r;
+    // A permanent error repeats identically — don't burn budget or spend on it.
+    if (!isTransientModelError(r.error || "")) return r;
+    if (attempt < retries) {
+      const backoff = Math.min(4_000, 750 * 2 ** attempt);
+      if (Date.now() + backoff + 3_000 > deadlineAt) break;
+      await sleep(backoff);
+    }
+  }
+  return last;
+}
+
+async function openrouterOnce(
+  key: string,
+  model: string,
+  messages: unknown[],
+  opts: OrOpts = {},
+): Promise<OrResult> {
   const tMs = Math.max(3_000, Math.min(opts.timeoutMs ?? CALL_TIMEOUT_MS, CALL_TIMEOUT_MS));
   const reasoning = resolveReasoning(opts.reasoning);
   try {
@@ -438,6 +610,12 @@ function toolSpecs(enabled: Set<string>): unknown[] {
         parameters: { type: "object", properties: { limit: { type: "number", description: "max rows (default 30)" } } } } },
       { type: "function", function: { name: "read_leads", description: "List recent leads in the CRM (Command's Review tab / staged_leads).",
         parameters: { type: "object", properties: { limit: { type: "number", description: "max rows (default 25)" } } } } },
+      { type: "function", function: { name: "read_runs", description: "Read the agent run log (Routiner History): status, model, and the final output/error of past runs — including your own. Use this to diagnose why runs are failing before proposing a fix.",
+        parameters: { type: "object", properties: {
+          limit: { type: "number", description: "max rows (default 20, max 100)" },
+          status: { type: "string", enum: ["success", "error", "running", "cancelled", "missed"], description: "filter to one status, e.g. 'error'" },
+          since_hours: { type: "number", description: "only runs fired within the last N hours" },
+        } } } },
     );
   }
   if (enabled.has("research")) {
@@ -470,7 +648,24 @@ function toolSpecs(enabled: Set<string>): unknown[] {
         parameters: { type: "object", properties: { ...repoProp, state: { type: "string", enum: ["open", "closed", "all"], description: "default open" } } } } },
       { type: "function", function: { name: "gh_read_pr", description: "Read one pull request: its metadata, mergeability, and per-file diffs (patches).",
         parameters: { type: "object", required: ["number"], properties: { ...repoProp, number: { type: "number", description: "the PR number" } } } } },
-      { type: "function", function: { name: "gh_propose_change", description: "Fix code: create a branch off the base, write the given file(s) in full, and open a pull request. Provide the COMPLETE new content of each file, not a diff.",
+      { type: "function", function: { name: "gh_read_issue", description: "Read one GitHub issue: its title, body, labels, state and recent comments. Use this whenever the task references an issue number or an issues/ URL.",
+        parameters: { type: "object", required: ["number"], properties: { ...repoProp, number: { type: "number", description: "the issue number" } } } } },
+      { type: "function", function: { name: "gh_list_issues", description: "List issues in the repo (number, title, state). Pull requests are flagged with is_pull_request.",
+        parameters: { type: "object", properties: { ...repoProp, state: { type: "string", enum: ["open", "closed", "all"], description: "default open" } } } } },
+      { type: "function", function: { name: "gh_propose_edit", description: "PREFERRED way to fix code. Change part of one or more files with exact find/replace edits and open a pull request — you do NOT need the whole file, so this works on large files. The server reads the current file, applies your edits, and commits the result.",
+        parameters: { type: "object", required: ["title", "edits"], properties: { ...repoProp,
+          title: { type: "string", description: "PR title / commit message" },
+          body: { type: "string", description: "PR description (markdown)" },
+          base: { type: "string", description: "base branch to target (default: the repo's default branch)" },
+          branch: { type: "string", description: "new branch name (default: an auto-generated agent/… name)" },
+          edits: { type: "array", description: "find/replace edits, applied in order", items: { type: "object", required: ["path", "old_string", "new_string"],
+            properties: {
+              path: { type: "string", description: "file to edit" },
+              old_string: { type: "string", description: "text to find — must match the file EXACTLY (indentation included) and be unique unless replace_all is true" },
+              new_string: { type: "string", description: "replacement text" },
+              replace_all: { type: "boolean", description: "replace every occurrence (default false)" },
+            } } } } } } },
+      { type: "function", function: { name: "gh_propose_change", description: "Replace whole file(s) and open a pull request. Requires the COMPLETE new content of each file — for changing part of an existing file prefer gh_propose_edit, which does not.",
         parameters: { type: "object", required: ["title", "changes"], properties: { ...repoProp,
           title: { type: "string", description: "PR title / commit message" },
           body: { type: "string", description: "PR description (markdown)" },
@@ -518,6 +713,28 @@ async function runTool(
         const rows = await sbGet(`routiner_notes?${owner}select=id,body,status&order=created_at.desc&limit=${lim}`);
         return JSON.stringify(rows);
       }
+      case "read_runs": {
+        // The agent's own telemetry. Without this an agent asked to "find out why
+        // runs fail" can only guess — it cannot see History at all.
+        const lim = Math.min(Number(args.limit) || 20, 100);
+        const st = typeof args.status === "string" && args.status.trim()
+          ? `status=eq.${encodeURIComponent(args.status.trim())}&` : "";
+        let since = "";
+        const hrs = Number(args.since_hours);
+        if (hrs > 0) {
+          since = `fired_at=gte.${encodeURIComponent(new Date(Date.now() - hrs * 3_600_000).toISOString())}&`;
+        }
+        const rows = await sbGet(
+          `routiner_runs?${owner}${st}${since}select=id,title,status,model,fired_at,output&order=fired_at.desc&limit=${lim}`,
+        );
+        // Trim each output — a full transcript tail would blow the tool cap and
+        // crowd out the rest of the diagnosis.
+        const trimmed = (rows || []).map((r: any) => ({
+          ...r,
+          output: String(r.output || "").slice(0, 1200),
+        }));
+        return JSON.stringify(trimmed);
+      }
       case "read_leads": {
         const lim = Math.min(Number(args.limit) || 25, 200);
         const rows = await sbGet(`staged_leads?select=business_name,website_domain,phone_e164,vertical,status,created_at&order=created_at.desc&limit=${lim}`);
@@ -526,6 +743,11 @@ async function runTool(
       case "web_research": {
         const query = String(args.query || "").trim();
         if (!query) return "error: empty query";
+        // Research is slow; starting one with a few seconds left just guarantees
+        // a timeout and wastes the step. Defer it to the next segment instead.
+        if (tMs < 12_000) {
+          return "error: not enough time left in this segment to research. Do it first thing next segment, or finish with what you already have.";
+        }
         const r = await openrouter(ctx.key, RESEARCH_MODEL,
           [{ role: "system", content: "You are a precise research assistant. Answer with well-sourced, specific findings." }, { role: "user", content: query }],
           { maxTokens: 2000, timeoutMs: tMs });
@@ -566,12 +788,26 @@ async function runTool(
       case "gh_read_file": {
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
-        const path = String(args.path || "").trim(); if (!path) return "error: missing path";
+        // An omitted/"."/"/" path means "show me the repo root" — that's what the
+        // model wants, and erroring here just cost it a step.
+        let path = String(args.path ?? "").trim().replace(/^\.\/+/, "");
+        if (path === "." || path === "/") path = "";
         const refQ = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
-        const r = await gh("GET", `/repos/${repo}/contents/${ghPath(path)}${refQ}`, undefined, tMs);
-        if (!r.ok) return `error: read ${path} → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
+        let r = await gh("GET", `/repos/${repo}/contents/${ghPath(path)}${refQ}`, undefined, tMs);
+        // 404 is usually a casing miss. Resolve it against the parent listing
+        // instead of making the model guess again.
+        if (!r.ok && r.status === 404 && path) {
+          const fix = await resolveCasePath(repo!, path, args.ref ? String(args.ref) : undefined, tMs);
+          if (fix.path && fix.path !== path) {
+            const retry = await gh("GET", `/repos/${repo}/contents/${ghPath(fix.path)}${refQ}`, undefined, tMs);
+            if (retry.ok) { path = fix.path; r = retry; }
+          } else if (fix.candidates?.length) {
+            return `error: '${path}' not found. That directory contains:\n${fix.candidates.join("\n")}\n\nUse one of these exact paths (they are case-sensitive).`;
+          }
+        }
+        if (!r.ok) return `error: read ${path || "/"} → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
         if (Array.isArray(r.data)) {
-          return `directory ${path}:\n` + r.data.map((e: any) => `${e.type === "dir" ? "dir " : "file"}  ${e.path}`).join("\n");
+          return `directory ${path || "/"}:\n` + r.data.map((e: any) => `${e.type === "dir" ? "dir " : "file"}  ${e.path}`).join("\n");
         }
         // Contents API omits body for files > ~1MB — fall back to the Git Blobs API.
         let text = "";
@@ -648,54 +884,82 @@ async function runTool(
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
         const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
         const changes = Array.isArray(args.changes) ? args.changes.filter((c: any) => c && c.path) : [];
-        if (!changes.length) return "error: no changes provided (need at least one { path, content }).";
-        if (changes.length > GH_MAX_FILES) {
-          return `error: too many files (${changes.length}); max is ${GH_MAX_FILES} per PR. Split the work.`;
+        if (!changes.length) {
+          return "error: no changes provided (need at least one { path, content }). If you only want to alter part of a file, use gh_propose_edit instead — it does not need the whole file.";
         }
-        for (const c of changes) {
-          const p = String(c.path || "").replace(/^\/+/, "").replace(/\\/g, "/");
+        const files = changes.map((c: any) => ({
+          path: String(c.path || "").replace(/^\/+/, "").replace(/\\/g, "/"),
+          content: String(c.content ?? ""),
+        }));
+        return await openPrWithFiles(repo!, args, files, tMs);
+      }
+      case "gh_propose_edit": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const rawEdits = Array.isArray(args.edits) ? args.edits.filter((e: any) => e && e.path) : [];
+        if (!rawEdits.length) return "error: no edits provided (need at least one { path, old_string, new_string }).";
+        // Group by file so several edits to one file are applied in sequence.
+        const byPath = new Map<string, any[]>();
+        for (const e of rawEdits) {
+          const p = String(e.path || "").replace(/^\/+/, "").replace(/\\/g, "/");
+          if (!byPath.has(p)) byPath.set(p, []);
+          byPath.get(p)!.push(e);
+        }
+        if (byPath.size > GH_MAX_FILES) {
+          return `error: too many files (${byPath.size}); max is ${GH_MAX_FILES} per PR. Split the work.`;
+        }
+        const files: Array<{ path: string; content: string }> = [];
+        for (const [p, edits] of byPath) {
           const deny = deniedWritePath(p);
           if (deny) return `error: blocked path '${p}': ${deny}`;
-          const content = String(c.content ?? "");
-          if (content.length > GH_MAX_FILE_CHARS) {
-            return `error: '${p}' is too large to write (${content.length} chars); max is ${GH_MAX_FILE_CHARS}. Split the change or raise AGENT_GH_MAX_FILE_CHARS (hard max 1e6).`;
+          // Read the CURRENT file from the base branch — the agent never has to
+          // reproduce it, which is what made whole-file rewrites fail on big files.
+          const cur = await gh("GET", `/repos/${repo}/contents/${ghPath(p)}`, undefined, tMs);
+          if (!cur.ok) return `error: read ${p} → ${cur.status}: ${String(cur.data?.message || "").slice(0, 160)}`;
+          if (Array.isArray(cur.data)) return `error: '${p}' is a directory, not a file.`;
+          let text = "";
+          if (cur.data?.encoding === "base64" && cur.data?.content) {
+            try { text = b64decode(cur.data.content); } catch { return `error: ${p} is not UTF-8 text.`; }
+          } else {
+            const blob = cur.data?.sha ? await gh("GET", `/repos/${repo}/git/blobs/${cur.data.sha}`, undefined, tMs) : null;
+            if (!blob?.ok || blob.data?.encoding !== "base64") return `error: ${p} is not a readable text file.`;
+            try { text = b64decode(blob.data.content); } catch { return `error: ${p} is not UTF-8 text.`; }
           }
+          const applied = applyEdits(text, edits, p);
+          if (applied.error) return `error: ${applied.error}`;
+          files.push({ path: p, content: applied.content! });
         }
-        const title = String(args.title || "").trim() || "Routiner agent change";
-        // Resolve default branch; only allow PRs targeting that branch (not release/* etc.).
-        const meta = await gh("GET", `/repos/${repo}`, undefined, tMs);
-        const defaultBranch = (meta.ok && meta.data?.default_branch) ? String(meta.data.default_branch) : "main";
-        let base = String(args.base || "").trim() || defaultBranch;
-        if (base.toLowerCase() !== defaultBranch.toLowerCase()) {
-          return `error: base branch must be the repo default ('${defaultBranch}'); got '${base}'.`;
-        }
-        base = defaultBranch; // use canonical casing from GitHub
-        const baseRef = await gh("GET", `/repos/${repo}/git/ref/heads/${encodeURIComponent(base)}`, undefined, tMs);
-        if (!baseRef.ok) return `error: base branch '${base}' not found (${baseRef.status}).`;
-        const baseSha = baseRef.data?.object?.sha;
-        // Always under agent/; never silently write onto a pre-existing branch (422).
-        const branch = normalizeAgentBranch(String(args.branch || "").trim() || `agent/${Date.now().toString(36)}`);
-        const mk = await gh("POST", `/repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha: baseSha }, tMs);
-        if (!mk.ok) {
-          if (mk.status === 422) {
-            return `error: branch '${branch}' already exists — pick a new name (or omit branch for an auto name). Refusing to overwrite.`;
-          }
-          return `error: create branch '${branch}' → ${mk.status}: ${String(mk.data?.message || "").slice(0, 160)}`;
-        }
-        for (const c of changes) {
-          const p = String(c.path || "").replace(/^\/+/, "").replace(/\\/g, "/");
-          const cur = await gh("GET", `/repos/${repo}/contents/${ghPath(p)}?ref=${encodeURIComponent(branch)}`, undefined, tMs);
-          const sha = (cur.ok && !Array.isArray(cur.data)) ? cur.data.sha : undefined;
-          const put = await gh("PUT", `/repos/${repo}/contents/${ghPath(p)}`, {
-            message: `${title} — ${p}`, branch, content: b64encode(String(c.content ?? "")), ...(sha ? { sha } : {}),
-          }, tMs);
-          if (!put.ok) return `error: write ${p} → ${put.status}: ${String(put.data?.message || "").slice(0, 160)}`;
-        }
-        const pr = await gh("POST", `/repos/${repo}/pulls`, {
-          title, head: branch, base, body: `${String(args.body || "")}\n\n— proposed by a Routiner OpenRouter agent`.trim(),
-        }, tMs);
-        if (!pr.ok) return `error: open PR → ${pr.status}: ${String(pr.data?.message || "").slice(0, 200)}`;
-        return `opened PR #${pr.data.number}: ${pr.data.html_url} (branch ${branch} → ${base}, ${changes.length} file(s))`;
+        return await openPrWithFiles(repo!, args, files, tMs);
+      }
+      case "gh_read_issue": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const n = Number(args.number); if (!n) return "error: missing issue number";
+        const r = await gh("GET", `/repos/${repo}/issues/${n}`, undefined, tMs);
+        if (!r.ok) return `error: read issue #${n} → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
+        const cm = await gh("GET", `/repos/${repo}/issues/${n}/comments?per_page=20`, undefined, tMs);
+        const comments = (cm.ok && Array.isArray(cm.data))
+          ? cm.data.map((c: any) => ({ user: c.user?.login, body: String(c.body || "").slice(0, 2000) }))
+          : [];
+        return JSON.stringify({
+          number: r.data.number, title: r.data.title, state: r.data.state,
+          is_pull_request: !!r.data.pull_request,
+          labels: (r.data.labels || []).map((l: any) => (typeof l === "string" ? l : l?.name)).filter(Boolean),
+          body: String(r.data.body || "").slice(0, 8000),
+          url: r.data.html_url, comments,
+        });
+      }
+      case "gh_list_issues": {
+        if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
+        const { repo, error } = resolveRepo(args.repo); if (error) return `error: ${error}`;
+        const state = ["open", "closed", "all"].includes(args.state) ? args.state : "open";
+        const r = await gh("GET", `/repos/${repo}/issues?state=${state}&per_page=30`, undefined, tMs);
+        if (!r.ok) return `error: list issues → ${r.status}: ${String(r.data?.message || "").slice(0, 160)}`;
+        // The issues endpoint also returns PRs; mark them so the model can tell.
+        return JSON.stringify((r.data || []).map((i: any) => ({
+          number: i.number, title: i.title, state: i.state,
+          is_pull_request: !!i.pull_request, url: i.html_url,
+        })));
       }
       case "gh_comment_pr": {
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
@@ -741,10 +1005,13 @@ function buildSystem(model: string, toolList: string): string {
 You have these tool capabilities: ${toolList}.
 
 Efficiency rules (critical — you have limited steps per segment):
-- Prefer acting over exploring. Guess correct path casing once (e.g. TODO.md not todo.md); on 404, try the obvious alternate once, then move on.
-- Do not re-read a file you already have in the transcript. Do not list "/" unless you truly don't know the layout.
-- Large files: gh_read_file supports start_line + max_lines. If a read says "more content after line N", page with start_line=N+1 — do NOT say the file is too large or unreadable. Prefer editing smaller files; for huge files, page the relevant region and still send COMPLETE file contents to gh_propose_change only when you have them (or skip and report which window you inspected).
-- For code fixes: read the target file(s) → gh_propose_change with COMPLETE file contents → stop tools and summarize with the PR URL.
+- Prefer acting over exploring. A 404 on a read is corrected for you automatically when it's only a casing difference, and otherwise comes back with the real directory listing — read that listing instead of guessing again.
+- Do not re-read a file you already have in the transcript. Call gh_read_file with path "." only when you truly don't know the layout.
+- Large files: gh_read_file supports start_line + max_lines. If a read says "more content after line N", page with start_line=N+1 — do NOT say the file is too large or unreadable.
+- To change part of a file, use gh_propose_edit with exact find/replace edits. You do NOT need to have read the whole file, and you must never reproduce a large file just to change a few lines. Copy old_string verbatim from what you read, including indentation, and include enough surrounding lines to make it unique.
+- Use gh_propose_change (whole-file) only for a new file or a total rewrite.
+- If the task mentions an issue number or an issues/ URL, call gh_read_issue to get its contents — do not ask the user to paste it.
+- For code fixes: read the target region → gh_propose_edit → stop tools and summarize with the PR URL.
 - One focused change set per task. Do not start a second unrelated fix in the same run.
 - Use read_* / web_research only when needed for the task. Skip them for pure code edits when the user already named the file/repo.
 - gh_merge_pr only if merge is enabled and the head is agent/*; when unsure, open the PR and stop.
@@ -754,19 +1021,26 @@ Do not claim to have done something a tool did not confirm.`;
 }
 
 // Shrink old tool payloads so long runs don't blow the context window / latency.
-function compactMessages(messages: any[]): any[] {
-  const toolIdxs: number[] = [];
-  for (let i = 0; i < messages.length; i++) {
-    if (messages[i]?.role === "tool") toolIdxs.push(i);
+// Budget-based, not count-based: newest tool results are kept in full until
+// `budget` characters are spent, then everything older is cut to a small floor.
+// (Counting messages instead of characters is what let three large file reads
+// put ~360k chars into a single request.) Never mutates the input.
+const TOOL_FLOOR_CHARS = 400;
+function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET): any[] {
+  const cap = Number.isFinite(budget) && budget > 0 ? budget : 0;
+  const out = messages.slice();
+  let spent = 0;
+  // Newest → oldest, so the model always keeps the results it's reasoning about.
+  for (let i = out.length - 1; i >= 0; i--) {
+    const m = out[i];
+    if (m?.role !== "tool") continue;
+    const c = String(m.content ?? "");
+    if (c.length <= TOOL_FLOOR_CHARS) { spent += c.length; continue; }
+    if (spent + c.length <= cap) { spent += c.length; continue; }
+    out[i] = { ...m, content: c.slice(0, TOOL_FLOOR_CHARS) + "\n…[truncated for context]" };
+    spent += TOOL_FLOOR_CHARS;
   }
-  // Keep the last 6 tool results full; older ones get truncated.
-  const keepFull = new Set(toolIdxs.slice(-6));
-  return messages.map((m, i) => {
-    if (m?.role !== "tool" || keepFull.has(i)) return m;
-    const c = String(m.content || "");
-    if (c.length <= 500) return m;
-    return { ...m, content: c.slice(0, 500) + "\n…[truncated for context]" };
-  });
+  return out;
 }
 
 function isBudgetStop(text: string): boolean {
@@ -780,8 +1054,19 @@ function isHardError(text: string): boolean {
   return true;
 }
 
+// Worth another attempt. Deliberately broad: OpenRouter surfaces upstream
+// provider flakiness through several unrelated strings, and treating any of them
+// as fatal ends a run that would have succeeded on the next call. Anything NOT
+// matched here is treated as permanent and fails fast — keep real
+// configuration errors (bad key, spend cap, unknown model) out of this list.
 function isTransientModelError(err: string): boolean {
-  return /timed out|timeout|rate.?limit|overloaded|temporar|529|502|503|504/i.test(err || "");
+  const e = err || "";
+  // Never retry these, even though some contain retryable-looking words.
+  if (/key limit exceeded|insufficient credit|quota exceeded|daily spend cap|not allowed|invalid api key|unauthorized|no auth credentials/i.test(e)) {
+    return false;
+  }
+  return /timed out|timeout|rate.?limit|overloaded|temporar|capacity|try again|provider returned error|no endpoints|no allowed providers|internal server error|service unavailable|bad gateway|gateway time|fetch failed|connection|socket|stream|econnreset|429|500|502|503|504|520|522|524|529/i
+    .test(e);
 }
 
 
@@ -887,6 +1172,12 @@ function noProgressStopMessage(streak: number): string {
   return `Stopped: ${streak} consecutive segments made no progress (model timing out or returning nothing). Try a faster model (kimi-k2.7-code, deepseek-chat) or reply to retry.`;
 }
 
+// Ran out of auto-continue segments with the task still unfinished. Reported as
+// an error, not a success, so History reflects what actually happened.
+function exhaustedMessage(depth: number): string {
+  return `⚠ Ran out of time: used all ${depth + 1} segment(s) of the auto-continue budget without finishing. Partial progress is saved — open this run and **Retry** (or reply "continue") to pick up where it stopped. If this keeps happening, narrow the task or raise AGENT_MAX_AUTO_CONTINUES.`;
+}
+
 type LoopResult = {
   finalText: string;
   actions: string[];
@@ -894,6 +1185,7 @@ type LoopResult = {
   steps: number;
   incomplete: boolean; // true → worth auto-continuing
   openedPr: boolean;
+  modelUsed: string;   // may differ from the requested model after a fallback
 };
 
 // Run the bounded tool-use loop over `messages` (mutated in place).
@@ -909,6 +1201,10 @@ async function runAgentLoop(opts: {
   let cost = 0, steps = 0, finalText = "";
   let openedPr = false;
   let incomplete = false;
+  // The model actually used right now — may switch to FALLBACK_MODEL once if the
+  // configured one is failing transiently. Reported back so History is honest.
+  let activeModel = model;
+  let fellBack = false;
   const started = Date.now();
   const hardStop = started + DEADLINE_MS;
   const remaining = () => Math.max(0, hardStop - Date.now());
@@ -944,14 +1240,28 @@ async function runAgentLoop(opts: {
     const forModel = compactMessages(messages);
     // After a PR is opened, force a text-only wrap-up (no more tools).
     const useTools = openedPr ? [] : tools;
-    const r = await openrouter(key, model, forModel, {
+    const r = await openrouter(key, activeModel, forModel, {
       tools: useTools.length ? useTools : undefined,
       timeoutMs: budget,
+      retries: MODEL_RETRIES,
+      deadlineAt: hardStop,
     });
     cost += Number(r.usage?.cost) || 0;
-    await logUsage(model, r.usage, ctx.account, ctx.triggerKey, r.ok, r.error ?? null);
+    await logUsage(activeModel, r.usage, ctx.account, ctx.triggerKey, r.ok, r.error ?? null);
     if (!r.ok) {
       const err = String(r.error || "unknown");
+      // Retries inside openrouter() are already spent by here. If the chosen
+      // model is the thing that's broken, finish the job on a reliable one
+      // instead of ending the run — the user cares about the task, not the model.
+      const canFallBack = isTransientModelError(err) && !fellBack && FALLBACK_MODEL &&
+        FALLBACK_MODEL !== activeModel && allowedModels().has(FALLBACK_MODEL) &&
+        callBudget() >= MIN_MODEL_CALL_MS;
+      if (canFallBack) {
+        fellBack = true;
+        actions.push(`model fallback: ${activeModel} → ${FALLBACK_MODEL} after "${err.slice(0, 120)}"`);
+        activeModel = FALLBACK_MODEL;
+        continue; // costs one step; far cheaper than losing the run
+      }
       if (isTransientModelError(err)) {
         // Soft stop — checkpoint + auto-continue (do not mark as hard failure).
         finalText = `Paused on step ${steps}: ${err}. Continuing in the background if possible.`;
@@ -1048,7 +1358,7 @@ async function runAgentLoop(opts: {
     incomplete = false;
   }
 
-  return { finalText, actions, cost, steps, incomplete, openedPr };
+  return { finalText, actions, cost, steps, incomplete, openedPr, modelUsed: activeModel };
 }
 
 async function insertRunningRun(row: Record<string, unknown>): Promise<string | null> {
@@ -1182,7 +1492,7 @@ async function handleRequest(req: Request): Promise<Response> {
       key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId,
       ctx: { userId, account, triggerKey, enabled },
     });
-    let { finalText, actions, cost, steps, incomplete, openedPr } = loop;
+    let { finalText, actions, cost, steps, incomplete, openedPr, modelUsed } = loop;
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
 
     // Progress streak: human follow-ups reset; auto-continue carries noProgressIn.
@@ -1201,19 +1511,23 @@ async function handleRequest(req: Request): Promise<Response> {
         continuing = scheduleAutoContinue(runId, continueDepth, nextNoProgress);
       }
     }
+    // Out of segments with the task unfinished. This used to be filed as
+    // "success", so History showed green on runs that did nothing.
+    const exhausted = !wasCancelled && incomplete && !continuing && !noProgressStop && !isHardError(finalText);
+    if (exhausted) finalText = `${finalText}\n\n${exhaustedMessage(continueDepth)}`;
 
     const status = wasCancelled
       ? "cancelled"
-      : (isHardError(finalText) || noProgressStop) ? "error" : (continuing ? "running" : "success");
+      : (isHardError(finalText) || noProgressStop || exhausted) ? "error" : (continuing ? "running" : "success");
     const note = continuing
       ? `${finalText}\n\n_Still working in the background (auto-continue ${continueDepth + 1}/${MAX_AUTO_CONTINUES})…_`
       : finalText;
     const output = `${note}${recap}`.slice(0, OUTPUT_CAP);
 
-    await checkpointRun(runId, { status, output, messages, model });
+    await checkpointRun(runId, { status, output, messages, model: modelUsed });
 
     return json({
-      ok: true, runId, output, steps, cost: Number(cost.toFixed(6)), model, keySource,
+      ok: true, runId, output, steps, cost: Number(cost.toFixed(6)), model: modelUsed, keySource,
       continuing, openedPr, continueDepth, noProgress: nextNoProgress,
       stopped: wasCancelled,
     });
@@ -1282,7 +1596,7 @@ async function handleRequest(req: Request): Promise<Response> {
     key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId: newRunId,
     ctx: { userId, account, triggerKey, enabled },
   });
-  let { finalText, actions, cost, steps, incomplete, openedPr } = loop;
+  let { finalText, actions, cost, steps, incomplete, openedPr, modelUsed } = loop;
 
   const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
 
@@ -1300,27 +1614,29 @@ async function handleRequest(req: Request): Promise<Response> {
       continuing = scheduleAutoContinue(newRunId, 0, nextNoProgress);
     }
   }
+  const exhausted = !wasCancelled && incomplete && !continuing && !noProgressStop && !isHardError(finalText);
+  if (exhausted) finalText = `${finalText}\n\n${exhaustedMessage(0)}`;
 
   const status = wasCancelled
     ? "cancelled"
-    : (isHardError(finalText) || noProgressStop) ? "error" : (continuing ? "running" : "success");
+    : (isHardError(finalText) || noProgressStop || exhausted) ? "error" : (continuing ? "running" : "success");
   const note = continuing
     ? `${finalText}\n\n_Still working in the background (auto-continue 1/${MAX_AUTO_CONTINUES})…_`
     : finalText;
   const output = `${note}${recap}`.slice(0, OUTPUT_CAP);
 
   if (newRunId) {
-    await checkpointRun(newRunId, { status, output, messages, model });
+    await checkpointRun(newRunId, { status, output, messages, model: modelUsed });
   } else if (userId) {
     // Fallback: no early id (insert failed) — try one final insert.
     newRunId = await insertRunningRun({
       user_id: userId, routine_id: routineId || null, title, status, output,
-      messages, model, account, trigger_key: triggerKey, tools: [...enabled],
+      messages, model: modelUsed, account, trigger_key: triggerKey, tools: [...enabled],
     });
   }
 
   return json({
-    ok: true, runId: newRunId, output, steps, cost: Number(cost.toFixed(6)), model, keySource,
+    ok: true, runId: newRunId, output, steps, cost: Number(cost.toFixed(6)), model: modelUsed, keySource,
     continuing, openedPr, continueDepth: 0, noProgress: nextNoProgress,
     stopped: wasCancelled,
   });

@@ -138,6 +138,9 @@ After deploy, these optional secrets tune the agent path:
 |--------|---------|------|
 | `AGENT_REASONING_EFFORT` | `low` | OpenRouter `reasoning` on agent model calls (`low`/`medium`/`high`/`off`/`unset`) |
 | `RESPONDER_REASONING_EFFORT` | `low` | Same for `dynamic-responder` (body `reasoning` wins) |
+| `AGENT_MODEL_RETRIES` | `2` | Retries for a **transient** OpenRouter failure inside one step (`Provider returned error`, 5xx, timeout). Permanent errors — bad key, spend cap, disallowed model — still fail fast |
+| `AGENT_FALLBACK_MODEL` | `moonshotai/kimi-k2.7-code` | If the chosen model keeps failing transiently, the run finishes on this one instead of dying. Set to `""` to disable |
+| `AGENT_CONTEXT_TOOL_BUDGET` | `60000` | Total chars of tool output kept at full size in the model's context. Older results are floored at 400 chars |
 | `AGENT_MAX_STEPS` | `5` | Tool-loop steps per edge invocation (non-code) |
 | `AGENT_CODE_MAX_STEPS` | `12` | Tool-loop steps when the `code` tool group is enabled |
 | `AGENT_MAX_NO_PROGRESS` | `2` | Consecutive auto-continue segments with no tools/text before the chain stops with `error` |
@@ -249,11 +252,22 @@ executed by the `openrouter-agent` edge function through the **GitHub REST API**
 (no shell/sandbox needed — GitHub *is* the sandbox).
 
 **Tools the model gets** (when `code` is checked on the instance and a token is
-configured): `gh_read_file` (read a file or list a dir, returns the blob sha),
-`gh_list_prs`, `gh_read_pr` (metadata + per-file patches), `gh_propose_change`
-(branch → write full file(s) → open PR — the *fix* path), `gh_comment_pr`, and
-`gh_merge_pr` (the *merge* path). The agent is told to read before it writes and
-to send the **complete** new file contents, never a partial diff.
+configured): `gh_read_file` (read a file or list a dir; an omitted path lists the
+root, and a 404 that's only a casing miss is corrected automatically instead of
+costing the model a step), `gh_read_issue` + `gh_list_issues` (so *"read issue
+#57 and fix it"* actually works), `gh_list_prs`, `gh_read_pr` (metadata +
+per-file patches), **`gh_propose_edit`** (branch → apply exact find/replace edits
+→ open PR — the preferred *fix* path), `gh_propose_change` (whole-file rewrite,
+for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
+
+> **`gh_propose_edit` is the important one.** `gh_propose_change` requires the
+> model to emit the *complete* new file, which is impossible on anything large —
+> agents used to read a 1300-line file, realise they couldn't reproduce it, and
+> give up ("I don't have a way to get the full file content"). `gh_propose_edit`
+> takes `{ path, old_string, new_string }` edits; the edge function reads the
+> current file, applies them server-side, and commits the result. `old_string`
+> must match exactly and be unique (or pass `replace_all`), and a bad edit comes
+> back as an actionable tool error the model can correct rather than a dead run.
 
 **Setup (one-time, human — Supabase → Edge Functions → secrets):**
 
@@ -301,6 +315,43 @@ in **History** (full transcript, resumable) like any other agent run, and every
 model call is metered in `routiner_openrouter_usage`. This is the path to *"I
 can merge and fix code without Claude."* Keep merge gated until you trust a
 given model on your repo; start by letting it open PRs and reviewing them.
+
+## Agents fixing themselves — the self-repair loop
+
+The pieces for a recursively-improving system are now all present, and they're
+worth naming because each one was individually blocking:
+
+| Piece | Tool / knob | Without it |
+|-------|-------------|-----------|
+| **See** what went wrong | `read_runs` (in the `read` group) | An agent asked "why do runs fail?" can only guess — it cannot see History at all. One literally reported *"I can't see raw execution History logs from these tools."* |
+| **Read** the ask | `gh_read_issue` | Runs died asking the human to paste the issue body |
+| **Change** code | `gh_propose_edit` | Whole-file rewrites are impossible on real source files |
+| **Survive** flakiness | `AGENT_MODEL_RETRIES`, `AGENT_FALLBACK_MODEL` | One `Provider returned error` ended the whole run |
+| **Verify** the fix | `scripts/test-agent.mjs` | Nothing checked that a self-authored change actually works |
+
+`node --experimental-strip-types scripts/test-agent.mjs` runs the reliability
+tests with no network and no Deno, so an agent (or CI, or you) can check a change
+to the agent loop before it ships.
+
+**The routine.** A `library` routine titled *"Self-repair: diagnose failed agent
+runs"* ships with the app — on an OpenRouter agent instance with `read` + `code`
+enabled. It is deliberately **not scheduled**: arm it from the Calendar when you
+want it running. Its prompt:
+
+> Call `read_runs` with `status: "error"` and `since_hours: 168` to see what has
+> actually been failing. Group the failures by root cause and pick the **single**
+> most common one that is fixable in this repo. Read the relevant code with
+> `gh_read_file`, then open a PR with `gh_propose_edit` making the smallest
+> change that addresses it. Do not attempt more than one root cause per run. If
+> the top cause is a configuration or credit problem rather than a code bug
+> (e.g. "Key limit exceeded"), do not open a PR — report it instead. Finish with
+> a summary naming the failure count, the root cause, and the PR link.
+
+Keep `AGENT_ALLOW_MERGE` **off** for this routine's account until you've watched
+a few of its PRs. The loop is: it reads its own failures → proposes a fix → you
+review and merge → the edge function auto-deploys from `main` → the next run is
+measurably better. Review every PR; a model diagnosing its own logs is a genuine
+feedback loop, but it is not a substitute for judgment.
 
 ## Lead enrichment — the autonomous ICP flywheel
 

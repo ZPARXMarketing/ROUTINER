@@ -79,7 +79,7 @@ const DEFAULT_PERPLEXITY_MODEL = 'perplexity/sonar-pro';
    `openrouter` (Perplexity enrichment) account above, which is left untouched. */
 const DEFAULT_AGENT_MODEL = 'moonshotai/kimi-k2.7-code';
 const AGENT_TOOLS = [
-  { id: 'read', label: 'Read your data' },
+  { id: 'read', label: 'Read your data + run history' },
   { id: 'research', label: 'Web research' },
   { id: 'write', label: 'Write to apps' },
   { id: 'code', label: 'Fix code (GitHub)' },
