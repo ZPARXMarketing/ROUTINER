@@ -689,7 +689,7 @@ function toolSpecs(enabled: Set<string>): unknown[] {
 async function runTool(
   name: string,
   args: Record<string, any>,
-  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string>; timeoutMs?: number },
+  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string>; timeoutMs?: number; runId?: string | null },
 ): Promise<string> {
   const group = toolGroupOf(name);
   if (!group || !ctx.enabled.has(group)) {
@@ -724,8 +724,15 @@ async function runTool(
         if (hrs > 0) {
           since = `fired_at=gte.${encodeURIComponent(new Date(Date.now() - hrs * 3_600_000).toISOString())}&`;
         }
+        // Exclude the caller's own row. A diagnosis run checkpoints its actions
+        // to `output` as it goes, so without this it reads itself: its own recap
+        // comes back as the newest "error", crowding out the real failures. The
+        // first self-repair run reported exactly that — "the returned run list
+        // was truncated by the currently running self-repair run recursively
+        // echoing its own actions".
+        const notSelf = ctx.runId ? `id=neq.${encodeURIComponent(ctx.runId)}&` : "";
         const rows = await sbGet(
-          `routiner_runs?${owner}${st}${since}select=id,title,status,model,fired_at,output&order=fired_at.desc&limit=${lim}`,
+          `routiner_runs?${owner}${notSelf}${st}${since}select=id,title,status,model,fired_at,output&order=fired_at.desc&limit=${lim}`,
         );
         // Trim each output — a full transcript tail would blow the tool cap and
         // crowd out the rest of the diagnosis.
@@ -1318,7 +1325,7 @@ async function runAgentLoop(opts: {
       let args: Record<string, any> = {};
       try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
       const raw = await runTool(name, args, {
-        userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled,
+        userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled, runId,
         timeoutMs: toolBudget,
       });
       // File reads get a much higher cap; other tools stay small for context.

@@ -323,7 +323,7 @@ worth naming because each one was individually blocking:
 
 | Piece | Tool / knob | Without it |
 |-------|-------------|-----------|
-| **See** what went wrong | `read_runs` (in the `read` group) | An agent asked "why do runs fail?" can only guess — it cannot see History at all. One literally reported *"I can't see raw execution History logs from these tools."* |
+| **See** what went wrong | `read_runs` (in the `read` group) | An agent asked "why do runs fail?" can only guess — it cannot see History at all. One literally reported *"I can't see raw execution History logs from these tools."* `read_runs` excludes the caller's own run row: a diagnosis run checkpoints its actions to `output` as it goes, so without that filter it reads itself and its own recap crowds out the real failures. |
 | **Read** the ask | `gh_read_issue` | Runs died asking the human to paste the issue body |
 | **Change** code | `gh_propose_edit` | Whole-file rewrites are impossible on real source files |
 | **Survive** flakiness | `AGENT_MODEL_RETRIES`, `AGENT_FALLBACK_MODEL` | One `Provider returned error` ended the whole run |
@@ -333,19 +333,32 @@ worth naming because each one was individually blocking:
 tests with no network and no Deno, so an agent (or CI, or you) can check a change
 to the agent loop before it ships.
 
-**The routine.** A `library` routine titled *"Self-repair: diagnose failed agent
-runs"* ships with the app — on an OpenRouter agent instance with `read` + `code`
-enabled. It is deliberately **not scheduled**: arm it from the Calendar when you
-want it running. Its prompt:
+**The routines.** Two `library` routines ship with the app, both on an OpenRouter
+agent instance with `read` + `code` enabled, and both deliberately **not
+scheduled** — arm them from the Calendar when you want them running.
 
-> Call `read_runs` with `status: "error"` and `since_hours: 168` to see what has
-> actually been failing. Group the failures by root cause and pick the **single**
-> most common one that is fixable in this repo. Read the relevant code with
-> `gh_read_file`, then open a PR with `gh_propose_edit` making the smallest
-> change that addresses it. Do not attempt more than one root cause per run. If
-> the top cause is a configuration or credit problem rather than a code bug
-> (e.g. "Key limit exceeded"), do not open a PR — report it instead. Finish with
-> a summary naming the failure count, the root cause, and the PR link.
+*"Verify: agent can open a PR (smoke test)"* is the one to run **first**, and
+after any change to the agent loop. It makes one scripted find/replace edit to
+`TODO.md` via `gh_propose_edit` and reports the PR URL. It exists because the
+diagnosis half of self-repair and the *fix* half fail differently: a run can
+diagnose perfectly and still never exercise the PR path, so a broken
+`gh_propose_edit` would stay invisible. If the smoke test opens a PR, the
+read → edit → branch → commit → PR chain is proven end to end.
+
+*"Self-repair: diagnose failed agent runs"* reads its own failures and fixes one.
+Its prompt tells it to pick the most common cause **that is fixable in this
+repo's code**, to note configuration/credit problems without stopping on them,
+and to confirm with `gh_read_file` that the bug still exists before proposing
+anything — several failures in the log always predate fixes that already
+shipped. Only when there is genuinely no code-fixable cause should it finish
+without a PR.
+
+> **Write that "don't stop on config problems" clause carefully.** The first
+> version said *"if the top cause is a configuration or credit problem, do not
+> open a PR — report it instead"*. The log was dominated by `Key limit exceeded`,
+> so the agent dutifully reported the credit problem and stopped — a correct
+> reading of the instructions that produced a no-op every single run. The model
+> was obedient, not weak. Instructions that can dead-end will dead-end.
 
 Keep `AGENT_ALLOW_MERGE` **off** for this routine's account until you've watched
 a few of its PRs. The loop is: it reads its own failures → proposes a fix → you
