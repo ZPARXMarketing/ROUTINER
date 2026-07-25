@@ -12,7 +12,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 import {
   MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
-  effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel, runChat,
+  effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel,
   ROUTING_POLICY, setActivePolicy, getActivePolicy, normalizePolicy,
   estimateRunCost, fmtUSD,
 } from './model-router.js';
@@ -340,7 +340,7 @@ function warnRecentFailures() {
   _failuresWarned = true;
   const n = bad.length;
   const kinds = bad.some((b) => b.status === 'missed') ? 'failed/missed' : 'failed';
-  toast(`${n} routine run${n > 1 ? 's' : ''} ${kinds} in the last 24h — see History`, 'error');
+  toast(`${n} routine run${n > 1 ? 's' : ''} ${kinds} in the last 24h — see Chat`, 'error');
 }
 const getRoutine = (id) => routines.find((r) => r.id === id);
 
@@ -418,16 +418,20 @@ async function dbInsertRun(routine, result) {
   if (!error && data) runs.unshift({ id: data.id, routineId: data.routine_id, title: data.title, status: data.status, output: data.output, firedAt: data.fired_at });
 }
 
-/* ---------- Master fire switch (per browser/deployment) ---------- */
+/* ---------- Master fire switch (per browser/deployment) ----------
+   Lives in Settings rather than the top bar: it is a rarely-flipped safety
+   catch, not a per-session control, and the rail is better spent on the work.
+   Both functions no-op when the drawer isn't open, so they're safe to call
+   from anywhere. */
 function paintFireSwitch() {
   const el = $('#fireSwitch'); if (!el) return;
   const on = !!settings.firing;
   el.classList.toggle('is-on', on);
   el.classList.toggle('is-off', !on);
-  const lbl = $('#fireLabel'); if (lbl) lbl.textContent = on ? 'Active' : 'Inactive';
+  const lbl = $('#fireLabel'); if (lbl) lbl.textContent = on ? 'Active' : 'Paused';
   el.title = on
-    ? 'This site WILL fire routines (Run now / immediate). Click to set inactive.'
-    : 'This site will NOT fire routines from here. Click to set active.';
+    ? 'This site WILL fire routines (Run now / immediate). Click to pause.'
+    : 'This site will NOT fire routines from here. Click to activate.';
 }
 function toggleFireSwitch() {
   settings.firing = !settings.firing;
@@ -824,7 +828,6 @@ function render() {
   if (currentView === 'board') return renderBoard();
   if (currentView === 'calendar') return renderCalendar();
   if (currentView === 'history') return renderHistory();
-  if (currentView === 'chat') return renderChat();
   const fired = firedRoutineIds();
   const items = routines.filter((r) => {
     // Library = every non-archived routine, scheduled ones included (they stay
@@ -1216,7 +1219,7 @@ function renderHistory() {
   const { all, failures, items } = historyFiltered();
   if (!all.length) {
     view.innerHTML = `<div class="hx"><section class="hx__main"><div class="hx__blank"><div class="empty">
-      <h3>No history yet</h3>
+      <h3>Nothing here yet</h3>
       <p>Finished runs land here — pick one from the list to read the whole exchange, and reply to keep it going.</p>
     </div></div></section></div>`;
     return;
@@ -1230,7 +1233,7 @@ function renderHistory() {
     <div class="hx__scrim" id="hx-scrim"></div>
     <aside class="hx__rail" id="hx-rail">
       <div class="hx__rail-head">
-        <span class="hx__rail-title">History · ${all.length} run${all.length === 1 ? '' : 's'}</span>
+        <span class="hx__rail-title">Chat · ${all.length} run${all.length === 1 ? '' : 's'}</span>
         <input class="input hx__search" id="hx-search" type="search" placeholder="Search runs…" value="${esc(historyQuery)}" />
         <div class="log__filter">
           <button class="btn btn--sm ${historyFilter === 'all' ? 'btn--secondary' : 'btn--ghost'}" data-histf="all">All <span id="hx-fall">${all.length}</span></button>
@@ -1566,63 +1569,6 @@ async function pollReplyLanded(runId, sinceTime) {
   return false;
 }
 
-/* ---------- Chat (test a model directly) ----------
-   A plain chatbot for trying prompts on any model in the picker, using the API
-   keys from Settings → Advanced. Kept in memory for the session — copy out
-   anything you want to keep. */
-const CHAT_MODELS = MODELS.filter((m) => m.id !== 'auto');
-let chatModel = null;      // sticky for the session
-let chatMsgs = [];         // [{ role: 'user'|'assistant', content }]
-let chatBusy = false;
-function renderChat() {
-  if (!chatModel) chatModel = (settings.model && settings.model !== 'auto') ? settings.model : 'claude-sonnet-5';
-  if (!CHAT_MODELS.some((m) => m.id === chatModel)) chatModel = 'claude-sonnet-5';
-  const bubble = (m) => `<div class="chatmsg chatmsg--${m.role === 'user' ? 'user' : 'bot'}${m.error ? ' chatmsg--error' : ''}">${esc(m.content)}</div>`;
-  view.innerHTML = `<div class="chat">
-    <div class="chat__bar">
-      <label class="label" for="chat-model">Model</label>
-      <select class="select chat__model" id="chat-model">${CHAT_MODELS.map((m) => `<option value="${m.id}" ${chatModel === m.id ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select>
-      <button class="btn btn--ghost btn--sm" id="chat-clear" ${chatMsgs.length ? '' : 'disabled'}>Clear</button>
-    </div>
-    <div class="chat__thread" id="chat-thread">
-      ${chatMsgs.length ? chatMsgs.map(bubble).join('') : `<div class="empty"><h3>Test a model</h3><p>Pick a model above and chat with it directly. Claude models use your Anthropic key, the rest use your OpenRouter key (both in Settings → Advanced). The conversation isn't saved yet — copy out what you want to keep.</p></div>`}
-      ${chatBusy ? '<div class="chatmsg chatmsg--bot chatmsg--busy">Thinking…</div>' : ''}
-    </div>
-    <div class="chat__compose">
-      <textarea class="textarea chat__input" id="chat-input" placeholder="Message the model… (Enter to send, Shift+Enter for a new line)"></textarea>
-      <button class="btn btn--primary" id="chat-send" ${chatBusy ? 'disabled' : ''}>Send</button>
-    </div>
-  </div>`;
-  const thread = $('#chat-thread', view);
-  thread.scrollTop = thread.scrollHeight;
-  $('#chat-model', view).addEventListener('change', (e) => { chatModel = e.target.value; });
-  $('#chat-clear', view).addEventListener('click', () => { chatMsgs = []; renderChat(); });
-  const input = $('#chat-input', view);
-  const send = async () => {
-    const text = input.value.trim();
-    if (!text || chatBusy) return;
-    chatMsgs.push({ role: 'user', content: text });
-    chatBusy = true;
-    renderChat();
-    // Error bubbles stay visible in the thread but are excluded from what we
-    // send; consecutive same-role turns (left behind by an excluded error) are
-    // merged so providers that require strict alternation accept the history.
-    const messages = [];
-    for (const m of chatMsgs) {
-      if (m.error) continue;
-      const last = messages[messages.length - 1];
-      if (last && last.role === m.role) last.content += '\n\n' + m.content;
-      else messages.push({ role: m.role, content: m.content });
-    }
-    const res = await runChat(messages, chatModel, { anthropic: settings.anthropicKey, openrouter: settings.openrouterKey }, { referer: location.origin, title: 'Routiner' });
-    chatBusy = false;
-    chatMsgs.push({ role: 'assistant', content: res.text, ...(res.status === 'success' ? {} : { error: true }) });
-    if (currentView === 'chat') renderChat();
-  };
-  $('#chat-send', view).addEventListener('click', send);
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
-  if (!chatBusy) setTimeout(() => input.focus(), 30);
-}
 /* Render a run summary as light, safe Markdown: escape everything first, then
    linkify http(s) URLs and bold **text**. The .run__body container uses
    white-space:pre-wrap, so newlines and bullet/number prefixes from
@@ -2460,13 +2406,24 @@ async function openSettings() {
   cfgModel = normalizeAccounts(await dbLoadAccountCreds(), true);
 
   drawerBody.innerHTML = `
-    <div class="notice">Add a Claude <b>account</b>, then give it one or more <b>triggers</b> — each is a Fire URL (or <code>trig_…</code>) + token. Or add an <b>OpenRouter account</b> whose named <b>instances</b> each run a model (e.g. Kimi) with tools to read your data, research the web, and write into your apps — their output lands in History, where you can reply to continue the conversation. Routines pick which trigger/instance fires them. Saved to your account and used server-side; no Netlify setup needed.</div>
+    <div class="notice">Add a Claude <b>account</b>, then give it one or more <b>triggers</b> — each is a Fire URL (or <code>trig_…</code>) + token. Or add an <b>OpenRouter account</b> whose named <b>instances</b> each run a model (e.g. Kimi) with tools to read your data, research the web, and write into your apps — their output lands in <b>Chat</b>, where you can reply to continue the conversation. Routines pick which trigger/instance fires them. Saved to your account and used server-side; no Netlify setup needed.</div>
     <div class="field__row">
       <div class="field"><label class="label" for="s-account">Default account</label>
         <select class="select" id="s-account">${cfgModel.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
       <div class="field"><label class="label" for="s-model">Default model</label>
         <select class="select" id="s-model">${MODELS.map((m) => `<option value="${m.id}" ${settings.model === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select>
         <span class="hint">New routines start here. <b>Auto</b> lets Routiner pick per task.</span></div>
+    </div>
+    <div class="cfg-sep">Firing</div>
+    <div class="fire-row">
+      <div class="fire-row__text">
+        <b>Fire routines from this site</b>
+        <span class="hint">The master catch. Paused means nothing fires from this browser — scheduled runs and <b>Run now</b> both stay put. Saved per browser.</span>
+      </div>
+      <label class="fire-toggle" id="fireSwitch">
+        <span class="fire-toggle__label" id="fireLabel">Paused</span>
+        <span class="fire-toggle__track"><span class="fire-toggle__knob"></span></span>
+      </label>
     </div>
     <div class="cfg-sep">Accounts &amp; triggers</div>
     <div id="cfg-accounts"></div>
@@ -2488,6 +2445,10 @@ async function openSettings() {
     </details>`;
   drawerFoot.innerHTML = `<button class="btn btn--primary" id="s-save">Save settings</button>`;
   renderCfgAccounts();
+
+  // The fire switch saves on flip (it's a safety catch, not a form field).
+  paintFireSwitch();
+  $('#fireSwitch')?.addEventListener('click', toggleFireSwitch);
 
   // Reset the policy grid's selects to the built-in defaults (saved on Save).
   const resetBtn = $('#pol-reset');
@@ -2576,7 +2537,6 @@ function showApp() {
   const bar = $('#topbar'); if (bar) bar.style.display = '';
   $('.app')?.classList.remove('is-auth');
 
-  paintFireSwitch();
   const email = session.user.email || '';
   const chip = $('#userChip');
   if (chip) { chip.textContent = (email[0] || '?').toUpperCase(); chip.title = `Signed in as ${email}`; }
@@ -2586,11 +2546,34 @@ function showApp() {
   loadAll();
 }
 
+/* ---------- Viewport height ----------
+   The shell is exactly one viewport tall and its columns scroll inside that, so
+   the height has to be right or content ends up clipped and unreachable. `dvh`
+   is the CSS answer but iPadOS Safari disagrees with itself about it in a
+   Stage Manager window, so measure the visual viewport and hand it to CSS as
+   --app-h; the dvh value stays as the fallback. Measuring also means the pane
+   shrinks when the on-screen keyboard opens, keeping the reply box in view
+   instead of behind the keyboard. */
+function trackAppHeight() {
+  const vv = window.visualViewport;
+  const apply = () => {
+    // Ignore a pinch-zoomed visual viewport — that's a smaller window onto the
+    // same page, not a smaller page.
+    const zoomed = vv && Math.abs((vv.scale || 1) - 1) > 0.02;
+    const h = (!zoomed && vv && vv.height) || window.innerHeight || 0;
+    if (h > 240) document.documentElement.style.setProperty('--app-h', `${Math.round(h)}px`);
+  };
+  apply();
+  window.addEventListener('resize', apply);
+  window.addEventListener('orientationchange', () => setTimeout(apply, 150));
+  vv?.addEventListener('resize', apply);
+}
+
 /* ---------- Init ---------- */
 function wireOnce() {
+  trackAppHeight();
   $('#newBtn').addEventListener('click', () => openDrawer());
   $('#budgetChip').addEventListener('click', openForecast);
-  $('#fireSwitch').addEventListener('click', toggleFireSwitch);
   $('#settingsBtn').addEventListener('click', () => { closeAcctMenu(); openSettings(); });
   $('#signOutBtn').addEventListener('click', async () => { closeAcctMenu(); await sb.auth.signOut(); });
   wireAcctMenu();
