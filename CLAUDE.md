@@ -489,6 +489,18 @@ triggers runs it truly in parallel.
   and `overflow: hidden` on both columns. `trackAppHeight()` measures
   `visualViewport.height` into `--app-h` (dvh stays the fallback), which also
   keeps the reply box above the on-screen keyboard.
+- **Two smaller things made the pane *feel* broken even once it worked.** Both
+  are worth not reintroducing:
+  - The scroll columns had `overscroll-behavior: contain`. When a column has
+    nothing to scroll — most `[Leads]` recaps are four lines — `contain`
+    swallows the gesture entirely, so there was no scroll *and* no rubber-band,
+    which reads as frozen. Nothing outside these columns scrolls, so containment
+    bought nothing; it's gone.
+  - The vendored token scale defines `--sp-1..4, 6, 8, 12, 16, 24` but **no
+    `--sp-5`**. A bare `var(--sp-5)` makes the whole declaration invalid and the
+    padding computes to `0`, silently — which is why the transcript, its header
+    and the composer all sat flush against their edges. Always write
+    `var(--sp-5, 20px)`; `.card` and `.cfg-sep` already did.
 - **`fitHistoryPane()` is the belt to that braces.** After every render and on
   every resize it measures the space between `.hx`'s top edge and the bottom of
   the visual viewport, and pins the pane there in pixels if the laid-out height

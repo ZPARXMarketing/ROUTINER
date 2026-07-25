@@ -35,7 +35,6 @@ a { color: var(--periwinkle); }
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior-y: contain;
   padding:
     var(--sp-6)
     max(var(--sp-8), env(safe-area-inset-right))
@@ -485,7 +484,7 @@ a { color: var(--periwinkle); }
   line-height: 1;
 }
 .drawer__close:hover { color: var(--text-hi); }
-.drawer__body { padding: var(--sp-6); overflow: auto; flex: 1; display: flex; flex-direction: column; gap: var(--sp-5); }
+.drawer__body { padding: var(--sp-6); overflow: auto; flex: 1; display: flex; flex-direction: column; gap: var(--sp-5, 20px); }
 .drawer__foot {
   padding: var(--sp-4) var(--sp-6);
   border-top: 1px solid var(--hairline);
@@ -556,7 +555,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   border: 1px solid var(--hairline);
   border-left: 3px solid var(--lime);
   border-radius: var(--r-md);
-  padding: var(--sp-3) var(--sp-5);
+  padding: var(--sp-3) var(--sp-5, 20px);
   box-shadow: var(--shadow-md);
   font-size: 14px;
   max-width: 90vw;
@@ -640,7 +639,6 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior: contain;
   padding: var(--sp-2);
   padding-left: max(var(--sp-2), env(safe-area-inset-left));
   padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom));
@@ -663,8 +661,8 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-5);
-  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+  padding: var(--sp-3) var(--sp-5, 20px);
+  padding-right: max(var(--sp-5, 20px), env(safe-area-inset-right));
   border-bottom: 1px solid var(--hairline);
   flex: 0 0 auto;
   min-height: 0;
@@ -672,13 +670,22 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .hx__title { font-family: var(--font-display); font-weight: 800; font-size: 16px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hx__time { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); white-space: nowrap; }
 .hx__head-actions { display: flex; gap: var(--sp-2); flex: 0 0 auto; }
+/* Heads up: the vendored token scale has no `--sp-5`, so a bare var(--sp-5)
+   makes the whole declaration invalid and the padding silently computes to 0.
+   That is why this pane's content sat flush against the header and the left
+   edge for so long. Always write var(--sp-5, 20px) — the rest of the sheet
+   already does. */
+/* No overscroll containment anywhere in this pane. `contain` swallows the
+   gesture when a column has nothing to scroll — which is most [Leads] recaps,
+   they're four lines long — so the pane felt dead rather than bottoming out
+   with the usual rubber-band. Nothing outside these columns scrolls, so
+   containment bought nothing and cost the bounce. */
 .hx__thread {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: var(--sp-6) var(--sp-5);
-  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+  padding: var(--sp-8) var(--sp-5, 20px) var(--sp-6);
+  padding-right: max(var(--sp-5, 20px), env(safe-area-inset-right));
 }
 .hx__thread-inner { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-3); }
 .hx__thread .chatmsg { max-width: 88%; }
@@ -689,8 +696,8 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   flex: 0 0 auto;
   border-top: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.35), var(--bg-base));
-  padding: var(--sp-3) var(--sp-5) calc(var(--sp-3) + env(safe-area-inset-bottom));
-  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+  padding: var(--sp-3) var(--sp-5, 20px) calc(var(--sp-3) + env(safe-area-inset-bottom));
+  padding-right: max(var(--sp-5, 20px), env(safe-area-inset-right));
 }
 .hx__compose-inner { max-width: 860px; margin: 0 auto; display: flex; gap: var(--sp-2); align-items: flex-end; }
 .hx__compose .chat__input {
@@ -1004,7 +1011,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   .hx__head { padding: var(--sp-3) var(--sp-4); gap: var(--sp-2); }
   .hx__title { font-size: 14px; }
   .hx__time { display: none; }
-  .hx__thread { padding: var(--sp-4) var(--sp-4); }
+  .hx__thread { padding: var(--sp-5, 20px) var(--sp-4) var(--sp-4); }
   .hx__compose { padding-left: var(--sp-4); padding-right: var(--sp-4); }
 }
 
