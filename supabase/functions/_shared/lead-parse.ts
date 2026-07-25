@@ -53,16 +53,29 @@ export function validatePhone(raw: string | null): string | null {
   return raw.trim();
 }
 
-/** Best-effort E.164 for staged_leads.phone_e164 (approval re-normalizes anyway). */
+/**
+ * Best-effort E.164 for staged_leads.phone_e164.
+ *
+ * This feeds a dialer, so a wrong country code is worse than no number at all.
+ * The old fallback slapped "+" on ANY bare digit string, which turned a
+ * mistyped US number into a foreign one: a Florence, AL dental practice came
+ * back as `+25676495335` — an 11-digit 256-area-code number reinterpreted as
+ * country code +256, **Uganda**. Silently dialable, silently wrong.
+ *
+ * So a number written WITHOUT a leading "+" is only trusted in the two
+ * unambiguous NANP shapes. Anything else is junk we cannot safely interpret,
+ * and this file's rule for junk is null — never a guess.
+ */
 export function toE164(raw: string | null): string | null {
   if (!raw) return null;
   const hasPlus = raw.trim().startsWith("+");
   const digits = raw.replace(/[^\d]/g, "");
   if (digits.length < 7 || digits.length > 15) return null;
+  // An explicit "+" means the source stated its country code — trust it.
   if (hasPlus) return "+" + digits;
-  if (digits.length === 10) return "+1" + digits;          // bare US/CA
+  if (digits.length === 10) return "+1" + digits;           // bare US/CA
   if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
-  return "+" + digits;                                      // assume already country-coded
+  return null;                                              // unsafe to guess
 }
 
 export function validateEmail(raw: string | null): string | null {

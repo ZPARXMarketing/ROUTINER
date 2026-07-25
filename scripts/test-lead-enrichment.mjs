@@ -16,6 +16,7 @@ import {
   parseGapFill,
   parseLeads,
   scoreCeiling,
+  toE164,
   verificationVerdict,
 } from "../supabase/functions/_shared/lead-parse.ts";
 
@@ -119,6 +120,26 @@ console.log("\nbuildResearchPrompt — location hard filter + exclusion list");
   ok("lists the businesses we already have", user.includes("Revive Clinic") && user.includes("Synergy Med-Spa"));
   ok("omits the exclusion block when there's nothing to exclude",
     !buildResearchPrompt({ niche: "x", location: null, count: 5, dmTitles: [] }).user.includes("ALREADY have"));
+}
+
+console.log("\ntoE164 — never invent a country code");
+{
+  eq("bare 10-digit US → +1", toE164("(256) 764-9533"), "+12567649533");
+  eq("bare 11-digit starting 1 → +1", toE164("1-256-764-9533"), "+12567649533");
+  eq("explicit + is trusted as given", toE164("+44 20 7946 0958"), "+442079460958");
+
+  // The real defect: a Florence, AL dental practice came back as +25676495335 —
+  // an 11-digit 256-area-code number reinterpreted as country code +256,
+  // Uganda. This feeds a dialer, so a guess is worse than nothing.
+  eq("11 digits not starting with 1 → null, NOT a foreign country code",
+    toE164("256-764-95335"), null);
+  eq("12 bare digits → null", toE164("256764953355"), null);
+  eq("a stray extension digit does not become a country code",
+    toE164("(256) 764-9533 x2"), null);
+
+  eq("too short → null", toE164("12345"), null);
+  eq("too long → null", toE164("+1234567890123456"), null);
+  eq("null in, null out", toE164(null), null);
 }
 
 console.log("\nverificationVerdict — the fabrication gate");
