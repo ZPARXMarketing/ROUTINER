@@ -40,8 +40,11 @@ import {
   parseGapFill,
   parseLeads,
   scoreLead,
+  scoreCeiling,
   toE164,
+  verificationVerdict,
 } from "../_shared/lead-parse.ts";
+import type { SiteStatus } from "../_shared/lead-parse.ts";
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const ROICAL_DEFAULT_URL = "https://pqnycfugadzwcuntfhjp.supabase.co";
@@ -269,6 +272,56 @@ async function exclusionNames(location: string | null, limit = 60): Promise<stri
   return [...names].slice(0, limit);
 }
 
+// ── website liveness ─────────────────────────────────────────────────────────
+// The cheapest, most decisive check in the pipeline: a fabricated domain simply
+// does not exist. No model, no API, no cost — and in the run that motivated
+// this it identified every invented business on the first try.
+//
+// Any HTTP answer counts as alive, including 403/404/500: we are asking "does a
+// server exist for this hostname", not "is the site any good". Only a
+// DNS/connection failure is `dead`, and a timeout is `unknown` so a slow host is
+// never mistaken for a fake one.
+const SITE_TIMEOUT_MS = 6000;
+
+async function checkSite(domain: string | null): Promise<SiteStatus> {
+  if (!domain) return "none";
+  let sawTimeout = false;
+  for (const scheme of ["https", "http"]) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), SITE_TIMEOUT_MS);
+    try {
+      await fetch(`${scheme}://${domain}/`, {
+        method: "GET",
+        redirect: "follow",
+        signal: ctrl.signal,
+        headers: { "user-agent": "Mozilla/5.0 (compatible; ZPARX-lead-verify/1.0)" },
+      });
+      return "alive";
+    } catch (e) {
+      if ((e as Error).name === "AbortError" || (e as Error).name === "TimeoutError") sawTimeout = true;
+      // Otherwise a TypeError — DNS failure or refused connection. Try http, then give up.
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return sawTimeout ? "unknown" : "dead";
+}
+
+/** Liveness for many domains at once, bounded so a batch can't stall the run. */
+async function checkSites(domains: (string | null)[], concurrency = 6): Promise<SiteStatus[]> {
+  const out = new Array<SiteStatus>(domains.length).fill("none");
+  let cursor = 0;
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= domains.length) return;
+      out[i] = await checkSite(domains[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, domains.length || 1) }, worker));
+  return out;
+}
+
 // ── the deepen phase ─────────────────────────────────────────────────────────
 
 interface StagedRow {
@@ -353,7 +406,7 @@ async function deepenOne(
 async function runDeepen(
   key: string,
   opts: { model: string; limit: number; deadline: number; dmTitles: string[]; leadIds?: string[] },
-): Promise<{ eligible: number; scanned: number; filled: number; fields: Record<string, number>; unresolved: number; remaining: number; cost: number; errors: string[] }> {
+): Promise<{ eligible: number; scanned: number; filled: number; fields: Record<string, number>; unresolved: number; quarantined: number; remaining: number; cost: number; errors: string[] }> {
   const sel =
     "id,business_name,website_domain,city,region,phone_e164,email,contact_name,contact_title,lead_score,vertical,enrichment";
   const filter = opts.leadIds?.length
@@ -364,7 +417,7 @@ async function runDeepen(
   try {
     rows = (await sbGet(`staged_leads?select=${sel}&${filter}&order=created_at.asc&limit=${opts.limit}`)) as StagedRow[];
   } catch (e) {
-    return { eligible: 0, scanned: 0, filled: 0, fields: {}, unresolved: 0, remaining: 0, cost: 0, errors: [(e as Error).message] };
+    return { eligible: 0, scanned: 0, filled: 0, fields: {}, unresolved: 0, quarantined: 0, remaining: 0, cost: 0, errors: [(e as Error).message] };
   }
 
   // How many are still queued behind this batch — lets the caller loop to zero.
@@ -384,7 +437,7 @@ async function runDeepen(
 
   const fields: Record<string, number> = {};
   const errors: string[] = [];
-  let filled = 0, unresolved = 0, cost = 0, scanned = 0;
+  let filled = 0, unresolved = 0, cost = 0, scanned = 0, quarantined = 0;
   let cursor = 0;
 
   const worker = async () => {
@@ -418,6 +471,35 @@ async function runDeepen(
       take("email", row.email, found?.email ?? null);
 
       const prev = (row.enrichment ?? {}) as Record<string, unknown>;
+
+      // Verify whatever website we would end up shipping — the one the second
+      // pass just proposed, or the one the first pass claimed. A domain that
+      // does not resolve is dropped rather than handed to the human as real.
+      const finalDomain = (patch.website_domain ?? row.website_domain) as string | null;
+      let siteStatus: SiteStatus = await checkSite(finalDomain);
+      let deadDomain: string | null = null;
+      if (siteStatus === "dead" && finalDomain) {
+        deadDomain = finalDomain;
+        if (patch.website_domain) {
+          delete patch.website_domain;
+          const gi = gained.indexOf("website_domain");
+          if (gi >= 0) gained.splice(gi, 1);
+          fields.website_domain = Math.max(0, (fields.website_domain ?? 1) - 1);
+        } else {
+          patch.website_domain = null; // clear the fabricated one already on the row
+        }
+      }
+
+      const hasPhone = Boolean(patch.phone_e164 ?? row.phone_e164);
+      const hasContact = Boolean(patch.contact_name ?? row.contact_name);
+      const { verdict, note: verdictNote } = verificationVerdict({
+        gained: gained.length,
+        confidence: found?.confidence ?? null,
+        siteStatus,
+        hasPhone,
+        hasContact,
+      });
+
       patch.enrichment = {
         ...prev,
         deepened_at: new Date().toISOString(),
@@ -425,8 +507,21 @@ async function runDeepen(
         deepen_filled: gained,
         deepen_note: found?.note ?? null,
         deepen_confidence: found?.confidence ?? null,
+        site_status: siteStatus,
+        ...(deadDomain ? { dead_domain: deadDomain } : {}),
+        verification: verdict,
+        verification_note: verdictNote,
+        verified_at: new Date().toISOString(),
         ...(found?.linkedin && !prev.linkedin ? { linkedin: found.linkedin } : {}),
       };
+
+      // Two independent pieces of evidence against it — nothing corroborated
+      // AND a website that does not exist — so it never reaches Review as a
+      // normal lead. Everything softer stays visible, just capped.
+      if (verdict === "failed") {
+        patch.status = "rejected";
+        quarantined++;
+      }
 
       // Re-score against the enriched row so the Review tab sorts on truth.
       const merged = {
@@ -436,7 +531,10 @@ async function runDeepen(
         website_domain: (patch.website_domain ?? row.website_domain) as string | null,
         enrichment: { confidence: found?.confidence ?? null, dm_email: null },
       };
-      patch.lead_score = scoreLead(merged as unknown as Parameters<typeof scoreLead>[0]);
+      patch.lead_score = Math.min(
+        scoreLead(merged as unknown as Parameters<typeof scoreLead>[0]),
+        scoreCeiling(verdict),
+      );
 
       try {
         await sbPatchStrict("staged_leads", `id=eq.${row.id}`, patch);
@@ -453,7 +551,7 @@ async function runDeepen(
   const remaining = opts.leadIds?.length
     ? Math.max(0, eligible - scanned)
     : Math.max(0, queued - scanned);
-  return { eligible, scanned, filled, fields, unresolved, remaining, cost: Number(cost.toFixed(4)), errors };
+  return { eligible, scanned, filled, fields, unresolved, quarantined, remaining, cost: Number(cost.toFixed(4)), errors };
 }
 
 async function loadTargets(body: Record<string, unknown>): Promise<Target[]> {
@@ -524,7 +622,9 @@ Deno.serve(async (req: Request) => {
           action: "report",
           routineId: body.routineId ?? undefined,
           status: r.errors.length && !r.filled ? "error" : "success",
-          summary: `Deepen: filled gaps on ${r.filled}/${r.scanned} lead(s) — ${gained}. ${r.remaining} still queued (~$${r.cost.toFixed(4)}).`,
+          summary: `Deepen: filled gaps on ${r.filled}/${r.scanned} lead(s) — ${gained}` +
+            `${r.quarantined ? `; QUARANTINED ${r.quarantined} unverifiable lead(s)` : ""}. ` +
+            `${r.remaining} still queued (~$${r.cost.toFixed(4)}).`,
           details: r.errors.length ? `Errors:\n${r.errors.map((e) => `- ${e}`).join("\n")}` : undefined,
           models: [deepenModel],
         }),
@@ -590,6 +690,24 @@ Deno.serve(async (req: Request) => {
     }
     const skipped = parsed - fresh.length - offArea;
 
+    // Verify every claimed website BEFORE anything is inserted. This also
+    // covers leads the second pass will skip for having no gaps — a fully
+    // fabricated lead can look "complete", and the DNS check is what catches it.
+    let deadSites = 0;
+    if (fresh.length) {
+      const statuses = await checkSites(fresh.map((l) => l.website_domain));
+      fresh.forEach((l, i) => {
+        const st = statuses[i];
+        (l.enrichment as Record<string, unknown>).site_status = st;
+        if (st === "dead") {
+          deadSites++;
+          (l.enrichment as Record<string, unknown>).dead_domain = l.website_domain;
+          l.website_domain = null;
+          l.lead_score = scoreLead(l as unknown as Parameters<typeof scoreLead>[0]);
+        }
+      });
+    }
+
     let inserted = 0, mirrored = 0, insErr: string | undefined;
     if (!dryRun && fresh.length) {
       // Command (staged_leads) and Abstrax (competitors) are independent
@@ -615,7 +733,7 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    const result = { requested: t.count, parsed, inserted: dryRun ? 0 : inserted, skipped, offArea, mirrored, cost };
+    const result = { requested: t.count, parsed, inserted: dryRun ? 0 : inserted, skipped, offArea, deadSites, mirrored, cost };
     runs.push({ target: t.label, model, ...result, ...(insErr ? { error: insErr } : {}), ...(dryRun ? { dryRun: true, sample: fresh.slice(0, 3) } : {}) });
     if (t.id) await sbPatch("lead_enrichment_targets", `id=eq.${t.id}`, { last_run_at: foundAt, last_result: result });
   }
@@ -641,7 +759,7 @@ Deno.serve(async (req: Request) => {
 
   // Best-effort recap into the Routiner Log (ad-hoc unless a routineId is passed).
   if (body.report !== false && SB_URL) {
-    const lines = runs.map((r) => `- **${r.target}**: ${r.error ? `⚠ ${r.error}` : `${r.inserted} new / ${r.parsed} found (${r.skipped} dup${r.offArea ? `, ${r.offArea} out-of-area` : ""})`}${r.mirrored ? `, ${r.mirrored}→Abstrax` : ""}`);
+    const lines = runs.map((r) => `- **${r.target}**: ${r.error ? `⚠ ${r.error}` : `${r.inserted} new / ${r.parsed} found (${r.skipped} dup${r.offArea ? `, ${r.offArea} out-of-area` : ""}${r.deadSites ? `, ${r.deadSites} dead domain` : ""})`}${r.mirrored ? `, ${r.mirrored}→Abstrax` : ""}`);
     if (deepen) {
       const gained = Object.entries(deepen.fields).map(([k, v]) => `${v}× ${k}`).join(", ") || "nothing new";
       lines.push(
@@ -649,6 +767,12 @@ Deno.serve(async (req: Request) => {
         `${deepen.unresolved ? `; ${deepen.unresolved} still had no verifiable details` : ""}` +
         `${deepen.remaining ? `; ${deepen.remaining} left queued` : ""}`,
       );
+      if (deepen.quarantined) {
+        lines.push(
+          `- **Verification**: **${deepen.quarantined} lead(s) quarantined** — nothing corroborated AND the ` +
+          `claimed website does not resolve. Marked \`rejected\`, not shown as live leads.`,
+        );
+      }
     }
     fetch(`${SB_URL}/functions/v1/routiner-admin`, {
       method: "POST",
@@ -658,7 +782,8 @@ Deno.serve(async (req: Request) => {
         routineId: body.routineId ?? undefined,
         status: runs.some((r) => r.error && !r.inserted) ? "error" : "success",
         summary: `Lead enrichment: ${totalInserted} new lead(s) into the Review tab across ${targets.length} target(s)` +
-          `${deepen ? `, ${deepen.filled} gap-filled by the automatic 2nd pass` : ""} (~$${totalCost.toFixed(4)}).`,
+          `${deepen ? `, ${deepen.filled} gap-filled by the automatic 2nd pass` : ""}` +
+          `${deepen?.quarantined ? `, ${deepen.quarantined} quarantined as unverifiable` : ""} (~$${totalCost.toFixed(4)}).`,
         details: lines.join("\n"),
         models: [...new Set([...runs.map((r) => r.model), ...(deepen ? [deepenModel] : [])].filter(Boolean))],
       }),

@@ -15,6 +15,8 @@ import {
   buildResearchPrompt,
   parseGapFill,
   parseLeads,
+  scoreCeiling,
+  verificationVerdict,
 } from "../supabase/functions/_shared/lead-parse.ts";
 
 let pass = 0, fail = 0;
@@ -117,6 +119,43 @@ console.log("\nbuildResearchPrompt — location hard filter + exclusion list");
   ok("lists the businesses we already have", user.includes("Revive Clinic") && user.includes("Synergy Med-Spa"));
   ok("omits the exclusion block when there's nothing to exclude",
     !buildResearchPrompt({ niche: "x", location: null, count: 5, dmTitles: [] }).user.includes("ALREADY have"));
+}
+
+console.log("\nverificationVerdict — the fabrication gate");
+{
+  const v = (o) => verificationVerdict({
+    gained: 0, confidence: "low", siteStatus: "dead", hasPhone: true, hasContact: false, ...o,
+  }).verdict;
+
+  // The exact shape of the three leads that triggered this: sonar-pro padded a
+  // count:10 request with invented businesses, the second pass corroborated
+  // nothing, and the domains did not exist.
+  eq("nothing corroborated + dead domain → quarantined", v({}), "failed");
+
+  // Both halves are required. One alone must never auto-reject.
+  eq("dead domain but details WERE corroborated → kept, unconfirmed",
+    v({ gained: 3, confidence: "high" }), "unconfirmed");
+  eq("nothing corroborated but the site is live → kept, unconfirmed",
+    v({ siteStatus: "alive" }), "unconfirmed");
+  eq("a real business with no website at all is never quarantined",
+    v({ siteStatus: "none" }), "unconfirmed");
+
+  // A slow host must not be mistaken for a fake one.
+  eq("timeout is not evidence of fabrication", v({ siteStatus: "unknown" }), "unconfirmed");
+
+  // High confidence from the second pass overrides the zero-gain signal: there
+  // was nothing left to fill because the first pass already had it right.
+  eq("high confidence + live site → verified",
+    v({ gained: 0, confidence: "high", siteStatus: "alive" }), "verified");
+  eq("corroborated + live site → verified",
+    v({ gained: 2, confidence: "medium", siteStatus: "alive" }), "verified");
+
+  eq("quarantined leads score 0", scoreCeiling("failed"), 0);
+  eq("unconfirmed leads are capped below verified ones", scoreCeiling("unconfirmed"), 20);
+  eq("verified leads keep their score", scoreCeiling("verified"), 100);
+
+  ok("the quarantine note explains itself",
+    /does not resolve/.test(verificationVerdict({ gained: 0, confidence: "low", siteStatus: "dead", hasPhone: false, hasContact: false }).note));
 }
 
 console.log("\nparseLeads — still parses the block format (regression)");

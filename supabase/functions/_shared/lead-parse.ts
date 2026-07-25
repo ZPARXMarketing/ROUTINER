@@ -267,6 +267,83 @@ export function buildResearchPrompt(opts: {
   return { system, user };
 }
 
+// ── Verification: is this business real at all? ──────────────────────────────
+// A live run asked sonar-pro for 10 Decatur med spas, and it padded the list to
+// hit the number: three of the returned domains did not exist in DNS, and four
+// different "businesses" shared a sequential phone block (…822-2227 / 2228 /
+// 2229 / 2270). The prompt already says to return fewer rather than pad; the
+// model ignored it. Instructions alone cannot be the control here.
+//
+// The signal was already sitting there unused — the second pass reported those
+// same leads as unresolved with "could not find any verified listing". Pair
+// that with a DNS check (deterministic, free, no model) and fabrications
+// identify themselves.
+
+/** Whether a lead's website answers: 'none' = it never claimed one. */
+export type SiteStatus = "alive" | "dead" | "unknown" | "none";
+
+export type Verdict = "verified" | "unconfirmed" | "failed";
+
+/**
+ * Decide what a lead has earned after the second pass.
+ *
+ * Deliberately conservative — the only automatic rejection is the case with two
+ * independent pieces of evidence against it: research corroborated *nothing*
+ * AND the claimed website does not resolve. A real business with no web
+ * presence, or a live site whose owner simply isn't published, lands in
+ * `unconfirmed` and stays visible for a human to judge.
+ */
+export function verificationVerdict(o: {
+  /** Fields the second pass managed to corroborate and fill. */
+  gained: number;
+  /** The second pass's own confidence, when it reported one. */
+  confidence: "high" | "medium" | "low" | null;
+  siteStatus: SiteStatus;
+  hasPhone: boolean;
+  hasContact: boolean;
+}): { verdict: Verdict; note: string } {
+  const foundNothing = o.gained === 0 && o.confidence !== "high";
+
+  if (foundNothing && o.siteStatus === "dead") {
+    return {
+      verdict: "failed",
+      note:
+        "Quarantined: the claimed website does not resolve in DNS and the second pass found no " +
+        "verifiable online presence for this business. Treated as a first-pass fabrication.",
+    };
+  }
+
+  // A dead domain on a business we *did* corroborate means the URL was wrong,
+  // not that the business is fake — the domain gets dropped, the lead survives.
+  if (o.siteStatus === "dead") {
+    return {
+      verdict: "unconfirmed",
+      note: "The website given by the first pass does not resolve and has been removed. Other details were corroborated.",
+    };
+  }
+
+  if (foundNothing && !o.hasContact && !o.hasPhone) {
+    return {
+      verdict: "unconfirmed",
+      note: "No decision-maker, no phone, and nothing corroborated by the second pass. Verify before spending time on it.",
+    };
+  }
+
+  if (foundNothing) {
+    return {
+      verdict: "unconfirmed",
+      note: "The second pass found no corroborating source for this business or its owner. Treat first-pass details as unverified.",
+    };
+  }
+
+  return { verdict: "verified", note: "Corroborated by the second pass against live web sources." };
+}
+
+/** Score ceiling per verdict, so unverified leads can't outrank real ones. */
+export function scoreCeiling(verdict: Verdict): number {
+  return verdict === "failed" ? 0 : verdict === "unconfirmed" ? 20 : 100;
+}
+
 // ── Second pass: fill the gaps on ONE known business ─────────────────────────
 // The first pass optimises for breadth and routinely returns NONE for phone,
 // website, or the decision-maker. Re-asking about a single named business —
