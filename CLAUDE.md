@@ -544,7 +544,14 @@ triggers runs it truly in parallel.
   Two gesture details that matter: `touch-action: pan-y` on the row keeps
   vertical scrolling native while the horizontal axis is ours, and
   `wireRailSwipe` (the mobile rail's open/close swipe) bails when a gesture
-  starts on a row, so the two never fight. The rail still closes via ☰, the
+  starts on a row, so the two never fight.
+  And one CSS detail that is easy to lose: the row needs **`flex: 0 0 auto`**.
+  `overflow: hidden` (which hides the Delete panel) makes the row a scroll
+  container, and a scroll container's automatic minimum size is zero — so as a
+  flex item in `#hx-list` every row shrank to a fraction of its content and the
+  whole list rendered as clipped slivers. It only showed up with a long list,
+  and "the list scrolls" stayed true throughout, which is why the first tests
+  missed it: `squash` now asserts row height against content height at 197 runs. The rail still closes via ☰, the
   scrim, Escape, or a swipe starting on its header.
 - **Run now on an agent instance lands in Chat** (`openRunInChat`) with the new
   run selected and the reply box focused, rather than leaving the reader to go
