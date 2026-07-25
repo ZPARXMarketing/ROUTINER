@@ -355,32 +355,49 @@ The single field that decides a lead's fate is the decision-maker: in the first
 every one without got **rejected**. That rate is not a property of the engine —
 it is a property of the **niche**, and it varies enormously.
 
-Sixteen niches measured in Huntsville, `count:8`, same day, same model:
+Twenty-eight niches measured in Huntsville, `count:8`, same day, same model.
 
-| Niche | parsed | with a decision-maker |
+**Worth arming — DM rate ≥ 70%:**
+
+| Niche | parsed | with a DM |
 |---|---|---|
 | dental practices | 8 | **8/8** |
+| personal injury law firms | 8 | **8/8** |
+| roofing contractors | 8 | **8/8** ⚠ |
 | veterinary clinics & animal hospitals | 8 | **7/7** |
 | physical therapy clinics | 8 | **6/6** |
 | pediatric dental | 6 | **5/5** |
 | dermatology clinics | 6 | **4/4** |
-| plastic / cosmetic surgery | 3 | 3/3 |
 | acupuncture & holistic medicine | 5 | 4/4 |
-| podiatry practices | 8 | 6/8 |
+| plastic / cosmetic surgery | 3 | 3/3 |
+| ear nose & throat (ENT) | 6 | 5/6 |
 | audiology & hearing aid | 5 | 4/5 |
-| oral surgery & periodontics | 8 | 5/8 |
-| orthopedic & sports medicine | 8 | 3/4 |
-| orthodontic practices | 4 | 2/4 |
-| **counseling & mental health** | 8 | **1/8** |
-| **optometry & eye care** | 4 | **0/4** |
-| **medical weight loss** | 7 | **0/6** |
+| podiatry practices | 8 | 6/8 |
+| home health care agencies | 8 | 5/7 |
+
+⚠ Roofing swung from 4 dead domains to 0 across two runs on the same query —
+highest domain variance measured. The gate absorbs it, but review those leads
+more carefully.
+
+**Marginal — 40-65%:** oral surgery & periodontics 5/8 · family medicine 4/8 ·
+orthopedic & sports medicine 3/4 · orthodontics 2/4 · pain management 1/2
+
+**Don't bother — under 30%:** OB-GYN 2/8 · pediatric medical 1/6 · counseling &
+mental health 1/8 · massage therapy 1/4 · HVAC contractors 1/8 · urgent care
+0/5 · optometry 0/4 · medical weight loss 0/6 · day spas & salons 0/8
 
 The pattern is consistent and worth internalising: **a practice led by a named,
 licensed practitioner has a findable owner** — dentists, vets, DPTs,
-dermatologists, surgeons all publish who they are, because the practitioner *is*
-the marketing. Categories that are chain-heavy, franchised, or
-privacy-oriented (optometry, weight-loss, mental health) do not, no matter how
-many businesses exist.
+dermatologists, surgeons and trial lawyers all publish who they are, because the
+practitioner *is* the marketing. Three groups reliably fail: chain or franchise
+categories (optometry, weight loss, day spas), hospital-affiliated groups with
+no single owner (urgent care, OB-GYN, pediatrics), and privacy-oriented
+practices (mental health).
+
+Measured result of choosing on this basis: twelve Huntsville targets run live
+produced **82 pending leads at 84% with a decision-maker, 100% with a phone,
+and zero quarantined** — against a starting point where half of all leads
+arrived with no decision-maker at all.
 
 So when the Review tab shows leads without a decision-maker, the fix is usually
 to **change niche**, not to push the engine harder. The second pass will rescue
