@@ -25,8 +25,10 @@ a { color: var(--periwinkle); }
   display: flex;
   flex-direction: column;
   height: 100vh;
-  height: 100dvh; /* exclude mobile browser chrome */
+  height: 100dvh;              /* exclude mobile browser chrome */
+  height: var(--app-h, 100dvh); /* …and prefer the height JS actually measured */
   min-height: 0;
+  overflow: hidden;
 }
 .content {
   flex: 1;
@@ -41,25 +43,31 @@ a { color: var(--periwinkle); }
     max(var(--sp-8), env(safe-area-inset-left));
 }
 /* Views that render their own full-height layout (History) take the pane raw —
-   no page padding, no page scroll; their inner columns scroll instead. */
-.content--flush { padding: 0; overflow: hidden; }
-.content--flush > #view { height: 100%; }
+   no page padding, no page scroll; their inner columns scroll instead.
+   The chain from .app down to a scrolling column is flex the whole way, with
+   min-height:0 at every link. It used to hand the pane a percentage height
+   (#view { height: 100% }) — iPadOS Safari resolves that against a
+   flex-derived parent height unreliably, and when it failed the panes grew past
+   the viewport, the overflow:hidden here clipped them, and nothing scrolled at
+   all. Never reintroduce a percentage height in this chain. */
+.content--flush { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.content--flush > #view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 
 @media (min-width: 900px) {
   .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); }
   .content--flush { padding: 0; }
 }
-/* The top rail keeps every tab reachable without scrolling. Above 1300px it is
+/* The top rail keeps every tab reachable without scrolling. Above 1140px it is
    one row and sheds the widest optional chips as space runs out; below that the
    nav takes a full row of its own, which buys the chips back. (Measured widths:
-   brand 186 · nav 682 · clock 206 · budget 144 · new 130 · fire 108.) Verified
-   with no overflow at 1920/1600/1500/1440/1300/1280/1100/900/834/700/560. */
-@media (min-width: 1301px) and (max-width: 1600px) {
+   brand 186 · nav 612 · clock 206 · budget 144 · new 130.) Verified for overflow
+   at 19 widths from 1920 down to 360 — an iPad in landscape keeps one row. */
+@media (min-width: 1141px) and (max-width: 1500px) {
   .clock--time.clock--next .clock__now { display: none; }  /* keep "next in 12m" */
   .clock--time:not(.clock--next) { display: none; }        /* nothing queued → drop it */
 }
-@media (min-width: 1301px) and (max-width: 1520px) { .budget-chip { display: none !important; } }
-@media (min-width: 1301px) and (max-width: 1400px) {
+@media (min-width: 1141px) and (max-width: 1420px) { .budget-chip { display: none !important; } }
+@media (min-width: 1141px) and (max-width: 1300px) {
   .topbar { gap: var(--sp-3); }
   .fire-toggle__label { display: none; }
   .tab { padding-left: var(--sp-2); padding-right: var(--sp-2); }
@@ -596,7 +604,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   position: relative;
   display: grid;
   grid-template-columns: 304px minmax(0, 1fr);
-  height: 100%;
+  flex: 1 1 auto;   /* sized by the flex chain above — not a percentage height */
   min-height: 0;
 }
 /* ── Left rail: the run list ── */
@@ -913,7 +921,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
    ══════════════════════════════════════════════════ */
 /* Two-row rail: nav drops to its own full-width row under the brand + actions
    rather than scrolling itself out of reach. */
-@media (max-width: 1300px) {
+@media (max-width: 1140px) {
   .topbar { flex-wrap: wrap; gap: var(--sp-2); padding-bottom: var(--sp-2); }
   .tabs { order: 3; flex: 1 1 100%; }
 }
@@ -1092,6 +1100,21 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   .cal__legend { margin-left: 0; width: 100%; }
   .cal__dnum { font-size: 13px; }
 }
+
+/* ── Settings: the master fire switch ──────────── */
+.fire-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  background: rgba(20,27,46,0.5);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+}
+.fire-row__text { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.fire-row__text b { font-size: 13px; color: var(--text-hi); }
+.fire-row .fire-toggle { flex: 0 0 auto; }
+.fire-row .fire-toggle__label { display: inline; }
 
 /* ── Settings: per-account trigger + token ─────── */
 .cfg-sep { font-family: var(--font-pixel); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-low); margin: var(--sp-5, 20px) 0 var(--sp-3); padding-top: var(--sp-4); border-top: 1px solid var(--hairline); }

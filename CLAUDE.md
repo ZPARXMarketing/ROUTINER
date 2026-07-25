@@ -447,19 +447,40 @@ triggers runs it truly in parallel.
 - `index.html`, `css/tokens.css` (vendored ZPARX tokens), `css/app.css`,
   `js/app.js` (single-page UI, ES module).
 - **Shell:** one top rail (`.topbar`) carries the brand, the nav tabs and the
-  actions (clock · budget chip · New routine · fire switch · account menu); the
-  body below it is the only scrolling region. The rail stays a single row down to
-  1300px — shedding the clock, then the budget chip, then the fire label as space
-  runs out — and below that the nav wraps to a full-width second row, which buys
-  those chips back. Verified for overflow at every breakpoint; only phone widths
-  scroll the nav, and a fade on its trailing edge says so.
+  actions (clock · budget chip · New routine · account menu); the body below it
+  is the only scrolling region. The rail stays a single row down to 1140px —
+  shedding the clock, then the budget chip, then tightening the tabs as space
+  runs out — so an iPad in landscape still gets one row; below that the nav wraps
+  to a full-width second row, which buys those chips back. Verified for overflow
+  at 20 widths from 1920 to 360; only phone widths scroll the nav, and a fade on
+  its trailing edge says so.
+- **The tab order leads with the work.** `Chat` (the `history` view — the runs
+  and their transcripts) sits first and carries no count badge; then Calendar,
+  Board, Scheduled, Library, Archived. The separate model-testing Chat view is
+  gone. The view id stays `history` throughout the code — only the label reads
+  "Chat".
+- **The master fire switch lives in Settings**, not the top rail: it is a
+  rarely-flipped safety catch, not a per-session control. `paintFireSwitch` /
+  `toggleFireSwitch` no-op when the drawer is closed, and it saves on flip rather
+  than on Save. Note the tradeoff — with it out of the rail there is no
+  at-a-glance sign that firing is paused.
 - Key views in `app.js`: **Board** (`renderBoard`), **Calendar**
   (`renderCalendar` — full 24h, blocks colored by trigger within a per-account
   hue family), Scheduled / Library / Archived, **History** (`renderHistory`),
-  **Chat** (test any model directly), the **budget forecast** (top-bar chip →
+  the **budget forecast** (top-bar chip →
   projected spend from the scheduled queue), the Settings **accounts & triggers**
   manager, and the create/edit **drawer**. The Library holds every non-archived
   routine — scheduling doesn't remove it, only archiving takes one off the air.
+- **The shell is exactly one viewport tall, and nothing in that chain may use a
+  percentage height.** `.app` → `.content--flush` → `#view` → `.hx` is flex the
+  whole way with `min-height: 0` at every link. It used to give the pane
+  `height: 100%`; iPadOS Safari resolves that against a flex-derived parent
+  unreliably, and when it failed the panes grew past the viewport, the
+  `overflow: hidden` clipped them, and **nothing scrolled at all** — the run list
+  and transcript were both frozen. `trackAppHeight()` also measures
+  `visualViewport.height` into `--app-h` (dvh stays the fallback), which fixes
+  the same symptom from the other direction and keeps the reply box above the
+  on-screen keyboard.
 - **History is a Claude-Code-shaped workspace, not a list of cards.** A left rail
   (`#hx-rail`) lists every run — searchable, filterable to failures — and the
   right pane (`#hx-main`) holds the selected run's whole exchange *flat against
