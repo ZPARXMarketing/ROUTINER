@@ -496,7 +496,7 @@ async function claimManualFire(routine) {
 const fireInFlight = new Set();
 
 async function fireTrigger(routine) {
-  if (!settings.firing) { toast('Firing is paused on this site (top-right switch). Toggle it live to fire.', 'error'); return; }
+  if (!settings.firing) { toast('Firing is paused on this site — turn it on in Settings → Firing.', 'error'); return; }
   if (routine?.id) {
     if (fireInFlight.has(routine.id)) { toast('Already firing this routine…'); return; }
     fireInFlight.add(routine.id);
@@ -628,10 +628,23 @@ async function fireAgent(routine) {
     } else {
       toast(`Done — ${modelLabel(model)} finished${data.steps ? ` in ${data.steps} step(s)` : ''}${cost ? ` (~$${cost.toFixed(4)})` : ''}. Open it in History to read the full reply or continue.`);
     }
-    try { await loadAll(); render(); } catch { /* non-fatal: the row is saved regardless */ }
+    try { await loadAll(); } catch { /* non-fatal: the row is saved regardless */ }
+    // Land in the thread it just created, with the reply box focused — the run
+    // is a conversation, so put the reader where they can answer it.
+    if (data.runId) openRunInChat(data.runId); else render();
   } catch (e) {
     toast(`Agent request failed: ${e.message}`, 'error');
   }
+}
+
+/* Jump to Chat with one run open and the reply box focused. */
+function openRunInChat(runId) {
+  selectedRunId = 'run-' + runId;
+  confirmDeleteId = null;
+  currentView = 'history';
+  syncTabs();
+  render();
+  setTimeout(() => $('#run-input')?.focus(), 80);
 }
 
 /* ---------- Optional live test (runs the prompt on the chosen model, picking
@@ -1063,10 +1076,18 @@ function friendlyText(raw) {
   if (s.length > 420) s = s.slice(0, 420).replace(/\s+\S*$/, '') + '…';
   return s;
 }
-/* An agent run carries a resumable transcript (or at least a model id), so it can
-   be reopened and continued. Claude-trigger and legacy rows can't — they open
-   read-only. */
-function isContinuable(it) { return !!(it && it.runId && (it.model || (Array.isArray(it.messages) && it.messages.length))); }
+/* Any run row can be replied to. The openrouter-agent function's continue path
+   seeds a system prompt and uses the row's stored `output` as the assistant turn
+   when there's no transcript, and falls back to the default model when the row
+   carries none — so a lead-enrichment recap or a Claude-trigger report is just
+   as answerable as a full agent thread. The only rows that aren't are the ones
+   synthesised from a routine that never logged a run: there is no run to
+   continue. */
+function isContinuable(it) { return !!(it && it.runId); }
+/* Retry and Stop mean "resume this agent's own work", so they stay on rows that
+   actually were an agent run — retrying a lead-enrichment row would run the
+   agent loop, not the enrichment engine, which isn't what the button says. */
+function isAgentRun(it) { return !!(it && it.runId && (it.model || (Array.isArray(it.messages) && it.messages.length))); }
 
 /* ══════════════════════════════════════════════════════════════
    History — a flat two-pane workspace, Claude Code style.
@@ -1078,6 +1099,7 @@ let historyFilter = 'all';   // 'all' | 'failures'
 let historyQuery = '';       // rail search box
 let selectedRunId = null;    // the historyItems id shown in the pane
 let railOpen = false;        // mobile: is the run list slid over the pane?
+let confirmDeleteId = null;  // the row currently asking "delete this run?"
 let runBusy = false;         // a follow-up is in flight
 const runDrafts = new Map(); // id → unsent reply text, so re-renders never eat it
 
@@ -1193,19 +1215,36 @@ function railRowHtml(it, active) {
   // with how long it ran beside it.
   const startIso = runStartIso(it) || it.time;
   const dur = fmtDur(runElapsedMs(it));
-  const cls = ['hxrow', active ? 'is-active' : '', ok ? '' : 'hxrow--bad', busy ? 'hxrow--busy' : '', stale ? 'hxrow--stale' : '']
-    .filter(Boolean).join(' ');
+  const confirming = confirmDeleteId === it.id;
+  const cls = ['hxrow', active ? 'is-active' : '', ok ? '' : 'hxrow--bad', busy ? 'hxrow--busy' : '', stale ? 'hxrow--stale' : '',
+    confirming ? 'hxrow--confirm' : ''].filter(Boolean).join(' ');
   const tip = [it.title || 'Untitled', startIso ? `started ${fmt(startIso)}` : '', runDurationLabel(it)].filter(Boolean).join(' · ');
-  return `<button type="button" class="${cls}" data-hist="${esc(it.id)}"${active ? ' aria-current="true"' : ''} title="${esc(tip)}">
+  // Only run-backed rows can be deleted — a row synthesised from a routine has
+  // no run to remove. A live run has to be stopped first, so it doesn't get one
+  // either (deleting the row mid-write just orphans the agent's checkpoints).
+  const del = (it.runId && !busy)
+    ? `<button type="button" class="hxrow__del" data-del="${esc(it.id)}" title="Delete this run" aria-label="Delete this run">🗑</button>`
+    : '';
+  const sub = confirming
+    ? `<span class="hxrow__sub hxrow__sub--confirm">
+        <span class="hxrow__ask">Delete this run?</span>
+        <button type="button" class="hxrow__cbtn hxrow__cbtn--yes" data-delyes="${esc(it.id)}">Delete</button>
+        <button type="button" class="hxrow__cbtn" data-delno="1">Cancel</button>
+      </span>`
+    : `<span class="hxrow__sub">
+        <span class="hxrow__status hist__status ${statusClass}">${spin}${esc(statusLabel)}</span>
+        ${snip ? `<span class="hxrow__snip">${esc(snip)}</span>` : ''}
+      </span>`;
+  // A div, not a button: the delete control is a real button and buttons cannot
+  // nest. Keyboard activation is wired by hand below to keep it operable.
+  return `<div class="${cls}" data-hist="${esc(it.id)}" role="button" tabindex="0"${active ? ' aria-current="true"' : ''} title="${esc(tip)}">
     <span class="hxrow__top">
       <span class="hxrow__title">${esc(it.title || 'Untitled')}</span>
       <span class="hxrow__time">${esc(fmtShort(startIso))}${dur ? ` · ${esc(dur)}` : ''}</span>
+      ${del}
     </span>
-    <span class="hxrow__sub">
-      <span class="hxrow__status hist__status ${statusClass}">${spin}${esc(statusLabel)}</span>
-      ${snip ? `<span class="hxrow__snip">${esc(snip)}</span>` : ''}
-    </span>
-  </button>`;
+    ${sub}
+  </div>`;
 }
 
 function railListHtml(items) {
@@ -1265,13 +1304,52 @@ function refreshRail() {
 }
 
 function wireRailRows() {
-  $$('#hx-list [data-hist]').forEach((el) => el.addEventListener('click', () => selectRun(el.dataset.hist)));
+  $$('#hx-list [data-hist]').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-del],[data-delyes],[data-delno]')) return; // delete owns those
+      selectRun(el.dataset.hist);
+    });
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectRun(el.dataset.hist); }
+    });
+  });
+  $$('#hx-list [data-del]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    confirmDeleteId = b.dataset.del;
+    refreshRail();
+  }));
+  $$('#hx-list [data-delno]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    confirmDeleteId = null;
+    refreshRail();
+  }));
+  $$('#hx-list [data-delyes]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    deleteRun(b.dataset.delyes);
+  }));
+}
+
+/* Delete one run for good. Two taps (trash → Delete) because there is no undo:
+   the row is the only copy of that transcript. */
+async function deleteRun(id) {
+  const it = historyItems().find((x) => x.id === id);
+  if (!it || !it.runId) return;
+  const { error } = await sb.from('routiner_runs').delete().eq('id', it.runId);
+  if (error) { toast('Delete failed: ' + error.message, 'error'); return; }
+  runs = runs.filter((r) => r.id !== it.runId);
+  runDrafts.delete(id);
+  confirmDeleteId = null;
+  if (selectedRunId === id) selectedRunId = null;   // fall back to the newest
+  toast('Run deleted.');
+  paintCounts();
+  renderHistory();
 }
 
 function wireRail() {
   wireRailRows();
   $$('#hx [data-histf]').forEach((b) => b.addEventListener('click', () => {
     historyFilter = b.dataset.histf;
+    confirmDeleteId = null;
     selectedRunId = null;            // fall back to the newest run in the new filter
     renderHistory();
   }));
@@ -1412,8 +1490,9 @@ function runPaneHtml(it) {
   const busy = isRunBusy(it);
   const stale = isRunStale(it);
   // Retry: error/cancelled + stale "running" rows — same continue path, fixed prompt.
-  const showRetry = can && !runBusy && (it.status === 'error' || it.status === 'cancelled' || stale);
-  const showStop = can && !runBusy && (busy || stale || it.status === 'running');
+  const agent = isAgentRun(it);
+  const showRetry = agent && !runBusy && (it.status === 'error' || it.status === 'cancelled' || stale);
+  const showStop = agent && !runBusy && (busy || stale || it.status === 'running');
   const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status || 'ran');
   const chipStatus = stale ? 'missed' : (it.status === 'cancelled' ? 'archived' : (it.status || 'ran')); // archived chip = muted "stopped"
   const spin = (busy || runBusy) ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
@@ -1426,7 +1505,7 @@ function runPaneHtml(it) {
           <button class="btn btn--primary" id="run-send" ${runBusy ? 'disabled' : ''}>Send</button>
         </div>
       </div>`
-    : `<div class="hx__compose"><div class="hx__note">This run isn't an interactive model chat, so it can't be continued here — it's shown for the record.</div></div>`;
+    : `<div class="hx__compose"><div class="hx__note">This entry is a routine whose run was never logged, so there's no conversation to continue.</div></div>`;
   return `<div class="hx__head">
       <button type="button" class="hx__railbtn" id="hx-railbtn" aria-label="Show the run list">☰ Runs</button>
       <span class="chip chip--${esc(chipStatus)}">${spin}${esc(statusLabel)}</span>

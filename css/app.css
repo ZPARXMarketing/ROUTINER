@@ -192,8 +192,6 @@ a { color: var(--periwinkle); }
 .acctmenu__item:hover { background: rgba(255,255,255,0.05); color: var(--text-hi); }
 .acctmenu__item--danger:hover { color: var(--danger); }
 
-.btn__narrow { display: none; }
-
 .clock {
   font-family: var(--font-mono);
   font-size: 13px;
@@ -235,6 +233,17 @@ a { color: var(--periwinkle); }
 .btn--ghost { background: transparent; color: var(--text-mid); border-color: var(--hairline); }
 .btn--ghost:hover { color: var(--text-hi); border-color: var(--grey-700); }
 .btn--sm { padding: var(--sp-2) var(--sp-3); font-size: 12px; font-weight: 600; }
+/* Icon-only primary action: a plus, like the Claude app's new-chat button. */
+.btn--icon {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1;
+}
 
 /* ── Master fire switch (top bar) ──────────────── */
 .fire-switch {
@@ -721,6 +730,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 
 /* ── A run in the rail ── */
 .hxrow {
+  position: relative;
   display: block;
   width: 100%;
   text-align: left;
@@ -746,7 +756,48 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .hxrow.is-active .hxrow__title { color: var(--lime); }
-.hxrow__time { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-low); white-space: nowrap; }
+.hxrow__time { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-low); white-space: nowrap; transition: opacity .12s ease; }
+/* Delete sits where the timestamp is — the stamp fades out on hover so the row
+   doesn't get busier, and the control is only a pointer away. */
+.hxrow__del {
+  position: absolute;
+  top: var(--sp-2);
+  right: var(--sp-2);
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-low);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease, background .12s ease, color .12s ease;
+}
+.hxrow:hover .hxrow__del, .hxrow__del:focus-visible { opacity: 1; }
+.hxrow:hover .hxrow__time { opacity: 0; }
+.hxrow__del:hover { background: rgba(255,77,94,0.14); color: var(--danger); }
+@media (hover: none) { .hxrow__del { opacity: 0.55; } .hxrow:hover .hxrow__time { opacity: 1; } }
+/* Confirm strip — no undo, so deleting takes two deliberate taps. */
+.hxrow--confirm { background: rgba(255,77,94,0.08); border-color: rgba(255,77,94,0.35); }
+.hxrow__sub--confirm { gap: var(--sp-2); flex-wrap: wrap; }
+.hxrow__ask { color: var(--text-mid); font-weight: 600; }
+.hxrow__cbtn {
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  color: var(--text-mid);
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px var(--sp-2);
+  cursor: pointer;
+}
+.hxrow__cbtn:hover { color: var(--text-hi); border-color: var(--grey-700); }
+.hxrow__cbtn--yes { color: var(--danger); border-color: rgba(255,77,94,0.45); }
+.hxrow__cbtn--yes:hover { background: rgba(255,77,94,0.16); color: var(--danger); }
 .hxrow__sub { display: flex; align-items: center; gap: 6px; margin-top: 3px; font-size: 11.5px; color: var(--text-low); }
 .hxrow__status { font-weight: 700; display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; }
 .hxrow__snip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -956,9 +1007,6 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   }
 }
 @media (max-width: 560px) {
-  .btn__wide { display: none; }
-  .btn__narrow { display: inline; font-size: 18px; line-height: 1; }
-  #newBtn { padding: var(--sp-2) var(--sp-4); }
   .brand--bar .brand__wordmark { display: none; }
 }
 

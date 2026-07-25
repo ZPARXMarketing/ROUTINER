@@ -447,7 +447,7 @@ triggers runs it truly in parallel.
 - `index.html`, `css/tokens.css` (vendored ZPARX tokens), `css/app.css`,
   `js/app.js` (single-page UI, ES module).
 - **Shell:** one top rail (`.topbar`) carries the brand, the nav tabs and the
-  actions (clock · budget chip · New routine · account menu); the body below it
+  actions (clock · budget chip · a **+** for a new routine · account menu); the body below it
   is the only scrolling region. The rail stays a single row down to 1140px —
   shedding the clock, then the budget chip, then tightening the tabs as space
   runs out — so an iPad in landscape still gets one row; below that the nav wraps
@@ -521,6 +521,25 @@ triggers runs it truly in parallel.
   `openrouter-agent` function, and Stop/Retry live in the pane header.
   Below 900px the rail becomes an off-canvas panel that slides over the
   transcript — via the **☰ Runs** button, an edge swipe, the scrim or Escape.
+- **Any run row can be replied to.** `isContinuable` is just "has a runId": the
+  `openrouter-agent` continue path seeds a system prompt, uses the row's stored
+  `output` as the assistant turn when there is no transcript, and falls back to
+  the default model when the row carries none — so a lead-enrichment recap or a
+  Claude-trigger report answers as readily as a full agent thread. `isAgentRun`
+  is the stricter test, and it gates **Retry**/**Stop** only: retrying a
+  lead-enrichment row would run the agent loop, not the enrichment engine. The
+  only rows with no composer are the ones synthesised from a routine that never
+  logged a run.
+- **Rail rows can be deleted** (`deleteRun`) — trash, then a confirm strip in
+  the row, because there is no undo and the row is the only copy of that
+  transcript. Offered on run-backed rows only, and never while one is running
+  (stop it first; deleting mid-write just orphans the agent's checkpoints).
+  Rail rows are `div[role=button]`, not `<button>`, precisely so they can hold
+  those controls — buttons cannot nest.
+- **Run now on an agent instance lands in Chat** (`openRunInChat`) with the new
+  run selected and the reply box focused, rather than leaving the reader to go
+  find it. Claude-trigger fires create no row at fire time — the session reports
+  back later — so there is nothing to jump to there.
 - **A History row answers "where did this get to, and how long did it take."**
   The snippet is `lastWorkText` — the transcript read backwards to the last thing
   actually said or the last tool reached for, not the run's opening summary — so
