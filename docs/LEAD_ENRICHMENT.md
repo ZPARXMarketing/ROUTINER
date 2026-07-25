@@ -264,6 +264,54 @@ Loop while `remaining > 0`. Turn it off for one run with `{"deepen":false}`;
 pick the model with `deepenModel` or the `LEAD_DEEPEN_MODEL` edge secret
 (default `perplexity/sonar-pro`).
 
+## The fabrication gate
+
+**The model pads.** A live run asked `sonar-pro` for 10 Decatur med spas. It
+returned 10 — but three of the domains **did not exist in DNS**, and four
+different "businesses" shared a sequential phone block (`…822-2227 / 2228 /
+2229 / 2270`). The research prompt already said, in capitals, to return fewer
+rather than pad. It padded anyway. **Prompt instructions cannot be the control
+for this.**
+
+The evidence was already being collected and thrown away: the second pass had
+reported those same leads as unresolved, with notes like *"could not find any
+verified listing or official page"*. Pair that with a DNS check — deterministic,
+free, no model — and fabrications identify themselves.
+
+Every claimed website is probed (apex **and** `www`, https then http) before
+insert, and again before the second pass writes:
+
+| `site_status` | meaning |
+|---|---|
+| `alive` | some server answered — any status, even 404/403 |
+| `dead` | every candidate failed to resolve or connect |
+| `unknown` | only timeouts — **never** treated as fabrication |
+| `none` | the lead never claimed a website |
+
+> Probing the apex alone is not enough: plenty of real businesses publish only
+> `www.<domain>` with no apex A record. An apex-only check marked a live CRM
+> site dead, which would have stripped a working website and pushed a real
+> business toward quarantine.
+
+Then the verdict, which needs **two independent pieces of evidence** to reject:
+
+| condition | verdict | effect |
+|---|---|---|
+| nothing corroborated **AND** site dead | `failed` | `status='rejected'`, score 0 — never reaches Review as a live lead |
+| site dead, but details corroborated | `unconfirmed` | domain dropped, lead kept, score ≤ 20 |
+| nothing corroborated, but site alive / absent | `unconfirmed` | kept, score ≤ 20, reason recorded |
+| corroborated, or high confidence + live site | `verified` | full score |
+
+Every outcome writes `enrichment.verification`, `verification_note` and
+`site_status`, and quarantine counts appear in the History recap — so the gate
+is never silent about what it removed.
+
+**Verified on the real cases:** the fabricated *Shalom Family Practice* →
+`failed`/rejected/0 with its dead domain stripped; *Advanced Life Clinic* →
+`verified`/100 with the owner found; a real business whose domain had lapsed →
+`unconfirmed`/20, domain dropped but its **verified phone kept** and still
+visible. The gate discriminates rather than rejecting everything.
+
 ## Two other fixes that ride along
 
 **Exclusion list.** De-duping used to happen only *after* research, so the model

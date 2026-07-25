@@ -390,8 +390,20 @@ lead that is missing a website, phone, or decision-maker, one business at a
 time ("find the owner of THIS clinic" is a much easier question than "find me
 ten clinics"). Writes are add-only and stamped `enrichment.deepened_at`, so the
 pass is idempotent and can never clobber a value you trusted. Also callable
-alone as `{"mode":"deepen"}` to drain the queue or back-fill older leads. Two
-related fixes ship with it: known business names now go into the prompt as an
+alone as `{"mode":"deepen"}` to drain the queue or back-fill older leads.
+
+**It also refuses to ship fabrications.** Asked for 10 businesses in a city that
+didn't have 10, `sonar-pro` padded the list with invented ones — three domains
+that don't resolve, four "businesses" sharing a sequential phone block — despite
+a prompt telling it in capitals to return fewer. Prompts can't be the control
+for that, so every claimed website is now probed (apex **and** `www`) and a lead
+is auto-quarantined (`status='rejected'`, score 0) only on **two** independent
+signals: the second pass corroborated nothing **and** the site doesn't exist.
+Either alone caps the score at 20 and records why, but keeps the lead visible —
+a real business with no website must never be thrown away, and a timeout is
+never read as fabrication. Quarantine counts appear in the History recap.
+
+Two smaller fixes ride along: known business names go into the prompt as an
 exclusion list (one run had been coming back 5-of-6 duplicates), and leads whose
 address names another city or state are dropped as `offArea` (Huntsville targets
 were returning Birmingham and Chattanooga businesses). Verify with
