@@ -285,12 +285,19 @@ const SITE_TIMEOUT_MS = 6000;
 
 async function checkSite(domain: string | null): Promise<SiteStatus> {
   if (!domain) return "none";
+  const bare = domain.replace(/^www\./, "");
+  // MUST try www, not just the apex. Plenty of real businesses publish only
+  // www.<domain> with no apex A record — an apex-only probe calls those dead and
+  // would strip a working website (and, paired with a thin research result,
+  // could quarantine a real business). Verified against a live CRM site whose
+  // apex does not resolve. Only when every candidate fails is a domain dead.
+  const candidates = [`https://${bare}/`, `https://www.${bare}/`, `http://${bare}/`, `http://www.${bare}/`];
   let sawTimeout = false;
-  for (const scheme of ["https", "http"]) {
+  for (const url of candidates) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), SITE_TIMEOUT_MS);
     try {
-      await fetch(`${scheme}://${domain}/`, {
+      await fetch(url, {
         method: "GET",
         redirect: "follow",
         signal: ctrl.signal,
@@ -298,12 +305,14 @@ async function checkSite(domain: string | null): Promise<SiteStatus> {
       });
       return "alive";
     } catch (e) {
-      if ((e as Error).name === "AbortError" || (e as Error).name === "TimeoutError") sawTimeout = true;
-      // Otherwise a TypeError — DNS failure or refused connection. Try http, then give up.
+      const n = (e as Error).name;
+      if (n === "AbortError" || n === "TimeoutError") sawTimeout = true;
+      // Otherwise a TypeError — DNS failure or refused connection. Try the next.
     } finally {
       clearTimeout(timer);
     }
   }
+  // A host that only ever timed out is ambiguous, never evidence of fabrication.
   return sawTimeout ? "unknown" : "dead";
 }
 
