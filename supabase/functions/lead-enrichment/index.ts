@@ -342,6 +342,53 @@ async function checkSite(domain: string | null): Promise<{ status: SiteStatus; p
   return { status: sawTimeout ? "unknown" : "dead", phones: new Set() };
 }
 
+/**
+ * Second look for a phone number, on the pages that actually carry local ones.
+ *
+ * The homepage of a franchise or multi-location practice often shows only a
+ * national line, so a homepage-only check reported conflicts for businesses
+ * whose real number simply lives on /contact. Only called when the homepage
+ * check produced a conflict, so the extra requests are paid for rarely.
+ */
+async function morePhones(domain: string): Promise<Set<string>> {
+  const bare = domain.replace(/^www\./, "");
+  const out = new Set<string>();
+  for (const path of ["contact", "contact-us", "locations"]) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), SITE_TIMEOUT_MS);
+    try {
+      const res = await fetch(`https://${bare}/${path}`, {
+        redirect: "follow", signal: ctrl.signal,
+        headers: { "user-agent": "Mozilla/5.0 (compatible; ZPARX-lead-verify/1.0)" },
+      });
+      if (res.ok && /text|html/i.test(res.headers.get("content-type") ?? "")) {
+        for (const p of extractPhones((await res.text()).slice(0, SITE_BODY_CAP))) out.add(p);
+      } else {
+        await res.body?.cancel();
+      }
+    } catch { /* page absent — fine */ } finally { clearTimeout(timer); }
+    if (out.size) break; // one good page is enough
+  }
+  return out;
+}
+
+/**
+ * Full phone check: homepage first, and only if that contradicts do we spend
+ * extra requests on /contact before calling a number wrong.
+ */
+async function verifyPhone(
+  domain: string | null,
+  phone: string | null,
+  siteStatus: SiteStatus,
+  homepagePhones: Set<string>,
+): Promise<ReturnType<typeof phoneVerdict>> {
+  const first = phoneVerdict(phone, siteStatus === "alive" ? homepagePhones : null);
+  if (first.status !== "conflict" || !domain) return first;
+  const extra = await morePhones(domain);
+  if (!extra.size) return first;
+  return phoneVerdict(phone, new Set([...homepagePhones, ...extra]));
+}
+
 /** Liveness + published phone numbers for many domains, bounded concurrency. */
 async function checkSites(
   domains: (string | null)[],
@@ -531,7 +578,7 @@ async function runDeepen(
 
       // The number we would ship, checked against the site's own published numbers.
       const finalPhone = (patch.phone_e164 ?? row.phone_e164) as string | null;
-      const pv = phoneVerdict(finalPhone, siteStatus === "alive" ? probe.phones : null);
+      const pv = await verifyPhone(finalDomain, finalPhone, siteStatus, probe.phones);
       if (pv.status === "conflict") phoneConflicts++;
 
       const hasPhone = Boolean(patch.phone_e164 ?? row.phone_e164);
@@ -683,7 +730,7 @@ Deno.serve(async (req: Request) => {
         if (i >= rows.length) return;
         const row = rows[i];
         const probe = await checkSite(row.website_domain);
-        const pv = phoneVerdict(row.phone_e164, probe.status === "alive" ? probe.phones : null);
+        const pv = await verifyPhone(row.website_domain, row.phone_e164, probe.status, probe.phones);
         tally[pv.status] = (tally[pv.status] ?? 0) + 1;
         checked++;
         if (probe.status === "dead" && row.website_domain) deadNow++;
@@ -813,7 +860,7 @@ Deno.serve(async (req: Request) => {
     let deadSites = 0, phoneConflicts = 0;
     if (fresh.length) {
       const probes = await checkSites(fresh.map((l) => l.website_domain));
-      fresh.forEach((l, i) => {
+      await Promise.all(fresh.map(async (l, i) => {
         const { status: st, phones } = probes[i];
         const e = l.enrichment as Record<string, unknown>;
         e.site_status = st;
@@ -823,7 +870,7 @@ Deno.serve(async (req: Request) => {
           l.website_domain = null;
         }
         // Same fetch, second question: does the site publish OUR number?
-        const pv = phoneVerdict(l.phone_e164, st === "alive" ? phones : null);
+        const pv = await verifyPhone(l.website_domain, l.phone_e164, st, phones);
         e.phone_status = pv.status;
         e.phone_note = pv.note;
         if (pv.candidates.length) e.site_phones = pv.candidates;
@@ -832,7 +879,7 @@ Deno.serve(async (req: Request) => {
           scoreLead(l as unknown as Parameters<typeof scoreLead>[0]),
           phoneCeiling(pv.status),
         );
-      });
+      }));
     }
 
     let inserted = 0, mirrored = 0, insErr: string | undefined;

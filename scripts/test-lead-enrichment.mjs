@@ -189,6 +189,16 @@ console.log("\nphoneVerdict — the last unverified field");
   eq("no phone on the lead → no-phone",
     phoneVerdict(null, site).status, "no-phone");
 
+  // Franchise/hospital-group sites publish a national line and never the
+  // branch's local number — BrightStar, FirstLight, Aveanna, MDVIP and ATI all
+  // did. Calling that a conflict wrongly caps a perfectly good lead.
+  eq("site publishes only toll-free → unverified, not conflict",
+    phoneVerdict("+12568013600", new Set(["8666187827", "8009876543"])).status, "unverified");
+  eq("but a real local number on the site still contradicts",
+    phoneVerdict("+12568013600", new Set(["8666187827", "2565551234"])).status, "conflict");
+  eq("a toll-free lead number matching a toll-free site number is confirmed",
+    phoneVerdict("+18666187827", new Set(["8666187827"])).status, "confirmed");
+
   eq("a conflicted number is capped below a checked one", phoneCeiling("conflict"), 30);
   eq("confirmed does not cap", phoneCeiling("confirmed"), 100);
   eq("unverified does not cap — only a contradiction does", phoneCeiling("unverified"), 100);

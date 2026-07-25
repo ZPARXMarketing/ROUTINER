@@ -394,6 +394,10 @@ export function extractPhones(html: string): Set<string> {
   return out;
 }
 
+/** NANP toll-free area codes — a national line, never a branch's local number. */
+const TOLL_FREE = new Set(["800","833","844","855","866","877","880","881","882","883","884","885","886","887","888"]);
+export const isTollFree = (ten: string): boolean => TOLL_FREE.has(ten.slice(0, 3));
+
 /** Compare the lead's number against what its own website publishes. */
 export function phoneVerdict(
   leadPhone: string | null,
@@ -413,6 +417,18 @@ export function phoneVerdict(
   }
   if (sitePhones.has(ten)) {
     return { status: "confirmed", note: "This number appears on the business's own website.", candidates: [] };
+  }
+
+  // Franchise and hospital-group sites publish a national toll-free line and
+  // never the branch's local number — BrightStar, FirstLight, Aveanna, MDVIP
+  // and ATI all did exactly this. A toll-free number does not contradict a
+  // local one, so treat that as "cannot compare", not "wrong".
+  if (!isTollFree(ten) && [...sitePhones].every(isTollFree)) {
+    return {
+      status: "unverified",
+      note: "The site publishes only a national toll-free number, so a local number can't be confirmed from it.",
+      candidates: [],
+    };
   }
   // The site publishes numbers and ours is not one of them. That is the exact
   // failure this was built for: a plausible number on a real business.

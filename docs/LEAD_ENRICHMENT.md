@@ -425,18 +425,40 @@ chiropractic clinics, a market holding about one, and gets **1** back — paddin
 defence holding under deliberate pressure. Athens dental at `count:6` agreed on
 83% of names and on every phone across two runs.
 
-### The gap that remains: phones are not verified
+### Phone verification
 
-The DNS gate proves a *website* exists. Nothing proves a *phone number* is
-right. One practice came back with two different numbers on different runs, and
-neither the sequential check nor DNS can catch a plausible-but-wrong number
-attached to a real business. Treat first-pass phones as unconfirmed until the
-second pass corroborates them, and prefer leads whose `enrichment.verification`
-is `verified`.
+The number is the field that actually gets dialled, and for a while it was the
+only one nothing checked — one practice returned two different numbers on
+different runs. It is now read off **the business's own website** and compared.
 
-> A hypothesis that over-asking (`count` beyond real supply) causes this **did
-> not replicate** — `count:12` produced no clustering while `count:6` produced
-> 67%. Don't tune `count` on that theory; tune it on yield and duplicate rate.
+This costs nothing: the site probe was already fetching the page to prove the
+domain resolves, and simply threw the body away. `tel:` links are read first
+(a visible number can be split across markup), then NANP-shaped runs in the
+text with tags stripped, so `<b>555</b><i>123</i>` can't fuse into a phantom.
+
+| `enrichment.phone_status` | meaning | effect |
+|---|---|---|
+| `confirmed` | the number appears on the business's own site | none |
+| `conflict` | the site publishes numbers and ours is **not** among them | score capped at 30, site's numbers recorded in `site_phones` |
+| `unverified` | site unreachable, or publishes no number | none — absence of evidence is not evidence |
+| `no-phone` | nothing to check | none |
+
+**Deliberately not an auto-correct.** A site's number can legitimately differ
+from the one we hold — a tracking line, a department, a second location — so a
+conflict records what the site publishes as *candidates* and leaves the call to
+a human. It just can't outrank a number that checks out.
+
+Re-check leads sourced before this existed, with **zero model calls**:
+
+```bash
+curl -s "$ENG" -H 'content-type: application/json' -d '{"mode":"verify","limit":100}'
+# → { checked, deadSites, phones:{confirmed,conflict,unverified,no-phone}, conflicts:[…] }
+```
+
+> An earlier hypothesis that over-asking (`count` beyond real supply) caused the
+> wrong numbers **did not replicate** — `count:12` produced no clustering while
+> `count:6` produced 67%. Don't tune `count` on that theory; tune it on yield
+> and duplicate rate.
 
 ## Testing
 
