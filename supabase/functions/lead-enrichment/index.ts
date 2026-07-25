@@ -353,7 +353,7 @@ async function deepenOne(
 async function runDeepen(
   key: string,
   opts: { model: string; limit: number; deadline: number; dmTitles: string[]; leadIds?: string[] },
-): Promise<{ scanned: number; filled: number; fields: Record<string, number>; unresolved: number; remaining: number; cost: number; errors: string[] }> {
+): Promise<{ eligible: number; scanned: number; filled: number; fields: Record<string, number>; unresolved: number; remaining: number; cost: number; errors: string[] }> {
   const sel =
     "id,business_name,website_domain,city,region,phone_e164,email,contact_name,contact_title,lead_score,vertical,enrichment";
   const filter = opts.leadIds?.length
@@ -364,7 +364,7 @@ async function runDeepen(
   try {
     rows = (await sbGet(`staged_leads?select=${sel}&${filter}&order=created_at.asc&limit=${opts.limit}`)) as StagedRow[];
   } catch (e) {
-    return { scanned: 0, filled: 0, fields: {}, unresolved: 0, remaining: 0, cost: 0, errors: [(e as Error).message] };
+    return { eligible: 0, scanned: 0, filled: 0, fields: {}, unresolved: 0, remaining: 0, cost: 0, errors: [(e as Error).message] };
   }
 
   // How many are still queued behind this batch — lets the caller loop to zero.
@@ -377,6 +377,10 @@ async function runDeepen(
       queued = more.length;
     } catch { /* best-effort */ }
   }
+
+  // A lead the first pass fully resolved has nothing to deepen. Counting those
+  // as outstanding would make a caller loop over work that does not exist.
+  const eligible = rows.filter((r) => gapsOf(r).length > 0).length;
 
   const fields: Record<string, number> = {};
   const errors: string[] = [];
@@ -444,7 +448,12 @@ async function runDeepen(
   };
 
   await Promise.all(Array.from({ length: Math.min(DEEPEN_CONCURRENCY, rows.length || 1) }, worker));
-  return { scanned, filled, fields, unresolved, remaining: Math.max(0, queued - scanned), cost: Number(cost.toFixed(4)), errors };
+  // Explicit ids → what's left is the gapped rows this batch didn't reach.
+  // Whole-queue → what's left is everything still behind us in the queue.
+  const remaining = opts.leadIds?.length
+    ? Math.max(0, eligible - scanned)
+    : Math.max(0, queued - scanned);
+  return { eligible, scanned, filled, fields, unresolved, remaining, cost: Number(cost.toFixed(4)), errors };
 }
 
 async function loadTargets(body: Record<string, unknown>): Promise<Target[]> {
@@ -628,8 +637,6 @@ Deno.serve(async (req: Request) => {
       leadIds: needing,
     });
     totalCost += deepen.cost;
-    // Anything inserted but not reached before the deadline is still queued.
-    deepen.remaining = Math.max(deepen.remaining, insertedIds.length - deepen.scanned);
   }
 
   // Best-effort recap into the Routiner Log (ad-hoc unless a routineId is passed).
