@@ -164,7 +164,7 @@ balance via `/api/v1/key`, key-side so it never leaves Supabase):
 - **CLI:** `node scripts/usage-meter.mjs` — neon terminal meter (credit bar,
   today/month/lifetime spend, by-model, recent calls). `--watch 30` to live-poll,
   `--plain` for logs, `--demo` to see it with sample data and no network.
-- **Web:** open **`usage.html`** (also linked from the app sidebar → *◆ Usage*) —
+- **Web:** open **`usage.html`** (also linked from the app's account menu → *Usage*) —
   the same numbers as a cyberpunk dashboard that auto-refreshes.
 
 > Setup adds one table (migration `0008_openrouter_usage.sql`) and one function
@@ -426,7 +426,11 @@ were returning Birmingham and Chattanooga businesses). Verify with
   optional auto-routing table (`task_type → complexity → model`) edited in
   Settings and read by **both** the app and the scheduler; null = built-in
   default (`js/model-router.js`).
-- **`routiner_runs`** — run log (one row per fire).
+- **`routiner_runs`** — run log (one row per fire). Two timestamps that mean
+  different things: `started_at` is when the run began and never moves;
+  `fired_at` is bumped at every agent checkpoint, so it is the run's *last
+  activity*. History reads the pair as "started 09:12 · took 41m" (rows written
+  before `started_at` existed show no duration rather than an invented one).
 
 ## How a routine fires
 
@@ -442,16 +446,47 @@ triggers runs it truly in parallel.
 
 - `index.html`, `css/tokens.css` (vendored ZPARX tokens), `css/app.css`,
   `js/app.js` (single-page UI, ES module).
+- **Shell:** one top rail (`.topbar`) carries the brand, the nav tabs and the
+  actions (clock · budget chip · New routine · fire switch · account menu); the
+  body below it is the only scrolling region. The rail stays a single row down to
+  1300px — shedding the clock, then the budget chip, then the fire label as space
+  runs out — and below that the nav wraps to a full-width second row, which buys
+  those chips back. Verified for overflow at every breakpoint; only phone widths
+  scroll the nav, and a fade on its trailing edge says so.
 - Key views in `app.js`: **Board** (`renderBoard`), **Calendar**
   (`renderCalendar` — full 24h, blocks colored by trigger within a per-account
-  hue family), Scheduled / Library / Archived, **History** (`renderHistory` — the
-  single record of every run: plain-English recap + failures with reasons; click
-  a row to open the full exchange in a modal (`openRunModal`) and, for agent
-  runs, reply to continue it via `continueRun` → the `openrouter-agent` function),
-  **Chat** (test any model directly), the **budget forecast** (top-bar chip → projected spend
-  from the scheduled queue), the Settings **accounts & triggers** manager, and
-  the create/edit **drawer**. The Library holds every non-archived routine —
-  scheduling doesn't remove it, only archiving takes one off the air.
+  hue family), Scheduled / Library / Archived, **History** (`renderHistory`),
+  **Chat** (test any model directly), the **budget forecast** (top-bar chip →
+  projected spend from the scheduled queue), the Settings **accounts & triggers**
+  manager, and the create/edit **drawer**. The Library holds every non-archived
+  routine — scheduling doesn't remove it, only archiving takes one off the air.
+- **History is a Claude-Code-shaped workspace, not a list of cards.** A left rail
+  (`#hx-rail`) lists every run — searchable, filterable to failures — and the
+  right pane (`#hx-main`) holds the selected run's whole exchange *flat against
+  the UI*: transcript scrolling in place, reply box pinned to the bottom. There is
+  no modal. `renderHistory` builds the workspace once; every later repaint (the
+  8s live poll, a filter flip, a finished reply) goes through `refreshHistory`,
+  which re-renders in place so the search box keeps focus, the reader keeps their
+  scroll position and an unsent draft survives (`runDrafts`). `selectRun` swaps
+  the pane; `continueRun` still posts `{ runId, prompt }` to the
+  `openrouter-agent` function, and Stop/Retry live in the pane header.
+  Below 900px the rail becomes an off-canvas panel that slides over the
+  transcript — via the **☰ Runs** button, an edge swipe, the scrim or Escape.
+- **A History row answers "where did this get to, and how long did it take."**
+  The snippet is `lastWorkText` — the transcript read backwards to the last thing
+  actually said or the last tool reached for, not the run's opening summary — so
+  a row keeps showing its most recent real move. The stamp is the *start* time
+  plus elapsed (`runDurationLabel`): `took 41m` for a single-round run,
+  `running 6m` while one is live (the 8s poll ticks it), and `over 2d` for a
+  thread you replied to later — that verb keeps elapsed time from claiming the
+  model worked the whole span. Rows still sort by last activity, so a
+  freshly-continued thread surfaces even though its stamp is older.
+- **Past calendar blocks rename in place.** A block whose time has passed is a
+  record of something that happened, so it carries a pencil that swaps its title
+  for an input right on the grid (`startBlockRename` — Enter saves, Escape
+  reverts, clicking away saves). Future blocks still open the drawer on tap.
+  One thing to know: a recurring routine is a single row behind every one of its
+  blocks, so renaming any of them renames the series — the toast says so.
 - DB schema: `supabase/schema.sql` (one-paste setup for a fresh project) +
   incremental `supabase/migrations/`.
 - Styling follows the ZPARX design system: dark-mode-first; lime and yellow are

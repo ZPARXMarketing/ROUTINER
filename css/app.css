@@ -17,80 +17,76 @@ body {
 
 a { color: var(--periwinkle); }
 
-/* ── Layout shell ──────────────────────────────── */
+/* ── Layout shell ──────────────────────────────────
+   One fixed top rail + a single scrolling body underneath (Claude Code shape):
+   the chrome never scrolls away, and a view can choose to own the whole pane
+   instead of the page scroll (see .content--flush / History). */
 .app {
-  display: grid;
-  grid-template-columns: 248px minmax(0, 1fr);
-  min-height: 100vh;
-}
-/* Signed out the sidebar is display:none, so the lone .content child would land
-   in the 248px sidebar track and leave the rest of the viewport empty. Collapse
-   to a single column while the auth screen is up so the card centers. */
-.app.is-auth { grid-template-columns: 1fr; }
-.content {
-  min-width: 0;
-  padding:
-    max(var(--sp-6), env(safe-area-inset-top))
-    max(var(--sp-8), env(safe-area-inset-right))
-    var(--sp-24)
-    max(var(--sp-8), env(safe-area-inset-left));
-}
-/* ── Sidebar (navigation table) ────────────────── */
-.sidebar {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-6);
-  /* top / right / bottom / left — bottom carries the home-indicator inset so the
-     Sign out button never runs under it (or off-screen). */
-  padding:
-    calc(var(--sp-6) + env(safe-area-inset-top))
-    var(--sp-4)
-    calc(var(--sp-6) + env(safe-area-inset-bottom))
-    max(var(--sp-4), env(safe-area-inset-left));
-  border-right: 1px solid var(--hairline);
-  background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
-  position: sticky;
-  top: 0;
   height: 100vh;
-  height: 100dvh; /* exclude mobile browser chrome so the Account group stays in view */
+  height: 100dvh; /* exclude mobile browser chrome */
+  min-height: 0;
+}
+.content {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding:
+    var(--sp-6)
+    max(var(--sp-8), env(safe-area-inset-right))
+    var(--sp-16)
+    max(var(--sp-8), env(safe-area-inset-left));
 }
-.sidebar__group { display: flex; flex-direction: column; gap: var(--sp-2); }
-.sidebar__group--foot { margin-top: auto; }
+/* Views that render their own full-height layout (History) take the pane raw —
+   no page padding, no page scroll; their inner columns scroll instead. */
+.content--flush { padding: 0; overflow: hidden; }
+.content--flush > #view { height: 100%; }
 
-/* Roomier perimeter on tablet / desktop widths (e.g. iPadOS) so the UI isn't
-   jammed against the screen edges — the sidebar owns the left outer gutter and
-   the content owns the right one. Placed AFTER the base .content / .sidebar
-   rules so these longhand overrides win over their padding shorthands. */
 @media (min-width: 900px) {
-  .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); padding-top: max(var(--sp-8), env(safe-area-inset-top)); }
-  .sidebar {
-    padding-left: max(var(--sp-8), env(safe-area-inset-left));
-    padding-right: var(--sp-5, 20px);
-    padding-top: calc(var(--sp-8) + env(safe-area-inset-top));
-    padding-bottom: calc(var(--sp-8) + env(safe-area-inset-bottom));
-  }
+  .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); }
+  .content--flush { padding: 0; }
 }
-.sidebar__label {
-  font-family: var(--font-pixel);
-  font-size: 9px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-low);
-  padding: 0 var(--sp-2);
-  margin-bottom: var(--sp-1);
+/* The top rail keeps every tab reachable without scrolling. Above 1300px it is
+   one row and sheds the widest optional chips as space runs out; below that the
+   nav takes a full row of its own, which buys the chips back. (Measured widths:
+   brand 186 · nav 682 · clock 206 · budget 144 · new 130 · fire 108.) Verified
+   with no overflow at 1920/1600/1500/1440/1300/1280/1100/900/834/700/560. */
+@media (min-width: 1301px) and (max-width: 1600px) {
+  .clock--time.clock--next .clock__now { display: none; }  /* keep "next in 12m" */
+  .clock--time:not(.clock--next) { display: none; }        /* nothing queued → drop it */
 }
-.sidebar__btn { width: 100%; justify-content: flex-start; }
+@media (min-width: 1301px) and (max-width: 1520px) { .budget-chip { display: none !important; } }
+@media (min-width: 1301px) and (max-width: 1400px) {
+  .topbar { gap: var(--sp-3); }
+  .fire-toggle__label { display: none; }
+  .tab { padding-left: var(--sp-2); padding-right: var(--sp-2); }
+}
 
-/* ── Top bar ───────────────────────────────────── */
+/* ── Top bar (brand + navigation + actions) ────── */
 .topbar {
   display: flex;
   align-items: center;
   gap: var(--sp-4);
-  padding: var(--sp-2) 0 var(--sp-6);
-  flex-wrap: wrap;
+  flex-wrap: nowrap; /* one rail on desktop; the narrow query wraps nav to row 2 */
+  flex: 0 0 auto;
+  padding:
+    calc(var(--sp-3) + env(safe-area-inset-top))
+    max(var(--sp-6), env(safe-area-inset-right))
+    var(--sp-3)
+    max(var(--sp-6), env(safe-area-inset-left));
+  border-bottom: 1px solid var(--hairline);
+  background: linear-gradient(180deg, rgba(20,27,46,0.72), rgba(12,17,31,0.88));
+  backdrop-filter: blur(10px);
+  z-index: 30;
 }
+.topbar__actions { margin-left: auto; }
 .brand { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; padding: 0 var(--sp-2); min-width: 0; }
+.brand--bar { flex-direction: row; align-items: center; gap: var(--sp-2); padding-left: 0; flex: 0 0 auto; }
+.brand--bar .brand__logo { height: 22px; }
+.brand--bar .brand__wordmark { font-size: 11px; }
 .brand__logo { height: 26px; width: auto; max-width: 100%; display: block; }
 .brand__wordmark {
   font-family: var(--font-pixel);
@@ -122,7 +118,74 @@ a { color: var(--periwinkle); }
   margin-bottom: 2px;
 }
 .topbar__spacer { flex: 1 1 auto; }
-.topbar__actions { display: flex; align-items: center; gap: var(--sp-2); }
+.topbar__actions { display: flex; align-items: center; gap: var(--sp-2); flex: 0 0 auto; }
+
+/* ── Account menu (top-right popover) ──────────── */
+.acctmenu { position: relative; }
+.acctmenu__btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-mid);
+  background: var(--bg-surface);
+  border: 1px solid var(--hairline);
+  border-radius: 50%;
+  cursor: pointer;
+  text-transform: uppercase;
+}
+.acctmenu__btn:hover { color: var(--text-hi); border-color: var(--grey-700); }
+.acctmenu.is-open .acctmenu__btn { color: var(--text-hi); border-color: var(--grey-700); }
+.acctmenu__pop {
+  display: none;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 172px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--sp-1);
+  z-index: 60;
+}
+.acctmenu.is-open .acctmenu__pop { display: block; }
+.acctmenu__who {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-low);
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--hairline);
+  margin-bottom: var(--sp-1);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acctmenu__item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: var(--r-sm);
+  color: var(--text-mid);
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 600;
+  padding: var(--sp-2) var(--sp-3);
+  cursor: pointer;
+  text-decoration: none;
+}
+.acctmenu__item:hover { background: rgba(255,255,255,0.05); color: var(--text-hi); }
+.acctmenu__item--danger:hover { color: var(--danger); }
+
+.btn__narrow { display: none; }
 
 .clock {
   font-family: var(--font-mono);
@@ -187,27 +250,35 @@ a { color: var(--periwinkle); }
 .btn[disabled] { opacity: .5; cursor: not-allowed; }
 .btn__icon { font-size: 15px; line-height: 1; }
 
-/* ── Tabs (vertical sidebar nav table) ─────────── */
+/* ── Tabs (horizontal nav rail in the top bar) ─── */
 .tabs {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
   gap: 2px;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
+.tabs::-webkit-scrollbar { display: none; }
 .tab {
   background: none;
   border: 1px solid transparent;
-  border-radius: var(--r-md);
+  border-radius: var(--r-pill);
   color: var(--text-mid);
   font-family: var(--font-body);
   font-weight: 600;
-  font-size: 14px;
-  padding: var(--sp-3) var(--sp-3);
+  font-size: 13.5px;
+  padding: var(--sp-2) var(--sp-3);
   cursor: pointer;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: var(--sp-2);
+  gap: 6px;
   text-align: left;
-  width: 100%;
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 .tab:hover { color: var(--text-hi); background: rgba(255,255,255,0.03); }
 .tab.is-active {
@@ -223,7 +294,6 @@ a { color: var(--periwinkle); }
   border-radius: var(--r-pill);
   padding: 1px 7px;
   color: var(--text-mid);
-  margin-left: auto;
 }
 .tab.is-active .tab__count { background: rgba(188,239,47,0.14); color: var(--lime); border-color: transparent; }
 /* The Log badge turns hot when there are failures to look at. */
@@ -470,6 +540,9 @@ a { color: var(--periwinkle); }
 
 /* ── Toast ─────────────────────────────────────── */
 .toasts { position: fixed; bottom: var(--sp-6); left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: var(--sp-2); z-index: 80; align-items: center; }
+/* History pins a reply box to the bottom — clear it so toasts never land on the
+   box the reader is typing in. */
+body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bottom)); }
 .toast {
   background: var(--bg-elevated);
   border: 1px solid var(--hairline);
@@ -514,16 +587,151 @@ a { color: var(--periwinkle); }
 .run__body a { color: var(--accent); text-decoration: underline; word-break: break-all; }
 .run__body strong { color: var(--text-high); font-weight: 600; }
 
-/* ── History (friendly reading view) ───────────── */
-.hist {
-  background: var(--bg-surface);
-  border: 1px solid var(--hairline);
-  border-left: 3px solid rgba(188,239,47,0.55);
-  border-radius: var(--r-md);
-  padding: var(--sp-3) var(--sp-4);
+/* ══════════════════════════════════════════════════
+   History — flat two-pane workspace (Claude Code shape)
+   Left rail = every run; right pane = that run's exchange, flush against the
+   UI with a composer pinned to the bottom. No modal, no overlay.
+   ══════════════════════════════════════════════════ */
+.hx {
+  position: relative;
+  display: grid;
+  grid-template-columns: 304px minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
 }
-.hist--bad { border-left-color: var(--danger); }
-.hist--stale { border-left-color: var(--yellow); }
+/* ── Left rail: the run list ── */
+.hx__rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  border-right: 1px solid var(--hairline);
+  background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
+}
+.hx__rail-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-4) var(--sp-3);
+  padding-left: max(var(--sp-4), env(safe-area-inset-left));
+  border-bottom: 1px solid var(--hairline);
+  flex: 0 0 auto;
+}
+.hx__rail-title {
+  font-family: var(--font-pixel);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-low);
+}
+.hx__search { font-size: 13px; padding: var(--sp-2) var(--sp-3); }
+.hx__list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-2);
+  padding-left: max(var(--sp-2), env(safe-area-inset-left));
+  padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.hx__none { padding: var(--sp-6) var(--sp-4); font-size: 13px; color: var(--text-low); text-align: center; }
+/* ── Right pane: the exchange ── */
+.hx__main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-base);
+}
+.hx__head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-5);
+  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+  border-bottom: 1px solid var(--hairline);
+  flex: 0 0 auto;
+  min-height: 0;
+}
+.hx__title { font-family: var(--font-display); font-weight: 800; font-size: 16px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hx__time { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); white-space: nowrap; }
+.hx__head-actions { display: flex; gap: var(--sp-2); flex: 0 0 auto; }
+.hx__thread {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-6) var(--sp-5);
+  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+}
+.hx__thread-inner { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-3); }
+.hx__thread .chatmsg { max-width: 88%; }
+.hx__thread .chatmsg--busy { display: inline-flex; align-items: center; gap: 8px; align-self: flex-start; }
+.hx__thread .chatmsg--bot a { color: var(--periwinkle); text-decoration: underline; word-break: break-all; }
+.hx__thread .chatmsg--bot strong { color: var(--text-hi); font-weight: 600; }
+.hx__compose {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--hairline);
+  background: linear-gradient(180deg, rgba(20,27,46,0.35), var(--bg-base));
+  padding: var(--sp-3) var(--sp-5) calc(var(--sp-3) + env(safe-area-inset-bottom));
+  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+}
+.hx__compose-inner { max-width: 860px; margin: 0 auto; display: flex; gap: var(--sp-2); align-items: flex-end; }
+.hx__compose .chat__input {
+  min-height: 62px;
+  max-height: 220px;
+  flex: 1;
+  font-family: var(--font-body);   /* prose, not a prompt editor */
+  font-size: 14px;
+  line-height: 1.5;
+}
+.hx__compose .btn { flex: 0 0 auto; }
+.hx__note {
+  max-width: 860px; margin: 0 auto;
+  font-size: 12.5px; color: var(--text-low);
+}
+/* Nothing picked yet (or nothing to pick) */
+.hx__blank { flex: 1; display: flex; align-items: center; justify-content: center; padding: var(--sp-8); }
+/* Mobile-only rail controls */
+.hx__railbtn { display: none; }
+.hx__scrim { display: none; }
+
+/* ── A run in the rail ── */
+.hxrow {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-left: 3px solid rgba(188,239,47,0.55);
+  border-radius: var(--r-sm);
+  padding: var(--sp-2) var(--sp-3);
+  cursor: pointer;
+  font-family: var(--font-body);
+  color: var(--text-mid);
+  transition: background .12s ease, border-color .12s ease;
+}
+.hxrow:hover { background: rgba(255,255,255,0.035); }
+.hxrow.is-active { background: rgba(188,239,47,0.10); border-color: rgba(188,239,47,0.30); border-left-color: var(--lime); }
+.hxrow--bad { border-left-color: var(--danger); }
+.hxrow--stale { border-left-color: var(--yellow); }
+.hxrow--busy { border-left-color: var(--periwinkle); }
+.hxrow:focus-visible { outline: 2px solid var(--periwinkle); outline-offset: 1px; }
+.hxrow__top { display: flex; align-items: center; gap: var(--sp-2); }
+.hxrow__title {
+  font-family: var(--font-display); font-weight: 600; font-size: 13.5px; color: var(--text-hi);
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hxrow.is-active .hxrow__title { color: var(--lime); }
+.hxrow__time { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-low); white-space: nowrap; }
+.hxrow__sub { display: flex; align-items: center; gap: 6px; margin-top: 3px; font-size: 11.5px; color: var(--text-low); }
+.hxrow__status { font-weight: 700; display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+.hxrow__snip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+/* ── History (shared row bits — status colors, spinner) ─── */
 .hist--busy .hist__status.is-busy { color: var(--periwinkle); }
 .hist__head { display: flex; align-items: baseline; gap: var(--sp-3); flex-wrap: wrap; }
 .hist__title { font-family: var(--font-display); font-weight: 600; font-size: 15px; flex: 1; }
@@ -545,22 +753,9 @@ a { color: var(--periwinkle); }
   flex-shrink: 0;
 }
 @keyframes hist-spin { to { transform: rotate(360deg); } }
-.hist__text { font-size: 13.5px; line-height: 1.55; color: var(--text-mid); margin-top: var(--sp-2); }
-.hist__text--none { color: var(--text-low); font-style: italic; }
-.hist__meta {
-  display: flex; align-items: center; gap: var(--sp-2);
-  margin-top: var(--sp-2);
-  font-family: var(--font-mono); font-size: 11.5px; color: var(--text-low);
-}
-.hist__open { margin-left: auto; color: var(--periwinkle); font-weight: 600; opacity: 0; transition: opacity .15s ease; }
-/* Clickable rows: a run opens into its full exchange. */
-.hist--click { cursor: pointer; transition: border-color .15s ease, transform .05s ease; }
-.hist--click:hover { border-color: var(--grey-700); }
-.hist--click:hover .hist__open { opacity: 1; }
-.hist--click:focus-visible { outline: 2px solid var(--periwinkle); outline-offset: 2px; }
-
 /* ── Run-history filter (all / failures) ───────── */
-.log__filter { display: flex; gap: var(--sp-2); margin-bottom: var(--sp-4); }
+.log__filter { display: flex; gap: var(--sp-2); }
+.log__filter .btn { flex: 1 1 0; justify-content: center; }
 
 /* ── Chat (model testing) ──────────────────────── */
 .chat { max-width: 820px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-4); min-height: calc(100vh - 220px); }
@@ -597,34 +792,7 @@ a { color: var(--periwinkle); }
 .chat__input { min-height: 56px; max-height: 180px; flex: 1; }
 .chat__compose .btn { flex: 0 0 auto; }
 
-/* ── Run detail modal (full exchange + continue) ── */
-/* Centered dialog (the drawer overlay justifies to the right; this one centers). */
-.overlay--modal { align-items: center; justify-content: center; padding: var(--sp-6); }
-.modal {
-  width: min(760px, 100%);
-  max-height: min(88vh, 900px);
-  background: var(--bg-surface);
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-lg);
-  box-shadow: var(--shadow-lg);
-  display: flex;
-  flex-direction: column;
-  animation: modalIn .18s ease;
-}
-@keyframes modalIn { from { transform: translateY(10px) scale(.99); opacity: .5; } to { transform: none; opacity: 1; } }
-.modal__head {
-  display: flex; align-items: center; gap: var(--sp-3);
-  padding: var(--sp-4) var(--sp-5);
-  border-bottom: 1px solid var(--hairline);
-}
-.modal__title { font-family: var(--font-display); font-weight: 800; font-size: 17px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.modal__time { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); }
-.modal__thread {
-  flex: 1; overflow-y: auto;
-  display: flex; flex-direction: column; gap: var(--sp-3);
-  padding: var(--sp-5);
-  background: var(--bg-base);
-}
+/* ── Run transcript pieces (shared by the History pane) ── */
 /* The model's tool actions + their raw results, shown compactly in the thread. */
 .transcript__tool {
   align-self: flex-start;
@@ -682,26 +850,7 @@ a { color: var(--periwinkle); }
   max-height: 280px;
   overflow-y: auto;
 }
-.modal__thread .chatmsg { max-width: 88%; }
-.modal__thread .chatmsg--busy { display: inline-flex; align-items: center; gap: 8px; }
 .chip .hist__spin { margin-right: 4px; }
-.modal__thread .chatmsg--bot a { color: var(--accent); text-decoration: underline; word-break: break-all; }
-.modal__thread .chatmsg--bot strong { color: var(--text-high); font-weight: 600; }
-.modal__compose {
-  display: flex; gap: var(--sp-2); align-items: flex-end;
-  padding: var(--sp-4) var(--sp-5);
-  border-top: 1px solid var(--hairline);
-  background: var(--bg-base);
-}
-.modal__compose .chat__input { min-height: 52px; flex: 1; }
-.modal__compose .btn { flex: 0 0 auto; }
-.modal__compose-actions { display: flex; gap: var(--sp-2); flex: 0 0 auto; align-items: flex-end; }
-.modal__note {
-  padding: var(--sp-4) var(--sp-5);
-  border-top: 1px solid var(--hairline);
-  background: var(--bg-base);
-  font-size: 12.5px; color: var(--text-low);
-}
 
 /* ── Budget chip + forecast panel ──────────────── */
 .budget-chip { cursor: pointer; transition: border-color .15s ease, color .15s ease; }
@@ -758,25 +907,96 @@ a { color: var(--periwinkle); }
 .auth__msg.is-err { display: block; background: rgba(255,77,94,0.12); border: 1px solid rgba(255,77,94,0.4); color: var(--danger); }
 .auth__msg.is-ok { display: block; background: rgba(188,239,47,0.10); border: 1px solid rgba(188,239,47,0.35); color: var(--lime); }
 
-@media (max-width: 860px) {
-  .app { grid-template-columns: 1fr; }
-  .sidebar {
-    position: static;
-    height: auto;
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--sp-3);
-    border-right: none;
-    border-bottom: 1px solid var(--hairline);
+/* ══════════════════════════════════════════════════
+   Narrow / mobile — the top rail wraps to two rows and the History run list
+   becomes an off-canvas panel that slides over the transcript (Claude Code).
+   ══════════════════════════════════════════════════ */
+/* Two-row rail: nav drops to its own full-width row under the brand + actions
+   rather than scrolling itself out of reach. */
+@media (max-width: 1300px) {
+  .topbar { flex-wrap: wrap; gap: var(--sp-2); padding-bottom: var(--sp-2); }
+  .tabs { order: 3; flex: 1 1 100%; }
+}
+/* Row one still has to fit: shed the same chips, in the same order. */
+@media (max-width: 900px) { .clock--time { display: none; } .fire-toggle__label { display: none; } }
+@media (max-width: 820px) { .budget-chip { display: none !important; } }
+/* Phone: the nav row itself runs out of width — tighten the tabs before letting
+   them scroll, and drop the count badges last. */
+@media (max-width: 780px) {
+  .tab { font-size: 12.5px; padding: 6px var(--sp-2); gap: 4px; }
+  .tab__count { font-size: 10px; padding: 1px 5px; }
+}
+@media (max-width: 620px) { .tab__count { display: none; } }
+/* Narrower than this the nav genuinely cannot fit; it scrolls, and the fade on
+   the trailing edge says so. */
+@media (max-width: 520px) {
+  .tabs {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent 100%);
+    mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent 100%);
   }
-  .sidebar__group { flex: 1 1 auto; }
-  .sidebar__group--foot { flex-direction: row; align-items: center; gap: var(--sp-2); }
-  .sidebar__label { display: none; }
-  .tabs { flex-direction: row; flex-wrap: wrap; }
-  .tab { width: auto; }
+}
+@media (max-width: 560px) {
+  .btn__wide { display: none; }
+  .btn__narrow { display: inline; font-size: 18px; line-height: 1; }
+  #newBtn { padding: var(--sp-2) var(--sp-4); }
+  .brand--bar .brand__wordmark { display: none; }
+}
+
+@media (max-width: 900px) {
   .content { padding: var(--sp-6) max(var(--sp-6), env(safe-area-inset-right)) var(--sp-16) max(var(--sp-6), env(safe-area-inset-left)); }
+  .content--flush { padding: 0; }
   .brand__title { font-size: 18px; }
+
+  /* History: single pane, rail slides in over it. */
+  .hx { grid-template-columns: minmax(0, 1fr); }
+  .hx__rail {
+    position: absolute;
+    top: 0; bottom: 0; left: 0;
+    width: min(320px, 86vw);
+    z-index: 40;
+    background: var(--bg-surface);
+    transform: translateX(-100%);
+    transition: transform .24s cubic-bezier(.3, .7, .3, 1);
+    will-change: transform;
+  }
+  .hx.is-rail-open .hx__rail { transform: none; box-shadow: var(--shadow-lg); }
+  .hx__scrim {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 39;
+    background: rgba(7,10,20,0.66);
+    backdrop-filter: blur(2px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .24s ease;
+  }
+  .hx.is-rail-open .hx__scrim { opacity: 1; pointer-events: auto; }
+  .hx__railbtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-sm);
+    color: var(--text-mid);
+    font-family: var(--font-body);
+    font-weight: 600;
+    font-size: 12px;
+    padding: 6px var(--sp-2);
+    cursor: pointer;
+  }
+  .hx__railbtn:hover { color: var(--text-hi); border-color: var(--grey-700); }
+  .hx__head { padding: var(--sp-3) var(--sp-4); gap: var(--sp-2); }
+  .hx__title { font-size: 14px; }
+  .hx__time { display: none; }
+  .hx__thread { padding: var(--sp-4) var(--sp-4); }
+  .hx__compose { padding-left: var(--sp-4); padding-right: var(--sp-4); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hx__rail, .hx__scrim { transition: none; }
 }
 
 /* ============================================================
@@ -820,7 +1040,47 @@ a { color: var(--periwinkle); }
 .cal__ev:hover { filter: brightness(1.07); z-index: 5; box-shadow: var(--shadow-md); }
 .cal__ev--dragging { z-index: 50; cursor: grabbing; opacity: 0.92; box-shadow: 0 10px 26px rgba(0,0,0,0.5); transition: none; filter: brightness(1.08); }
 .cal__ev--past { opacity: 0.5; }
+.cal__ev--past:hover { opacity: 0.9; }
+.cal__ev--past:focus-within { opacity: 1; }  /* stays lit while you're renaming it */
 .cal__ev-title { font-family: var(--font-body); font-weight: 600; font-size: 11px; line-height: 1.1; overflow: hidden; text-overflow: ellipsis; }
+.cal__ev--past .cal__ev-title { padding-right: 18px; }
+
+/* Rename a past block in place — the pencil sits in its corner, the input takes
+   the title's spot. */
+.cal__ev-edit {
+  position: absolute;
+  top: 2px; right: 2px;
+  width: 17px; height: 17px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: rgba(0,0,0,0.20);
+  color: inherit;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease, background .12s ease;
+}
+.cal__ev:hover .cal__ev-edit { opacity: 1; }
+.cal__ev-edit:hover { background: rgba(0,0,0,0.34); }
+.cal__ev-edit:focus-visible { opacity: 1; outline: 2px solid var(--white); outline-offset: 1px; }
+/* No hover on touch — keep it visible so it's reachable at all. */
+@media (hover: none) { .cal__ev-edit { opacity: 0.6; } }
+.cal__ev-input {
+  width: 100%;
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 11px;
+  line-height: 1.15;
+  color: inherit;
+  background: rgba(0,0,0,0.22);
+  border: 1px solid rgba(0,0,0,0.35);
+  border-radius: 4px;
+  padding: 1px 3px;
+}
+.cal__ev-input:focus { outline: 2px solid rgba(255,255,255,0.65); outline-offset: 0; }
 .cal__ev-time { font-family: var(--font-mono); font-weight: 600; font-size: 9px; margin-top: 2px; opacity: 0.72; }
 
 .cal__now { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid var(--lime); box-shadow: 0 0 12px rgba(188,239,47,0.6); z-index: 6; pointer-events: none; }
