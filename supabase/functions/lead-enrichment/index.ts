@@ -602,6 +602,10 @@ Deno.serve(async (req: Request) => {
   let body: Record<string, unknown> = {};
   try { body = await req.json(); } catch { /* empty ok */ }
   const dryRun = Boolean(body.dryRun);
+  // How many parsed leads a dry run hands back. Defaults to 3 for a quick look;
+  // raise it when validating a target, where seeing every phone and domain is
+  // the whole point (a malformed number hid in the unsampled tail once).
+  const sampleSize = Math.max(1, Math.min(Number(body.sampleSize) || 3, COUNT_CAP));
   const allow = allowedModels();
   const startedAt = Date.now();
 
@@ -743,7 +747,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const result = { requested: t.count, parsed, inserted: dryRun ? 0 : inserted, skipped, offArea, deadSites, mirrored, cost };
-    runs.push({ target: t.label, model, ...result, ...(insErr ? { error: insErr } : {}), ...(dryRun ? { dryRun: true, sample: fresh.slice(0, 3) } : {}) });
+    runs.push({ target: t.label, model, ...result, ...(insErr ? { error: insErr } : {}), ...(dryRun ? { dryRun: true, sample: fresh.slice(0, sampleSize) } : {}) });
     if (t.id) await sbPatch("lead_enrichment_targets", `id=eq.${t.id}`, { last_run_at: foundAt, last_result: result });
   }
 
