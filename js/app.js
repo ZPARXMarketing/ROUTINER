@@ -238,7 +238,7 @@ function saveSettings() { localStorage.setItem(LS, JSON.stringify(settings)); }
 let routines = [];
 let runs = [];
 let notes = [];
-let currentView = 'calendar';
+let currentView = 'history';   // Chat — the first tab, and where the app opens
 let session = null;
 
 /* ---------- DOM helpers ---------- */

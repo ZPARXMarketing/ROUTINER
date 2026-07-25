@@ -455,7 +455,8 @@ triggers runs it truly in parallel.
   at 20 widths from 1920 to 360; only phone widths scroll the nav, and a fade on
   its trailing edge says so.
 - **The tab order leads with the work.** `Chat` (the `history` view — the runs
-  and their transcripts) sits first and carries no count badge; then Calendar,
+  and their transcripts) sits first, is what the app opens on, and carries no
+  count badge; then Calendar,
   Board, Scheduled, Library, Archived. The separate model-testing Chat view is
   gone. The view id stays `history` throughout the code — only the label reads
   "Chat".
