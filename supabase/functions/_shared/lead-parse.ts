@@ -380,12 +380,32 @@ export type PhoneStatus =
  * NANP-shaped runs in the text with the tags stripped so "…</b>555</span>…"
  * doesn't fuse into a false match.
  */
+/**
+ * Is this a number that could actually be dialled?
+ *
+ * Real business sites carry placeholders — live Huntsville sites published
+ * `555-555-5555` and `999-999-9999` in their own markup. Left in, they pollute
+ * the "what this site publishes" evidence and could even let a template's dummy
+ * number "confirm" a lead's dummy number. NANP rules do the filtering: an area
+ * code or exchange never starts with 0 or 1, 555 is reserved, and no real
+ * number is ten identical digits.
+ */
+export function isDialableNanp(ten: string): boolean {
+  if (!/^\d{10}$/.test(ten)) return false;
+  if (/^(\d)\1{9}$/.test(ten)) return false;          // 5555555555, 9999999999
+  const npa = ten.slice(0, 3), nxx = ten.slice(3, 6);
+  if (npa === "555" || npa[0] === "0" || npa[0] === "1") return false;
+  if (nxx[0] === "0" || nxx[0] === "1") return false;
+  if (npa[1] === "9" && npa[2] === "9") return false;   // unassigned 9x9 block
+  return true;
+}
+
 export function extractPhones(html: string): Set<string> {
   const out = new Set<string>();
   const add = (raw: string) => {
     const d = raw.replace(/[^\d]/g, "");
     const ten = d.length === 11 && d.startsWith("1") ? d.slice(1) : d;
-    if (ten.length === 10) out.add(ten);
+    if (ten.length === 10 && isDialableNanp(ten)) out.add(ten);
   };
   for (const m of html.matchAll(/href\s*=\s*["']tel:([^"']{7,25})["']/gi)) add(m[1]);
   // Replace tags with a space so adjacent elements never merge into a number.

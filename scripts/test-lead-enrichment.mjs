@@ -164,6 +164,15 @@ console.log("\nextractPhones — reading numbers off a business's own page");
   eq("strips a leading US 1 so formats compare equal",
     [...extractPhones('<a href="tel:12568826555">x</a>')][0], "2568826555");
   eq("empty page yields nothing", extractPhones("").size, 0);
+
+  // Real Huntsville sites publish placeholders in their own markup. Left in,
+  // they pollute the evidence and could let a template's dummy number
+  // "confirm" a lead's dummy number.
+  eq("555-555-5555 placeholder rejected", extractPhones("call 555-555-5555").size, 0);
+  eq("999-999-9999 placeholder rejected", extractPhones("call 999-999-9999").size, 0);
+  eq("area code starting with 1 rejected", extractPhones("call 155-123-4567").size, 0);
+  eq("exchange starting with 0 rejected", extractPhones("call 256-012-3456").size, 0);
+  ok("a real number still passes", extractPhones("call 256-882-6555").has("2568826555"));
 }
 
 console.log("\nphoneVerdict — the last unverified field");
