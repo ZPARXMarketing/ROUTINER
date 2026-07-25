@@ -53,16 +53,29 @@ export function validatePhone(raw: string | null): string | null {
   return raw.trim();
 }
 
-/** Best-effort E.164 for staged_leads.phone_e164 (approval re-normalizes anyway). */
+/**
+ * Best-effort E.164 for staged_leads.phone_e164.
+ *
+ * This feeds a dialer, so a wrong country code is worse than no number at all.
+ * The old fallback slapped "+" on ANY bare digit string, which turned a
+ * mistyped US number into a foreign one: a Florence, AL dental practice came
+ * back as `+25676495335` — an 11-digit 256-area-code number reinterpreted as
+ * country code +256, **Uganda**. Silently dialable, silently wrong.
+ *
+ * So a number written WITHOUT a leading "+" is only trusted in the two
+ * unambiguous NANP shapes. Anything else is junk we cannot safely interpret,
+ * and this file's rule for junk is null — never a guess.
+ */
 export function toE164(raw: string | null): string | null {
   if (!raw) return null;
   const hasPlus = raw.trim().startsWith("+");
   const digits = raw.replace(/[^\d]/g, "");
   if (digits.length < 7 || digits.length > 15) return null;
+  // An explicit "+" means the source stated its country code — trust it.
   if (hasPlus) return "+" + digits;
-  if (digits.length === 10) return "+1" + digits;          // bare US/CA
+  if (digits.length === 10) return "+1" + digits;           // bare US/CA
   if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
-  return "+" + digits;                                      // assume already country-coded
+  return null;                                              // unsafe to guess
 }
 
 export function validateEmail(raw: string | null): string | null {
@@ -163,12 +176,53 @@ export function parseLeads(
   return out;
 }
 
+/**
+ * Does this lead actually sit in the target area?
+ *
+ * Perplexity drifts: Huntsville targets have come back with Birmingham (205)
+ * and Chattanooga (423) businesses, which then burn a Review-tab slot. We only
+ * ever reject on a POSITIVE mismatch — a lead whose address we couldn't read
+ * inherits the target city in `parseLeads`, so "unknown" must not be treated as
+ * "wrong" or we'd throw away good leads for having a shy address line.
+ *
+ *   "confirmed" — the lead's own address agrees with the target
+ *   "mismatch"  — the lead's own address names a different city AND/OR state
+ *   "assumed"   — no usable address of its own; caller decides (we keep these)
+ */
+export function areaMatch(
+  l: { city: string | null; region: string | null; enrichment: { address: string | null } },
+  location: string | null,
+): "confirmed" | "mismatch" | "assumed" {
+  if (!location) return "assumed";
+  // No address of its own → parseLeads back-filled the target city. Unknowable.
+  if (!l.enrichment.address) return "assumed";
+
+  const parts = location.split(",").map((p) => p.trim()).filter(Boolean);
+  const wantCity = (parts[0] ?? "").toLowerCase();
+  const wantRegion = /\b([A-Za-z]{2})\b/.exec(parts[1] ?? "")?.[1]?.toUpperCase() ?? null;
+
+  const gotCity = (l.city ?? "").toLowerCase();
+  const gotRegion = (l.region ?? "").toUpperCase();
+
+  // A different state is a hard mismatch — no metro spans two of them here.
+  if (wantRegion && gotRegion && gotRegion.length === 2 && gotRegion !== wantRegion) return "mismatch";
+
+  if (!wantCity || !gotCity) return "assumed";
+  // Suburbs are legitimately "the metro", so accept either direction of
+  // containment (Huntsville ⊃ "Huntsville", "Madison" ⊄ "Huntsville" → checked
+  // by the caller's tolerance, not here) plus an exact hit.
+  if (gotCity === wantCity || gotCity.includes(wantCity) || wantCity.includes(gotCity)) return "confirmed";
+  return "mismatch";
+}
+
 /** The research prompt. Pure + exported so it can be unit-tested. */
 export function buildResearchPrompt(opts: {
   niche: string;
   location: string | null;
   count: number;
   dmTitles: string[];
+  /** Business names already in the CRM — the model is told to skip them. */
+  exclude?: string[];
 }): { system: string; user: string } {
   const where = opts.location ? ` in ${opts.location}` : "";
   const titleHint = opts.dmTitles.length
@@ -196,7 +250,346 @@ export function buildResearchPrompt(opts: {
     (opts.location ? " in that specific place" : "") +
     ". NEVER invent a business, phone, email, address, or person — use NONE for anything unverified. " +
     "The WEBSITE must be the business's OWN site, never a Facebook/Instagram/Yelp/LinkedIn/Maps/directory " +
-    "page. No preamble, no numbering, no markdown, no commentary.";
-  const user = `Niche: ${opts.niche}${where ? `\nPlace: ${opts.location}` : ""}\nList the real ${opts.niche} businesses${where} and each one's decision-maker.`;
+    "page. No preamble, no numbering, no markdown, no commentary." +
+    (opts.location
+      ? `\n\nLOCATION IS A HARD FILTER. Every business you return must have its own physical ` +
+        `location in ${opts.location} or its immediate suburbs, and the ADDRESS line must be that ` +
+        `local address. Do NOT include businesses from other metros or states. If you cannot find ` +
+        `${opts.count} qualifying businesses in that area, RETURN FEWER — a short, correct list is ` +
+        `the goal. Never pad the list with businesses from elsewhere.`
+      : "") +
+    `\n\nWORK HARD ON CONTACT. Before writing "CONTACT: NONE", actually check the business's own ` +
+    `About / Our Team / Meet-the-staff / Contact pages, its LinkedIn company page and the profiles ` +
+    `of people who list it as their employer, state license or registration lookups, and local press ` +
+    `or interviews. A named owner is the single most valuable field here. Only use NONE once you ` +
+    `have genuinely looked and cannot corroborate a name.`;
+
+  const excl = (opts.exclude ?? []).filter(Boolean);
+  // Dedupe used to happen only AFTER research, so the model spent real budget
+  // rediscovering businesses we already had (one run: 5 of 6 results were dupes).
+  // Naming them up front turns that wasted spend into new coverage.
+  const excludeBlock = excl.length
+    ? `\n\nWe ALREADY have these businesses — do not return any of them, and do not return ` +
+      `another location of the same brand. Find ones that are NOT on this list:\n` +
+      excl.map((n) => `- ${n}`).join("\n")
+    : "";
+
+  const user =
+    `Niche: ${opts.niche}${where ? `\nPlace: ${opts.location}` : ""}\n` +
+    `List the real ${opts.niche} businesses${where} and each one's decision-maker.${excludeBlock}`;
   return { system, user };
+}
+
+// ── Verification: is this business real at all? ──────────────────────────────
+// A live run asked sonar-pro for 10 Decatur med spas, and it padded the list to
+// hit the number: three of the returned domains did not exist in DNS, and four
+// different "businesses" shared a sequential phone block (…822-2227 / 2228 /
+// 2229 / 2270). The prompt already says to return fewer rather than pad; the
+// model ignored it. Instructions alone cannot be the control here.
+//
+// The signal was already sitting there unused — the second pass reported those
+// same leads as unresolved with "could not find any verified listing". Pair
+// that with a DNS check (deterministic, free, no model) and fabrications
+// identify themselves.
+
+/** Whether a lead's website answers: 'none' = it never claimed one. */
+export type SiteStatus = "alive" | "dead" | "unknown" | "none";
+
+export type Verdict = "verified" | "unconfirmed" | "failed";
+
+/**
+ * Decide what a lead has earned after the second pass.
+ *
+ * Deliberately conservative — the only automatic rejection is the case with two
+ * independent pieces of evidence against it: research corroborated *nothing*
+ * AND the claimed website does not resolve. A real business with no web
+ * presence, or a live site whose owner simply isn't published, lands in
+ * `unconfirmed` and stays visible for a human to judge.
+ */
+export function verificationVerdict(o: {
+  /** Fields the second pass managed to corroborate and fill. */
+  gained: number;
+  /** The second pass's own confidence, when it reported one. */
+  confidence: "high" | "medium" | "low" | null;
+  siteStatus: SiteStatus;
+  hasPhone: boolean;
+  hasContact: boolean;
+}): { verdict: Verdict; note: string } {
+  const foundNothing = o.gained === 0 && o.confidence !== "high";
+
+  if (foundNothing && o.siteStatus === "dead") {
+    return {
+      verdict: "failed",
+      note:
+        "Quarantined: the claimed website does not resolve in DNS and the second pass found no " +
+        "verifiable online presence for this business. Treated as a first-pass fabrication.",
+    };
+  }
+
+  // A dead domain on a business we *did* corroborate means the URL was wrong,
+  // not that the business is fake — the domain gets dropped, the lead survives.
+  if (o.siteStatus === "dead") {
+    return {
+      verdict: "unconfirmed",
+      note: "The website given by the first pass does not resolve and has been removed. Other details were corroborated.",
+    };
+  }
+
+  if (foundNothing && !o.hasContact && !o.hasPhone) {
+    return {
+      verdict: "unconfirmed",
+      note: "No decision-maker, no phone, and nothing corroborated by the second pass. Verify before spending time on it.",
+    };
+  }
+
+  if (foundNothing) {
+    return {
+      verdict: "unconfirmed",
+      note: "The second pass found no corroborating source for this business or its owner. Treat first-pass details as unverified.",
+    };
+  }
+
+  return { verdict: "verified", note: "Corroborated by the second pass against live web sources." };
+}
+
+/** Score ceiling per verdict, so unverified leads can't outrank real ones. */
+export function scoreCeiling(verdict: Verdict): number {
+  return verdict === "failed" ? 0 : verdict === "unconfirmed" ? 20 : 100;
+}
+
+// ── Is the PHONE right? ──────────────────────────────────────────────────────
+// The last unverified field, and the one that actually gets dialled. The DNS
+// gate proves a website exists; nothing proved the number belonged to it — and
+// the same practice came back with two different numbers on different runs.
+//
+// The check is free: the site probe already fetches the page, so we read the
+// number off the business's own site and compare. No model, no extra request.
+
+export type PhoneStatus =
+  | "confirmed"   // the number appears on the business's own site
+  | "conflict"    // the site lists phone numbers, and ours is not among them
+  | "unverified"  // site unreachable, or no number published on it
+  | "no-phone";   // the lead has no number to check
+
+/**
+ * Pull phone numbers out of a page.
+ *
+ * `tel:` links are the reliable source — a visible number can be split across
+ * markup, and page text is full of numeric noise (prices, addresses, ZIPs,
+ * years) that looks phone-shaped. We take tel: hrefs first, then fall back to
+ * NANP-shaped runs in the text with the tags stripped so "…</b>555</span>…"
+ * doesn't fuse into a false match.
+ */
+/**
+ * Is this a number that could actually be dialled?
+ *
+ * Real business sites carry placeholders — live Huntsville sites published
+ * `555-555-5555` and `999-999-9999` in their own markup. Left in, they pollute
+ * the "what this site publishes" evidence and could even let a template's dummy
+ * number "confirm" a lead's dummy number. NANP rules do the filtering: an area
+ * code or exchange never starts with 0 or 1, 555 is reserved, and no real
+ * number is ten identical digits.
+ */
+export function isDialableNanp(ten: string): boolean {
+  if (!/^\d{10}$/.test(ten)) return false;
+  if (/^(\d)\1{9}$/.test(ten)) return false;          // 5555555555, 9999999999
+  const npa = ten.slice(0, 3), nxx = ten.slice(3, 6);
+  if (npa === "555" || npa[0] === "0" || npa[0] === "1") return false;
+  if (nxx[0] === "0" || nxx[0] === "1") return false;
+  if (npa[1] === "9" && npa[2] === "9") return false;   // unassigned 9x9 block
+  return true;
+}
+
+export function extractPhones(html: string): Set<string> {
+  const out = new Set<string>();
+  const add = (raw: string) => {
+    const d = raw.replace(/[^\d]/g, "");
+    const ten = d.length === 11 && d.startsWith("1") ? d.slice(1) : d;
+    if (ten.length === 10 && isDialableNanp(ten)) out.add(ten);
+  };
+  for (const m of html.matchAll(/href\s*=\s*["']tel:([^"']{7,25})["']/gi)) add(m[1]);
+  // Replace tags with a space so adjacent elements never merge into a number.
+  const text = html.replace(/<[^>]*>/g, " ");
+  for (const m of text.matchAll(/(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}/g)) add(m[0]);
+  return out;
+}
+
+/** NANP toll-free area codes — a national line, never a branch's local number. */
+const TOLL_FREE = new Set(["800","833","844","855","866","877","880","881","882","883","884","885","886","887","888"]);
+export const isTollFree = (ten: string): boolean => TOLL_FREE.has(ten.slice(0, 3));
+
+/** Compare the lead's number against what its own website publishes. */
+export function phoneVerdict(
+  leadPhone: string | null,
+  sitePhones: Set<string> | null,
+): { status: PhoneStatus; note: string; candidates: string[] } {
+  if (!leadPhone) return { status: "no-phone", note: "No phone on the lead.", candidates: [] };
+
+  const d = leadPhone.replace(/[^\d]/g, "");
+  const ten = d.length === 11 && d.startsWith("1") ? d.slice(1) : d;
+
+  if (!sitePhones || sitePhones.size === 0) {
+    return {
+      status: "unverified",
+      note: "Could not read a phone number off the business's own site, so this number is unconfirmed.",
+      candidates: [],
+    };
+  }
+  if (sitePhones.has(ten)) {
+    return { status: "confirmed", note: "This number appears on the business's own website.", candidates: [] };
+  }
+
+  // Franchise and hospital-group sites publish a national toll-free line and
+  // never the branch's local number — BrightStar, FirstLight, Aveanna, MDVIP
+  // and ATI all did exactly this. A toll-free number does not contradict a
+  // local one, so treat that as "cannot compare", not "wrong".
+  if (!isTollFree(ten) && [...sitePhones].every(isTollFree)) {
+    return {
+      status: "unverified",
+      note: "The site publishes only a national toll-free number, so a local number can't be confirmed from it.",
+      candidates: [],
+    };
+  }
+  // The site publishes numbers and ours is not one of them. That is the exact
+  // failure this was built for: a plausible number on a real business.
+  const candidates = [...sitePhones].slice(0, 4);
+  return {
+    status: "conflict",
+    note:
+      `This number does NOT appear on the business's own site, which publishes ` +
+      `${candidates.map((c) => `+1${c}`).join(", ")}. Verify before dialling.`,
+    candidates,
+  };
+}
+
+/**
+ * Score ceiling for a conflicted number.
+ *
+ * Deliberately not an auto-correct: a site's number can legitimately differ
+ * from the one we hold (a tracking line, a department, a second location), so
+ * the site's numbers are recorded as candidates and a human decides. But a
+ * conflicted lead must never outrank one whose number checks out.
+ */
+export function phoneCeiling(status: PhoneStatus): number {
+  return status === "conflict" ? 30 : 100;
+}
+
+// ── Second pass: fill the gaps on ONE known business ─────────────────────────
+// The first pass optimises for breadth and routinely returns NONE for phone,
+// website, or the decision-maker. Re-asking about a single named business —
+// with everything we already know handed to the model — is a much easier
+// question than "find me 10 businesses", and it is what the human was doing by
+// hand in the Review tab.
+
+export interface GapFillFound {
+  website_domain: string | null;
+  phone: string | null;
+  contact_name: string | null;
+  contact_title: string | null;
+  email: string | null;
+  linkedin: string | null;
+  note: string | null;
+  confidence: "high" | "medium" | "low" | null;
+}
+
+/** Targeted "fill these specific blanks on this specific business" prompt. */
+export function buildGapFillPrompt(
+  lead: {
+    business_name: string;
+    website_domain?: string | null;
+    city?: string | null;
+    region?: string | null;
+    phone_e164?: string | null;
+    email?: string | null;
+    contact_name?: string | null;
+    contact_title?: string | null;
+  },
+  opts: { dmTitles?: string[]; niche?: string | null; wants: Array<"website" | "phone" | "contact" | "email"> },
+): { system: string; user: string } {
+  const known: string[] = [`Business name: ${lead.business_name}`];
+  const place = [lead.city, lead.region].filter(Boolean).join(", ");
+  if (opts.niche) known.push(`Type of business: ${opts.niche}`);
+  if (place) known.push(`Location: ${place}`);
+  if (lead.website_domain) known.push(`Website: ${lead.website_domain}`);
+  if (lead.phone_e164) known.push(`Known phone: ${lead.phone_e164}`);
+  if (lead.email) known.push(`Known email: ${lead.email}`);
+  if (lead.contact_name) known.push(`Known contact: ${lead.contact_name}`);
+  if (lead.contact_title) known.push(`Known contact title: ${lead.contact_title}`);
+
+  const want: string[] = [];
+  if (opts.wants.includes("website"))
+    want.push(`"website": the business's OWN official website hostname (not Facebook/Yelp/Maps/a directory)`);
+  if (opts.wants.includes("phone"))
+    want.push(`"phone": the business's best public phone number, in E.164 (e.g. +12565551234)`);
+  if (opts.wants.includes("contact")) {
+    const hint = opts.dmTitles?.length ? ` — typically one of: ${opts.dmTitles.join(", ")}` : "";
+    want.push(
+      `"contact_name": the full name of the owner or primary decision-maker${hint}`,
+      `"contact_title": that person's role (e.g. "Owner", "Medical Director")`,
+    );
+  }
+  if (opts.wants.includes("email"))
+    want.push(`"email": the best public contact email for the business or that person`);
+  want.push(`"linkedin": the company's LinkedIn URL, or null`);
+
+  const system =
+    "You are a precise B2B lead researcher with live web search, working on ONE named business. " +
+    "Dig properly: the business's own site (About / Our Team / Meet the staff / Contact), its " +
+    "LinkedIn company page and employees who list it, state license and business registration " +
+    "lookups, local news and interviews, and reputable local directories. " +
+    "Report only values you can actually corroborate from a real source. If you cannot verify a " +
+    "field with reasonable confidence, return null for it — NEVER guess or fabricate a phone " +
+    "number, person, or email. Return STRICT JSON only: no markdown, no code fence, no commentary.";
+
+  const user =
+    `Here is what we already know:\n${known.join("\n")}\n\n` +
+    `Find the missing details and return a JSON object with exactly these keys:\n` +
+    want.map((w) => `- ${w}`).join("\n") +
+    `\n- "note": one short sentence on where the information came from (or null)\n` +
+    `- "confidence": "high", "medium", or "low"\n\n` +
+    `This must be the business named above, at that location — if the only matches you find are a ` +
+    `different company or a different city, return null for every field and say so in "note". ` +
+    `Output ONLY the JSON object.`;
+  return { system, user };
+}
+
+/**
+ * Parse a gap-fill reply into validated values. Runs every field through the
+ * same validators as the bulk path, so the second pass can never sneak a
+ * fabricated phone or a Yelp URL past the guardrails the first pass enforces.
+ */
+export function parseGapFill(raw: string): GapFillFound | null {
+  if (!raw) return null;
+  let text = raw.trim();
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+  if (!text.startsWith("{")) {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start === -1 || end === -1 || end <= start) return null;
+    text = text.slice(start, end + 1);
+  }
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const str = (v: unknown): string | null => {
+    if (typeof v !== "string") return null;
+    const t = v.trim();
+    if (!t || /^(null|n\/a|unknown|not found|none)$/i.test(t)) return null;
+    return t;
+  };
+  const conf = str(obj.confidence)?.toLowerCase();
+  return {
+    website_domain: validateWebsite(str(obj.website)),
+    phone: validatePhone(str(obj.phone)),
+    contact_name: cleanText(str(obj.contact_name), 80),
+    contact_title: cleanText(str(obj.contact_title), 60),
+    email: validateEmail(str(obj.email)),
+    linkedin: validateLinkedin(str(obj.linkedin)),
+    note: cleanText(str(obj.note), 240),
+    confidence: conf === "high" || conf === "medium" || conf === "low" ? (conf as GapFillFound["confidence"]) : null,
+  };
 }

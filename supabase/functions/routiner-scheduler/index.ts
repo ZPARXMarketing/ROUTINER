@@ -226,14 +226,20 @@ function accountKind(accounts: unknown, account: string): string {
 }
 
 // Fire an OpenRouter-kind routine: its `prompt` is a small JSON config
-// { niche, location, count, dmTitles, vertical, model, toCommand, toAbstrax }.
+// { targetId } or { niche, location, count, dmTitles, vertical, model,
+// toCommand, toAbstrax }, plus optional { deepen, deepenLimit, deepenModel }.
 // We POST it to the lead-enrichment function (service-role auth satisfies the
-// function's verify_jwt) which does the Perplexity research + writes. Returns
-// { status, output } shaped like the Claude path so the caller's tail is shared.
+// function's verify_jwt) which does the Perplexity research, the automatic
+// gap-fill second pass, and the writes. Returns { status, output } shaped like
+// the Claude path so the caller's tail is shared. No Claude in this path at all.
 async function fireOpenRouter(r: Record<string, any>): Promise<{ status: string; output: string }> {
   let cfg: Record<string, unknown> = {};
   try { cfg = JSON.parse(r.prompt || "{}"); } catch { /* not JSON → empty config */ }
   const payload = {
+    // A saved ICP row (lead_enrichment_targets) is the preferred form: the niche,
+    // location, titles and count live in one editable place, and the engine
+    // stamps last_run_at/last_result back onto it. An inline niche still works.
+    targetId: cfg.targetId,
     niche: cfg.niche,
     location: cfg.location ?? null,
     count: cfg.count,
@@ -242,11 +248,15 @@ async function fireOpenRouter(r: Record<string, any>): Promise<{ status: string;
     model: cfg.model,
     toCommand: cfg.toCommand,
     syncAbstrax: cfg.toAbstrax ?? cfg.syncAbstrax,
+    // Second pass is on by default; these only need setting to tune or disable it.
+    deepen: cfg.deepen,
+    deepenLimit: cfg.deepenLimit,
+    deepenModel: cfg.deepenModel,
     routineId: r.id,
     report: true,
   };
-  if (!payload.niche) {
-    return { status: "error", output: "OpenRouter routine has no 'niche' in its config prompt." };
+  if (!payload.targetId && !payload.niche) {
+    return { status: "error", output: "OpenRouter routine config needs a 'targetId' or a 'niche'." };
   }
   try {
     const f = await fetch(LEAD_ENRICHMENT_URL, {
