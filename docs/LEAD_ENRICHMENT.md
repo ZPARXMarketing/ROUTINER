@@ -348,6 +348,41 @@ state is now dropped and counted as `offArea`. A lead with *no* address is never
 dropped — `parseLeads` back-fills the target city, so "unknown" must not be read
 as "wrong".
 
+## Auditing a target before you arm it
+
+`scripts/audit-leads.mjs` dry-runs a target (inserts nothing, safe against
+production) and checks **every** result — not a sample — for the fabrication
+modes that have got past an eyeball check:
+
+```bash
+node scripts/audit-leads.mjs "Florence, AL" "dental practices" 8
+node scripts/audit-leads.mjs --repeat 2 "Athens, AL" "dental practices" 6   # consistency
+node scripts/audit-leads.mjs --stress  "Athens, AL" "chiropractic clinics"  # padding
+```
+
+Hard failures (exit 1): a non-US country code, a phone block running
+sequentially across different businesses, or `--stress` filling its quota in a
+market too thin to hold it. Warnings: dead domains (the gate handles those),
+and exchange clustering (informational — see the note in the script).
+
+**Known-good as of 2026-07-25:** the stress case asks Athens for 15
+chiropractic clinics, a market holding about one, and gets **1** back — padding
+defence holding under deliberate pressure. Athens dental at `count:6` agreed on
+83% of names and on every phone across two runs.
+
+### The gap that remains: phones are not verified
+
+The DNS gate proves a *website* exists. Nothing proves a *phone number* is
+right. One practice came back with two different numbers on different runs, and
+neither the sequential check nor DNS can catch a plausible-but-wrong number
+attached to a real business. Treat first-pass phones as unconfirmed until the
+second pass corroborates them, and prefer leads whose `enrichment.verification`
+is `verified`.
+
+> A hypothesis that over-asking (`count` beyond real supply) causes this **did
+> not replicate** — `count:12` produced no clustering while `count:6` produced
+> 67%. Don't tune `count` on that theory; tune it on yield and duplicate rate.
+
 ## Testing
 
 `node --experimental-strip-types scripts/test-lead-enrichment.mjs` covers the
