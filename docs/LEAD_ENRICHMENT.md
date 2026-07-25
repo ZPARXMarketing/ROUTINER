@@ -177,6 +177,27 @@ RoiCal, `pipeline_status='prospect'`, `source='discovery'`):
 
 Without the key the mirror is a silent no-op — Command-only until you opt in.
 
+## One vertical per target — never blend niches
+
+Measured, not guessed. The same city, same count, same run:
+
+| `niche` | parsed | fresh |
+|---|---|---|
+| `"chiropractic clinics, dental practices, physical therapy clinics, and wellness or weight-loss clinics"` | **1** | 0 |
+| `"chiropractic clinics"` | **8** | 4 |
+| `"dental practices"` | **8** | 8 |
+
+Widening a target by stuffing several verticals into one `niche` string collapses
+the result to almost nothing — the model appears to search for the literal
+conjunction rather than the union. To cover more ground, add **one target row
+per vertical** and arm them separately. It costs one query each and returns a
+full list each, instead of one query returning one lead.
+
+The same applies to exhaustion: when a target's `last_result` shows `parsed`
+collapsing toward the duplicate count, that niche×city is mined out. Rotate the
+vertical or the city rather than raising `count` — raising `count` past real
+supply is what provokes the padding the fabrication gate then has to catch.
+
 ## Model + cost
 
 Per-target `model` (default `perplexity/sonar-pro`). Allowed:
