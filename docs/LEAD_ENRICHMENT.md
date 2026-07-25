@@ -176,8 +176,87 @@ per-query cost); a handful of weekly targets on `sonar-pro` is a few cents/week.
 | `dryRun` | research + parse only, insert nothing, return a sample |
 | `report` | set `false` to skip the routiner-admin Log recap |
 | `routineId` | attribute the Log recap to a routine |
+| `deepen` | set `false` to skip the automatic second pass on this run |
+| `deepenLimit`, `deepenModel` | how many leads to gap-fill, and with which model |
+| `mode:"deepen"` | run **only** the gap-fill pass (with `limit`, or explicit `leadIds`) |
 
-Response: `{ ok, runs:[{target,parsed,inserted,skipped,mirrored,cost,error?}], totals }`.
+Response: `{ ok, runs:[{target,parsed,inserted,skipped,offArea,mirrored,cost,error?}],
+deepen:{eligible,scanned,filled,fields,unresolved,remaining,cost}, totals }`.
+
+## The automatic second pass ("deepen")
+
+A discovery run optimises for breadth, so it routinely returns `NONE` for a
+website, phone, or — most damagingly — the decision-maker. That used to be the
+human's problem: the lead landed in the Review tab and someone re-searched it by
+hand. The log said exactly what that cost. Of the first 26 leads this pipeline
+produced, **half arrived with no decision-maker**, and the approve/reject split
+was almost perfectly predicted by that one field: leads that arrived with a
+named owner got **imported**, leads without one got **rejected**.
+
+So the engine now re-asks itself, per business, before the human sees anything:
+
+```
+discovery (find 10 clinics)  →  insert as pending
+                                     │
+                     for each new lead missing website / phone / owner
+                                     ▼
+              deepen (find the owner of THIS one named clinic)  →  patch in place
+```
+
+"Find the owner of this one named clinic" is a far easier question than "find me
+ten clinics", which is why it works — a seeded test lead with *every* contact
+field blank came back complete and correct (owner, title, phone, email, site,
+LinkedIn, cited sources) in ~3s for **$0.0085**.
+
+It runs automatically after every non-dry run, three lookups at a time, under a
+wall-clock deadline. Anything it doesn't reach stays queued.
+
+**Properties worth knowing:**
+
+- **Add-only.** A value already on the row always wins; a re-run can never
+  clobber something you trusted or edited.
+- **Idempotent.** Every row it touches is stamped `enrichment.deepened_at`
+  (found something or not), and the queue selector skips stamped rows — so
+  repeated calls walk forward instead of paying to re-ask unanswerable
+  questions. A *transient* error leaves the row unstamped so it retries later.
+- **Same guardrails.** Results go through the same validators as the first pass,
+  so the second pass is not a back door: Facebook/Yelp URLs, malformed phones
+  and invented emails are rejected exactly as before.
+- **Re-scores.** `lead_score` is recomputed against the enriched row, so the
+  Review tab sorts on the truth rather than on first-pass luck.
+
+Standalone, to drain the queue or to back-fill leads that predate this:
+
+```bash
+curl -s "$ENG" -H 'content-type: application/json' \
+  -d '{"mode":"deepen","limit":12}'          # → {eligible, scanned, filled, fields, unresolved, remaining}
+```
+
+Loop while `remaining > 0`. Turn it off for one run with `{"deepen":false}`;
+pick the model with `deepenModel` or the `LEAD_DEEPEN_MODEL` edge secret
+(default `perplexity/sonar-pro`).
+
+## Two other fixes that ride along
+
+**Exclusion list.** De-duping used to happen only *after* research, so the model
+spent real budget rediscovering businesses already in Command — one run came
+back **5 of 6 duplicates**. Known business names for the target's city now go
+into the prompt as "do not return these", turning that wasted spend into new
+coverage.
+
+**Area filter.** Huntsville targets were returning **Birmingham (205)** and
+**Chattanooga (423)** businesses, each burning a Review-tab slot on someone
+outside the service area. A lead whose own address names a different city or
+state is now dropped and counted as `offArea`. A lead with *no* address is never
+dropped — `parseLeads` back-fills the target city, so "unknown" must not be read
+as "wrong".
+
+## Testing
+
+`node --experimental-strip-types scripts/test-lead-enrichment.mjs` covers the
+area filter, the gap-fill parser and its guardrails, and the prompt rules — no
+network, no Deno, no Supabase. Run it before shipping a change to
+`lead-parse.ts` or `lead-enrichment/index.ts`.
 
 ## Guardrails baked in
 

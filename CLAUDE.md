@@ -382,6 +382,21 @@ thin Routiner routine), Abstrax sync, and tuning are in
 `lead_enrichment_targets` (niche × location × decision-maker titles × count);
 disabled rows are ignored, so the machine only spins on targets you enable.
 
+**It gap-fills itself.** A discovery run optimises for breadth and often returns
+no decision-maker — and in the first 26 leads, that one blank field decided
+everything: leads with a named owner got imported, leads without one got
+rejected. So after inserting, the engine automatically re-researches each new
+lead that is missing a website, phone, or decision-maker, one business at a
+time ("find the owner of THIS clinic" is a much easier question than "find me
+ten clinics"). Writes are add-only and stamped `enrichment.deepened_at`, so the
+pass is idempotent and can never clobber a value you trusted. Also callable
+alone as `{"mode":"deepen"}` to drain the queue or back-fill older leads. Two
+related fixes ship with it: known business names now go into the prompt as an
+exclusion list (one run had been coming back 5-of-6 duplicates), and leads whose
+address names another city or state are dropped as `offArea` (Huntsville targets
+were returning Birmingham and Chattanooga businesses). Verify with
+`node --experimental-strip-types scripts/test-lead-enrichment.mjs`.
+
 ## Data model (Supabase — all RLS per user)
 
 - **`routiner_notes`** — the Board. `body`, `status`
