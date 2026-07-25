@@ -735,6 +735,11 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   width: 100%;
   overflow: hidden;        /* the Delete panel hides behind the row */
   touch-action: pan-y;     /* vertical scrolling stays native; we own horizontal */
+  /* Required, and easy to lose: `overflow: hidden` makes the row a scroll
+     container, which drops its automatic minimum size to zero — so as a flex
+     item in #hx-list it happily shrank to a fraction of its content and every
+     row rendered as a clipped sliver. Rows never flex. */
+  flex: 0 0 auto;
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
