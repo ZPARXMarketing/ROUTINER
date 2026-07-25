@@ -44,6 +44,10 @@ create table if not exists public.routiner_runs (
   account     text,                         -- account id (to resolve the same key on continue)
   trigger_key text,                         -- trigger/instance within the account
   tools       jsonb,                        -- enabled tool groups, e.g. ["read","research","write"]
+  -- Two stamps, and they mean different things: started_at is when the run began
+  -- and never moves; fired_at is bumped at every checkpoint, so it is the run's
+  -- LAST activity. History reads the pair as "started … took …".
+  started_at  timestamptz default now(),
   fired_at    timestamptz not null default now()
 );
 
@@ -93,6 +97,7 @@ create table if not exists public.routiner_openrouter_usage (
 
 create index if not exists routiner_routines_user_idx on public.routiner_routines(user_id);
 create index if not exists routiner_runs_user_idx     on public.routiner_runs(user_id);
+create index if not exists routiner_runs_started_idx  on public.routiner_runs(started_at desc);
 create index if not exists routiner_notes_user_idx    on public.routiner_notes(user_id);
 create index if not exists routiner_openrouter_usage_created_idx on public.routiner_openrouter_usage(created_at desc);
 create index if not exists routiner_openrouter_usage_model_idx   on public.routiner_openrouter_usage(model);

@@ -319,6 +319,10 @@ async function loadAll() {
     // Agent runs also carry the resumable conversation + the context needed to
     // continue it (issues #51/#52). Null for Claude-trigger and legacy runs.
     messages: x.messages || null, model: x.model || null, account: x.account || null, triggerKey: x.trigger_key || null, tools: x.tools || null,
+    // fired_at is the run's LAST activity (the agent bumps it at every
+    // checkpoint); started_at is when it began. Null on rows written before the
+    // column existed — those simply show no duration.
+    startedAt: x.started_at || null,
   }));
   await dbLoadNotes();
   render();
@@ -661,7 +665,7 @@ function historyItems() {
   const fired = firedRoutineIds();
   const items = runs.map((run) => ({
     id: 'run-' + run.id, runId: run.id, title: run.title, status: run.status || 'ran',
-    output: run.output, time: run.firedAt, routineId: run.routineId,
+    output: run.output, time: run.firedAt, startedAt: run.startedAt, routineId: run.routineId,
     messages: run.messages, model: run.model, account: run.account, triggerKey: run.triggerKey, tools: run.tools,
   }));
   routines.forEach((r) => {
@@ -1041,7 +1045,14 @@ function friendlyText(raw) {
   s = s.replace(/`[^`\n]*`/g, ' ');                      // inline code
   s = s.replace(/https?:\/\/\S+/g, '');                  // links
   s = s.replace(/^#{1,6}\s+/gm, '');                     // headings
-  s = s.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/[*_~#>|]/g, ' '); // md marks
+  // Markdown marks, but not `#` or `_` on their own: those carry meaning in the
+  // text this app summarises — "PR #118" must not become "PR 118", and
+  // gh_propose_edit must not become gh propose edit. Headings are already gone
+  // (the line-anchored rule above), and `_emphasis_` only loses its underscores
+  // when they actually wrap a word.
+  s = s.replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/(^|\s)_([^_\n]+)_(?=\s|$)/g, '$1$2')
+    .replace(/[*~>|]/g, ' ');
   s = s.replace(/^[\s]*[-•=]{3,}[\s]*$/gm, ' ');         // rules
   s = s.replace(/[{}[\]\\]/g, ' ');                      // JSON-ish brackets
   s = s.replace(/\s+/g, ' ').trim();
@@ -1076,6 +1087,80 @@ function fmtShort(iso) {
     : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
+/* ---------- How long a run took ----------
+   A run has two stamps and they are not the same thing: `startedAt` is when it
+   began, `time` (fired_at) is its LAST activity — the agent bumps that at every
+   checkpoint. The gap between them is the elapsed time, which is what History
+   shows so a 40-minute run reads differently from a 4-second one. Runs recorded
+   before started_at existed return null and show no duration at all rather than
+   an invented one. */
+function runStartIso(it) { return it && (it.startedAt || null); }
+function runElapsedMs(it) {
+  const startIso = runStartIso(it);
+  if (!startIso || !it.time) return null;
+  const start = new Date(startIso).getTime();
+  // A live run is still counting; a finished one stopped at its last checkpoint.
+  const end = isRunBusy(it) ? Date.now() : new Date(it.time).getTime();
+  const ms = end - start;
+  return ms >= 0 ? ms : null;
+}
+/* Coarse, readable elapsed time — the unit that matters, not six digits. */
+function fmtDur(ms) {
+  if (ms == null) return '';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${Math.max(s, 1)}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  if (h < 24) return rm ? `${h}h ${rm}m` : `${h}h`;
+  const d = Math.floor(h / 24), rh = h % 24;
+  return rh ? `${d}d ${rh}h` : `${d}d`;
+}
+/* A thread you replied to spans your thinking time too, so it gets "over", not
+   "took" — the elapsed number is honest either way, the verb keeps it from
+   claiming the model worked that whole time. */
+function runRounds(it) {
+  const msgs = Array.isArray(it && it.messages) ? it.messages : [];
+  return msgs.filter((m) => m && m.role === 'user').length;
+}
+function runDurationLabel(it) {
+  const ms = runElapsedMs(it);
+  if (ms == null) return '';
+  if (isRunBusy(it)) return `running ${fmtDur(ms)}`;
+  return `${runRounds(it) > 1 ? 'over' : 'took'} ${fmtDur(ms)}`;
+}
+
+/* ---------- The last bit of work a run did ----------
+   The stored `output` is the run's summary, which for a long agent run says
+   nothing about where it actually got to. Read the transcript backwards instead
+   so every row shows its most recent real move — the last thing said, or the
+   last tool it reached for — and falls back to the summary when there's no
+   transcript to read. */
+function lastWorkText(it) {
+  const msgs = Array.isArray(it && it.messages) ? it.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m || m.role === 'system' || m.role === 'user') continue;
+    if (m.role === 'assistant') {
+      const text = friendlyText(m.content);
+      if (text) return text;
+      const calls = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+      const last = calls[calls.length - 1];
+      if (last) {
+        const name = last?.function?.name || 'tool';
+        let args = last?.function?.arguments || '';
+        try { args = Object.values(JSON.parse(args)).filter((v) => typeof v === 'string')[0] || ''; } catch { /* raw */ }
+        return `⚙ ${name}${args ? ` — ${String(args).slice(0, 80)}` : ''}`;
+      }
+    }
+    if (m.role === 'tool') {
+      const text = friendlyText(m.content);
+      if (text) return `⚙ result — ${text.slice(0, 120)}`;
+    }
+  }
+  return friendlyText(it && it.output);
+}
+
 function historyFiltered() {
   const all = historyItems();
   const failures = all.filter((it) => it.status === 'error' || it.status === 'missed');
@@ -1099,13 +1184,19 @@ function railRowHtml(it, active) {
   const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status);
   const statusClass = stale ? 'is-warn' : (busy ? 'is-busy' : (ok ? 'is-ok' : 'is-bad'));
   const spin = busy ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
-  const snip = friendlyText(it.output);
+  // The last thing this run actually did, not its opening summary.
+  const snip = lastWorkText(it);
+  // Stamped when it began (falling back to last activity on pre-started_at rows),
+  // with how long it ran beside it.
+  const startIso = runStartIso(it) || it.time;
+  const dur = fmtDur(runElapsedMs(it));
   const cls = ['hxrow', active ? 'is-active' : '', ok ? '' : 'hxrow--bad', busy ? 'hxrow--busy' : '', stale ? 'hxrow--stale' : '']
     .filter(Boolean).join(' ');
-  return `<button type="button" class="${cls}" data-hist="${esc(it.id)}"${active ? ' aria-current="true"' : ''}>
+  const tip = [it.title || 'Untitled', startIso ? `started ${fmt(startIso)}` : '', runDurationLabel(it)].filter(Boolean).join(' · ');
+  return `<button type="button" class="${cls}" data-hist="${esc(it.id)}"${active ? ' aria-current="true"' : ''} title="${esc(tip)}">
     <span class="hxrow__top">
       <span class="hxrow__title">${esc(it.title || 'Untitled')}</span>
-      <span class="hxrow__time">${esc(fmtShort(it.time))}</span>
+      <span class="hxrow__time">${esc(fmtShort(startIso))}${dur ? ` · ${esc(dur)}` : ''}</span>
     </span>
     <span class="hxrow__sub">
       <span class="hxrow__status hist__status ${statusClass}">${spin}${esc(statusLabel)}</span>
@@ -1260,6 +1351,18 @@ function transcriptTurns(it) {
   return turns;
 }
 
+/* Header stamp: when the run started and how long it ran — "09:12 · took 4m".
+   The tooltip spells out both ends for anyone who wants the exact times. */
+function runTimingChip(it) {
+  const startIso = runStartIso(it);
+  const label = runDurationLabel(it);
+  if (!startIso) return { text: it.time ? fmt(it.time) : '', tip: it.time ? `Last activity ${fmt(it.time)}` : '' };
+  return {
+    text: `${fmt(startIso)}${label ? ` · ${label}` : ''}`,
+    tip: `Started ${fmt(startIso)}\nLast activity ${fmt(it.time)}${label ? `\n${label}` : ''}`,
+  };
+}
+
 function runPaneHtml(it) {
   if (!it) {
     return `<div class="hx__blank"><div class="empty">
@@ -1285,6 +1388,7 @@ function runPaneHtml(it) {
   const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status || 'ran');
   const chipStatus = stale ? 'missed' : (it.status === 'cancelled' ? 'archived' : (it.status || 'ran')); // archived chip = muted "stopped"
   const spin = (busy || runBusy) ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
+  const timing = runTimingChip(it);
   const draft = runDrafts.get(it.id) || '';
   const compose = can
     ? `<div class="hx__compose">
@@ -1298,7 +1402,7 @@ function runPaneHtml(it) {
       <button type="button" class="hx__railbtn" id="hx-railbtn" aria-label="Show the run list">☰ Runs</button>
       <span class="chip chip--${esc(chipStatus)}">${spin}${esc(statusLabel)}</span>
       <h2 class="hx__title">${esc(it.title || 'Untitled')}</h2>
-      <span class="hx__time">${it.time ? fmt(it.time) : ''}</span>
+      ${timing.text ? `<span class="hx__time" title="${esc(timing.tip)}">${esc(timing.text)}</span>` : ''}
       <span class="hx__head-actions">
         ${showStop ? `<button class="btn btn--danger-ghost btn--sm" id="run-stop" type="button" title="Stop this agent">Stop</button>` : ''}
         ${showRetry ? `<button class="btn btn--secondary btn--sm" id="run-retry" type="button">Retry</button>` : ''}
@@ -1604,10 +1708,20 @@ function calEventHtml(ev) {
   const showTime = height >= 34;
   const tLabel = triggerLabel(ev.routine.account, ev.routine.triggerKey);
   const acctText = accountLabel(ev.routine.account) + (tLabel ? ` · ${tLabel}` : '');
+  // A block that has already run is a record of something that happened, so it
+  // can be renamed in place — no drawer, no round trip. Future blocks still open
+  // the drawer on tap, where the title is one of several things to set.
+  const renameTip = isRecurringRoutine(ev.routine)
+    ? 'Rename — this routine repeats, so every block of it takes the new name'
+    : 'Rename this block';
+  const rename = past
+    ? `<button type="button" class="cal__ev-edit" data-rename="${ev.routine.id}" title="${esc(renameTip)}" aria-label="Rename">✎</button>`
+    : '';
   return `<div class="cal__ev${past ? ' cal__ev--past' : ''}" data-id="${ev.routine.id}" title="${esc(ev.routine.title)} · ${esc(acctText)} · ${timeStr}"
     style="top:${top}px; height:${height}px; left:calc(${leftPct}% + 3px); width:calc(${widthPct}% - 5px); background:${c.solid}; color:${c.ink}; border-left-color:${c.edge};">
     <div class="cal__ev-title">${esc(ev.routine.title) || 'Untitled'}</div>
     ${showTime ? `<div class="cal__ev-time">${timeStr}</div>` : ''}
+    ${rename}
   </div>`;
 }
 
@@ -1632,6 +1746,48 @@ function legendGroups() {
     if (!g.triggers.has(key)) g.triggers.set(key, triggerLabel(accId, r.triggerKey) || '(other)');
   });
   return groups;
+}
+
+/* Rename a past block in place: the title becomes an input right on the
+   calendar. Enter or clicking away saves, Escape reverts. Recurring routines are
+   one row behind every one of their blocks, so renaming any of them renames the
+   series — the toast says so rather than letting it be a surprise. */
+function startBlockRename(el) {
+  if (!el || el.querySelector('.cal__ev-input')) return;
+  const id = el.dataset.id;
+  const r = getRoutine(id);
+  const titleEl = el.querySelector('.cal__ev-title');
+  if (!r || !titleEl) return;
+  const prev = r.title || '';
+  const input = document.createElement('input');
+  input.className = 'cal__ev-input';
+  input.value = prev;
+  input.setAttribute('aria-label', 'Block title');
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let settled = false;
+  const finish = async (save) => {
+    if (settled) return;
+    settled = true;
+    const next = input.value.trim();
+    if (!save || !next || next === prev) { renderCalendar(); return; }
+    await dbUpdate(id, Object.assign({}, r, { title: next }));
+    toast(isRecurringRoutine(r)
+      ? `Renamed to “${next}” — this routine repeats, so every one of its blocks now reads that.`
+      : `Renamed to “${next}”.`);
+    renderCalendar();
+  };
+  // Keep these off the document: Escape here reverts the rename, it doesn't
+  // close a drawer, and a click inside the editor isn't a click on the block.
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('pointerdown', (e) => e.stopPropagation());
+  input.addEventListener('click', (e) => e.stopPropagation());
 }
 
 function renderCalendar() {
@@ -1701,6 +1857,7 @@ function renderCalendar() {
   view.querySelectorAll('.cal__ev').forEach((el) => {
     el.addEventListener('pointerdown', (e) => {
       if (!e.isPrimary) return;
+      if (e.target.closest('.cal__ev-edit, .cal__ev-input')) return; // renaming, not dragging
       const id = el.dataset.id;
       const startX = e.clientX, startY = e.clientY;
       const blockTop = parseFloat(el.style.top) || 0;
@@ -1745,6 +1902,9 @@ function renderCalendar() {
       el.addEventListener('pointerup', onUp);
       el.addEventListener('pointercancel', onUp);
     });
+  });
+  view.querySelectorAll('[data-rename]').forEach((btn) => {
+    btn.addEventListener('click', (e) => { e.stopPropagation(); startBlockRename(btn.closest('.cal__ev')); });
   });
   // Click empty space in a day column to create a routine at that exact day + time.
   view.querySelectorAll('.cal__day').forEach((col, i) => col.addEventListener('click', (e) => {

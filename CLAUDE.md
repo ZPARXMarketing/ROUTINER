@@ -426,7 +426,11 @@ were returning Birmingham and Chattanooga businesses). Verify with
   optional auto-routing table (`task_type → complexity → model`) edited in
   Settings and read by **both** the app and the scheduler; null = built-in
   default (`js/model-router.js`).
-- **`routiner_runs`** — run log (one row per fire).
+- **`routiner_runs`** — run log (one row per fire). Two timestamps that mean
+  different things: `started_at` is when the run began and never moves;
+  `fired_at` is bumped at every agent checkpoint, so it is the run's *last
+  activity*. History reads the pair as "started 09:12 · took 41m" (rows written
+  before `started_at` existed show no duration rather than an invented one).
 
 ## How a routine fires
 
@@ -468,6 +472,21 @@ triggers runs it truly in parallel.
   `openrouter-agent` function, and Stop/Retry live in the pane header.
   Below 900px the rail becomes an off-canvas panel that slides over the
   transcript — via the **☰ Runs** button, an edge swipe, the scrim or Escape.
+- **A History row answers "where did this get to, and how long did it take."**
+  The snippet is `lastWorkText` — the transcript read backwards to the last thing
+  actually said or the last tool reached for, not the run's opening summary — so
+  a row keeps showing its most recent real move. The stamp is the *start* time
+  plus elapsed (`runDurationLabel`): `took 41m` for a single-round run,
+  `running 6m` while one is live (the 8s poll ticks it), and `over 2d` for a
+  thread you replied to later — that verb keeps elapsed time from claiming the
+  model worked the whole span. Rows still sort by last activity, so a
+  freshly-continued thread surfaces even though its stamp is older.
+- **Past calendar blocks rename in place.** A block whose time has passed is a
+  record of something that happened, so it carries a pencil that swaps its title
+  for an input right on the grid (`startBlockRename` — Enter saves, Escape
+  reverts, clicking away saves). Future blocks still open the drawer on tap.
+  One thing to know: a recurring routine is a single row behind every one of its
+  blocks, so renaming any of them renames the series — the toast says so.
 - DB schema: `supabase/schema.sql` (one-paste setup for a fresh project) +
   incremental `supabase/migrations/`.
 - Styling follows the ZPARX design system: dark-mode-first; lime and yellow are
