@@ -448,6 +448,29 @@ from the one we hold — a tracking line, a department, a second location — so
 conflict records what the site publishes as *candidates* and leaves the call to
 a human. It just can't outrank a number that checks out.
 
+Three refinements came straight out of reading the first 82 results, and each
+one removed real false positives:
+
+- **Toll-free ≠ contradiction.** Franchise and hospital-group sites (BrightStar,
+  FirstLight, Aveanna, MDVIP, ATI) publish a national 800/866/877 line and never
+  the branch's local number. A site publishing *only* toll-free numbers yields
+  `unverified`, not `conflict`.
+- **The homepage often isn't where the local number lives.** A conflict earns a
+  second look at `/contact`, `/contact-us` and `/locations` before the number is
+  called wrong. Only conflicted leads pay for those extra requests.
+- **Placeholders are filtered.** Live Huntsville sites publish `555-555-5555`
+  and `999-999-9999` in their own markup. NANP rules drop them, so a template's
+  dummy number can never become evidence.
+
+Measured effect on the same 82 leads: **23 conflicts → 17**, with the six that
+disappeared all being corporate-toll-free false alarms.
+
+A conflict is a prompt to look, not proof of a bad number — several remaining
+ones are multi-location practices whose branch line isn't on the pages fetched.
+But it reliably surfaces the real thing: **CHS MedSpa** was held at
+`+1 256 822-2772`, from the same fabricated `822-22xx` block as three
+quarantined leads, while its own site publishes `256-350-9880`.
+
 Re-check leads sourced before this existed, with **zero model calls**:
 
 ```bash
