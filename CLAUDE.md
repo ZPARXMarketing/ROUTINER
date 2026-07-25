@@ -164,7 +164,7 @@ balance via `/api/v1/key`, key-side so it never leaves Supabase):
 - **CLI:** `node scripts/usage-meter.mjs` — neon terminal meter (credit bar,
   today/month/lifetime spend, by-model, recent calls). `--watch 30` to live-poll,
   `--plain` for logs, `--demo` to see it with sample data and no network.
-- **Web:** open **`usage.html`** (also linked from the app sidebar → *◆ Usage*) —
+- **Web:** open **`usage.html`** (also linked from the app's account menu → *Usage*) —
   the same numbers as a cyberpunk dashboard that auto-refreshes.
 
 > Setup adds one table (migration `0008_openrouter_usage.sql`) and one function
@@ -442,16 +442,32 @@ triggers runs it truly in parallel.
 
 - `index.html`, `css/tokens.css` (vendored ZPARX tokens), `css/app.css`,
   `js/app.js` (single-page UI, ES module).
+- **Shell:** one top rail (`.topbar`) carries the brand, the nav tabs and the
+  actions (clock · budget chip · New routine · fire switch · account menu); the
+  body below it is the only scrolling region. The rail stays a single row down to
+  1300px — shedding the clock, then the budget chip, then the fire label as space
+  runs out — and below that the nav wraps to a full-width second row, which buys
+  those chips back. Verified for overflow at every breakpoint; only phone widths
+  scroll the nav, and a fade on its trailing edge says so.
 - Key views in `app.js`: **Board** (`renderBoard`), **Calendar**
   (`renderCalendar` — full 24h, blocks colored by trigger within a per-account
-  hue family), Scheduled / Library / Archived, **History** (`renderHistory` — the
-  single record of every run: plain-English recap + failures with reasons; click
-  a row to open the full exchange in a modal (`openRunModal`) and, for agent
-  runs, reply to continue it via `continueRun` → the `openrouter-agent` function),
-  **Chat** (test any model directly), the **budget forecast** (top-bar chip → projected spend
-  from the scheduled queue), the Settings **accounts & triggers** manager, and
-  the create/edit **drawer**. The Library holds every non-archived routine —
-  scheduling doesn't remove it, only archiving takes one off the air.
+  hue family), Scheduled / Library / Archived, **History** (`renderHistory`),
+  **Chat** (test any model directly), the **budget forecast** (top-bar chip →
+  projected spend from the scheduled queue), the Settings **accounts & triggers**
+  manager, and the create/edit **drawer**. The Library holds every non-archived
+  routine — scheduling doesn't remove it, only archiving takes one off the air.
+- **History is a Claude-Code-shaped workspace, not a list of cards.** A left rail
+  (`#hx-rail`) lists every run — searchable, filterable to failures — and the
+  right pane (`#hx-main`) holds the selected run's whole exchange *flat against
+  the UI*: transcript scrolling in place, reply box pinned to the bottom. There is
+  no modal. `renderHistory` builds the workspace once; every later repaint (the
+  8s live poll, a filter flip, a finished reply) goes through `refreshHistory`,
+  which re-renders in place so the search box keeps focus, the reader keeps their
+  scroll position and an unsent draft survives (`runDrafts`). `selectRun` swaps
+  the pane; `continueRun` still posts `{ runId, prompt }` to the
+  `openrouter-agent` function, and Stop/Retry live in the pane header.
+  Below 900px the rail becomes an off-canvas panel that slides over the
+  transcript — via the **☰ Runs** button, an edge swipe, the scrim or Escape.
 - DB schema: `supabase/schema.sql` (one-paste setup for a fresh project) +
   incremental `supabase/migrations/`.
 - Styling follows the ZPARX design system: dark-mode-first; lime and yellow are

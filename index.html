@@ -23,50 +23,46 @@
 </head>
 <body>
   <div class="app">
-    <!-- ── Sidebar: brand + navigation table ── -->
-    <aside class="sidebar" id="sidebar" style="display:none">
-      <div class="brand">
+    <!-- ── Top bar: brand + navigation + actions (one rail, Claude-Code style) ── -->
+    <header class="topbar" id="topbar" style="display:none">
+      <div class="brand brand--bar">
         <img class="brand__logo" src="assets/zparx-lockup.svg" alt="ZPARX" />
         <span class="brand__wordmark">Routiner</span>
       </div>
 
-      <div class="sidebar__group">
-        <span class="sidebar__label">Navigation</span>
-        <nav class="tabs" id="tabs">
-          <button class="tab is-active" data-view="calendar">Calendar</button>
-          <button class="tab" data-view="board">Board <span class="tab__count" data-count="board">0</span></button>
-          <button class="tab" data-view="scheduled">Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
-          <button class="tab" data-view="library">Library <span class="tab__count" data-count="library">0</span></button>
-          <button class="tab" data-view="archived">Archived <span class="tab__count" data-count="archived">0</span></button>
-          <button class="tab" data-view="history">History <span class="tab__count tab__count--alert" data-count="history">0</span></button>
-          <button class="tab" data-view="chat">Chat</button>
-        </nav>
-      </div>
+      <nav class="tabs" id="tabs">
+        <button class="tab is-active" data-view="calendar">Calendar</button>
+        <button class="tab" data-view="board">Board <span class="tab__count" data-count="board">0</span></button>
+        <button class="tab" data-view="scheduled">Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
+        <button class="tab" data-view="library">Library <span class="tab__count" data-count="library">0</span></button>
+        <button class="tab" data-view="archived">Archived <span class="tab__count" data-count="archived">0</span></button>
+        <button class="tab" data-view="history">History <span class="tab__count tab__count--alert" data-count="history">0</span></button>
+        <button class="tab" data-view="chat">Chat</button>
+      </nav>
 
-      <div class="sidebar__group sidebar__group--foot">
-        <span class="sidebar__label">Account</span>
-        <span class="clock clock--block" id="userChip" title="Signed in"></span>
-        <button class="btn btn--ghost btn--sm sidebar__btn" id="settingsBtn" title="Trigger &amp; model">Settings</button>
-        <a class="btn btn--ghost btn--sm sidebar__btn" href="usage.html" title="OpenRouter credit &amp; spend meter">Usage</a>
-        <button class="btn btn--ghost btn--sm sidebar__btn" id="signOutBtn">Sign out</button>
-      </div>
-    </aside>
-
-    <!-- ── Main column ── -->
-    <div class="content">
-      <header class="topbar" id="topbar" style="display:none">
-        <div class="topbar__spacer"></div>
-        <div class="topbar__actions">
-          <span class="clock" id="clock">—</span>
-          <button class="clock budget-chip" id="budgetChip" title="Projected spend from everything scheduled — click for the breakdown" style="display:none">—</button>
-          <button class="btn btn--primary" id="newBtn">New routine</button>
-          <label class="fire-toggle" id="fireSwitch" title="Master control: whether this site is allowed to fire routines">
-            <span class="fire-toggle__label" id="fireLabel">Inactive</span>
-            <span class="fire-toggle__track"><span class="fire-toggle__knob"></span></span>
-          </label>
+      <div class="topbar__actions">
+        <span class="clock clock--time" id="clock">—</span>
+        <button class="clock budget-chip" id="budgetChip" title="Projected spend from everything scheduled — click for the breakdown" style="display:none">—</button>
+        <button class="btn btn--primary" id="newBtn" title="New routine">
+          <span class="btn__wide">New routine</span><span class="btn__narrow" aria-hidden="true">+</span>
+        </button>
+        <label class="fire-toggle" id="fireSwitch" title="Master control: whether this site is allowed to fire routines">
+          <span class="fire-toggle__label" id="fireLabel">Inactive</span>
+          <span class="fire-toggle__track"><span class="fire-toggle__knob"></span></span>
+        </label>
+        <div class="acctmenu" id="acctMenu">
+          <button class="acctmenu__btn" id="userChip" title="Account" aria-haspopup="true" aria-expanded="false"></button>
+          <div class="acctmenu__pop" id="acctPop" role="menu">
+            <span class="acctmenu__who" id="acctWho"></span>
+            <button class="acctmenu__item" id="settingsBtn" role="menuitem">Settings</button>
+            <a class="acctmenu__item" href="usage.html" role="menuitem" title="OpenRouter credit &amp; spend meter">Usage</a>
+            <button class="acctmenu__item acctmenu__item--danger" id="signOutBtn" role="menuitem">Sign out</button>
+          </div>
         </div>
-      </header>
+      </div>
+    </header>
 
+    <div class="content">
       <main id="view"></main>
     </div>
   </div>

@@ -800,12 +800,23 @@ function openForecast() {
 function paintStatus() {
   const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const next = routines.filter((r) => r.status === 'scheduled' && r.scheduledAt).sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt))[0];
-  const clk = $('#clock'); if (clk) clk.innerHTML = next ? `${t} · next <b>${relative(next.scheduledAt)}</b>` : `${t}`;
+  const clk = $('#clock');
+  if (clk) {
+    // Two spans so a tight top rail can drop the wall clock but keep "next in …".
+    clk.innerHTML = next
+      ? `<span class="clock__now">${t} · </span><span class="clock__next">next <b>${relative(next.scheduledAt)}</b></span>`
+      : `<span class="clock__now">${t}</span>`;
+    clk.classList.toggle('clock--next', !!next);
+  }
 }
 
 function render() {
   if (!session) return;
   paintCounts(); paintStatus(); paintBudgetChip();
+  // History owns its whole pane (its own columns scroll); every other view rides
+  // the normal page scroll.
+  $('.content')?.classList.toggle('content--flush', currentView === 'history');
+  document.body.dataset.view = currentView;
   if (currentView === 'board') return renderBoard();
   if (currentView === 'calendar') return renderCalendar();
   if (currentView === 'history') return renderHistory();
@@ -998,14 +1009,14 @@ let historyPollTimer = null;
 function ensureHistoryPoll() {
   if (historyPollTimer) return;
   historyPollTimer = setInterval(async () => {
-    if (currentView !== 'history' && !runModalId) {
+    if (currentView !== 'history') {
       clearInterval(historyPollTimer); historyPollTimer = null; return;
     }
     const hasRunning = runs.some((r) => r.status === 'running');
-    if (!hasRunning && !runModalBusy) return;
+    if (!hasRunning && !runBusy) return;
     try {
       await loadAll();
-      if (runModalId) refreshRunModal();
+      refreshHistory();
     } catch { /* transient */ }
   }, 8_000);
 }
@@ -1043,77 +1054,182 @@ function friendlyText(raw) {
    read-only. */
 function isContinuable(it) { return !!(it && it.runId && (it.model || (Array.isArray(it.messages) && it.messages.length))); }
 
-let historyFilter = 'all'; // 'all' | 'failures'
-function renderHistory() {
+/* ══════════════════════════════════════════════════════════════
+   History — a flat two-pane workspace, Claude Code style.
+   The left rail lists every run; the right pane holds the selected run's whole
+   exchange flush against the UI (no modal, no overlay), with the reply box
+   pinned to the bottom. On narrow screens the rail slides over the transcript.
+   ══════════════════════════════════════════════════════════════ */
+let historyFilter = 'all';   // 'all' | 'failures'
+let historyQuery = '';       // rail search box
+let selectedRunId = null;    // the historyItems id shown in the pane
+let railOpen = false;        // mobile: is the run list slid over the pane?
+let runBusy = false;         // a follow-up is in flight
+const runDrafts = new Map(); // id → unsent reply text, so re-renders never eat it
+
+/* Compact rail timestamp: clock time for today, date for anything older. */
+function fmtShort(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+function historyFiltered() {
   const all = historyItems();
+  const failures = all.filter((it) => it.status === 'error' || it.status === 'missed');
+  let items = historyFilter === 'failures' ? failures : all;
+  const q = historyQuery.trim().toLowerCase();
+  if (q) items = items.filter((it) => `${it.title || ''} ${it.output || ''}`.toLowerCase().includes(q));
+  return { all, failures, items };
+}
+
+/* The run in the pane — falling back to the newest one that survives the active
+   filter, so the pane is never blank while runs exist. */
+function selectedRun(items) {
+  const list = items || historyFiltered().items;
+  return list.find((x) => x.id === selectedRunId) || list[0] || null;
+}
+
+function railRowHtml(it, active) {
+  const ok = !(it.status === 'error' || it.status === 'missed' || it.status === 'cancelled');
+  const busy = isRunBusy(it);
+  const stale = isRunStale(it);
+  const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status);
+  const statusClass = stale ? 'is-warn' : (busy ? 'is-busy' : (ok ? 'is-ok' : 'is-bad'));
+  const spin = busy ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
+  const snip = friendlyText(it.output);
+  const cls = ['hxrow', active ? 'is-active' : '', ok ? '' : 'hxrow--bad', busy ? 'hxrow--busy' : '', stale ? 'hxrow--stale' : '']
+    .filter(Boolean).join(' ');
+  return `<button type="button" class="${cls}" data-hist="${esc(it.id)}"${active ? ' aria-current="true"' : ''}>
+    <span class="hxrow__top">
+      <span class="hxrow__title">${esc(it.title || 'Untitled')}</span>
+      <span class="hxrow__time">${esc(fmtShort(it.time))}</span>
+    </span>
+    <span class="hxrow__sub">
+      <span class="hxrow__status hist__status ${statusClass}">${spin}${esc(statusLabel)}</span>
+      ${snip ? `<span class="hxrow__snip">${esc(snip)}</span>` : ''}
+    </span>
+  </button>`;
+}
+
+function railListHtml(items) {
+  if (items.length) return items.map((it) => railRowHtml(it, it.id === selectedRunId)).join('');
+  return `<div class="hx__none">${historyQuery.trim()
+    ? 'Nothing matches that search.'
+    : (historyFilter === 'failures' ? 'Nothing has failed or missed its slot. 🎉' : 'No runs yet.')}</div>`;
+}
+
+function renderHistory() {
+  const { all, failures, items } = historyFiltered();
   if (!all.length) {
-    view.innerHTML = `<div class="empty"><h3>No history yet</h3><p>Finished runs land here — click any one to read the full exchange, and reply to keep the conversation going.</p></div>`;
+    view.innerHTML = `<div class="hx"><section class="hx__main"><div class="hx__blank"><div class="empty">
+      <h3>No history yet</h3>
+      <p>Finished runs land here — pick one from the list to read the whole exchange, and reply to keep it going.</p>
+    </div></div></section></div>`;
     return;
   }
-  const failures = all.filter((it) => it.status === 'error' || it.status === 'missed');
-  const items = historyFilter === 'failures' ? failures : all;
-  const filterBar = `<div class="log__filter">
-      <button class="btn btn--sm ${historyFilter === 'all' ? 'btn--secondary' : 'btn--ghost'}" data-histf="all">All runs (${all.length})</button>
-      <button class="btn btn--sm ${historyFilter === 'failures' ? 'btn--secondary' : 'btn--ghost'}" data-histf="failures">Failures (${failures.length})</button>
-    </div>`;
-  const row = (it) => {
-    const ok = !(it.status === 'error' || it.status === 'missed' || it.status === 'cancelled');
-    const busy = isRunBusy(it);
-    const stale = isRunStale(it);
-    const text = friendlyText(it.output);
-    const can = isContinuable(it);
-    const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status);
-    const statusClass = stale ? 'is-warn' : (busy ? 'is-busy' : (ok ? 'is-ok' : 'is-bad'));
-    const spin = busy ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
-    const meta = [
-      it.model ? modelLabel(it.model) : '',
-      stale ? 'Open to retry' : (busy ? 'Working… open for live transcript' : (can ? 'Reply to continue' : '')),
-    ].filter(Boolean).join(' · ');
-    const stopBtn = (busy || stale) && can
-      ? `<button type="button" class="btn btn--danger-ghost btn--sm hist__stop" data-stop="${esc(it.id)}" title="Stop this agent">Stop</button>`
-      : '';
-    return `<div class="hist hist--click ${ok ? '' : 'hist--bad'}${busy ? ' hist--busy' : ''}${stale ? ' hist--stale' : ''}" data-hist="${esc(it.id)}" role="button" tabindex="0">
-      <div class="hist__head">
-        <span class="hist__title">${esc(it.title || 'Untitled')}</span>
-        <span class="hist__status ${statusClass}">${spin}${esc(statusLabel)}</span>
-        <span class="hist__time">${it.time ? fmt(it.time) : ''}</span>
-        ${stopBtn}
+  // The workspace is already up (a live poll, a filter flip): refresh it in
+  // place so the search box keeps focus and the reader keeps their place.
+  if ($('#hx')) { refreshHistory(); return; }
+  const current = selectedRun(items);
+  selectedRunId = current ? current.id : null;
+  view.innerHTML = `<div class="hx${railOpen ? ' is-rail-open' : ''}" id="hx">
+    <div class="hx__scrim" id="hx-scrim"></div>
+    <aside class="hx__rail" id="hx-rail">
+      <div class="hx__rail-head">
+        <span class="hx__rail-title">History · ${all.length} run${all.length === 1 ? '' : 's'}</span>
+        <input class="input hx__search" id="hx-search" type="search" placeholder="Search runs…" value="${esc(historyQuery)}" />
+        <div class="log__filter">
+          <button class="btn btn--sm ${historyFilter === 'all' ? 'btn--secondary' : 'btn--ghost'}" data-histf="all">All <span id="hx-fall">${all.length}</span></button>
+          <button class="btn btn--sm ${historyFilter === 'failures' ? 'btn--secondary' : 'btn--ghost'}" data-histf="failures">Failures <span id="hx-ffail">${failures.length}</span></button>
+        </div>
       </div>
-      ${text ? `<p class="hist__text">${esc(text)}</p>` : `<p class="hist__text hist__text--none">No summary was returned for this run — open it for the full details.</p>`}
-      ${meta ? `<div class="hist__meta">${esc(meta)} <span class="hist__open">Open →</span></div>` : `<div class="hist__meta"><span class="hist__open">Open →</span></div>`}
-    </div>`;
-  };
-  const body = items.length
-    ? `<div class="history">${items.map(row).join('')}</div>`
-    : `<div class="empty"><h3>No failures</h3><p>Nothing has failed or missed its slot. 🎉</p></div>`;
-  view.innerHTML = `<div class="section-head"><h2>History</h2><span class="hint">Every run — click one to see the full exchange and reply to continue it</span></div>
-    ${filterBar}${body}`;
-  view.querySelectorAll('[data-histf]').forEach((b) => b.addEventListener('click', () => { historyFilter = b.dataset.histf; renderHistory(); }));
-  const open = (id) => { const it = historyItems().find((x) => x.id === id); if (it) openRunModal(it); };
-  view.querySelectorAll('[data-hist]').forEach((el) => {
-    el.addEventListener('click', (e) => {
-      if (e.target.closest('[data-stop]')) return; // Stop handled separately
-      open(el.dataset.hist);
-    });
-    el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(el.dataset.hist); } });
-  });
-  view.querySelectorAll('[data-stop]').forEach((b) => {
-    b.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const it = historyItems().find((x) => x.id === b.dataset.stop);
-      if (it) stopRun(it);
-    });
-  });
+      <div class="hx__list" id="hx-list">${railListHtml(items)}</div>
+    </aside>
+    <section class="hx__main" id="hx-main">${runPaneHtml(current)}</section>
+  </div>`;
+  wireRail();
+  wireRunPane(current);
+  const thread = $('#hx-thread', view);
+  if (thread) thread.scrollTop = thread.scrollHeight;
   ensureHistoryPoll();
 }
 
-/* ---------- Run detail modal (full exchange + continue) ----------
-   Opens a run as a conversation: the original task, the model's reply, any tool
-   actions it took, and (for agent runs) a compose box to reply. Follow-ups call
-   the openrouter-agent function with { runId, prompt }, which resumes the stored
+/* Re-render just the rail list — keeps the search box's value and focus. */
+function refreshRail() {
+  const list = $('#hx-list'); if (!list) return;
+  const { all, failures, items } = historyFiltered();
+  const top = list.scrollTop;
+  list.innerHTML = railListHtml(items);
+  const a = $('#hx-fall'); if (a) a.textContent = all.length;
+  const f = $('#hx-ffail'); if (f) f.textContent = failures.length;
+  list.scrollTop = top;
+  wireRailRows();
+}
+
+function wireRailRows() {
+  $$('#hx-list [data-hist]').forEach((el) => el.addEventListener('click', () => selectRun(el.dataset.hist)));
+}
+
+function wireRail() {
+  wireRailRows();
+  $$('#hx [data-histf]').forEach((b) => b.addEventListener('click', () => {
+    historyFilter = b.dataset.histf;
+    selectedRunId = null;            // fall back to the newest run in the new filter
+    renderHistory();
+  }));
+  const search = $('#hx-search');
+  if (search) search.addEventListener('input', () => { historyQuery = search.value; refreshRail(); });
+  $('#hx-scrim')?.addEventListener('click', () => setRail(false));
+  wireRailSwipe();
+}
+
+/* Mobile: the run list slides over the transcript. */
+function setRail(open) {
+  railOpen = open;
+  $('#hx')?.classList.toggle('is-rail-open', open);
+}
+
+/* Edge-swipe to reveal the list, swipe back to hide it — the gesture Claude
+   Code's mobile layout uses. Desktop keeps both panes visible, so the class the
+   CSS keys off is inert there. */
+function wireRailSwipe() {
+  const hx = $('#hx'); if (!hx) return;
+  let x0 = null, y0 = null, armed = false;
+  hx.addEventListener('touchstart', (e) => {
+    const t = e.touches[0];
+    x0 = t.clientX; y0 = t.clientY;
+    armed = railOpen || (t.clientX - hx.getBoundingClientRect().left) < 28;
+  }, { passive: true });
+  hx.addEventListener('touchend', (e) => {
+    if (x0 == null || !armed) { x0 = null; armed = false; return; }
+    const t = e.changedTouches[0];
+    const dx = t.clientX - x0, dy = t.clientY - y0;
+    if (Math.abs(dx) > 56 && Math.abs(dx) > Math.abs(dy) * 1.5) setRail(dx > 0);
+    x0 = null; armed = false;
+  }, { passive: true });
+}
+
+function selectRun(id) {
+  const it = historyItems().find((x) => x.id === id);
+  if (!it) return;
+  selectedRunId = id;
+  $$('#hx-list [data-hist]').forEach((el) => {
+    const on = el.dataset.hist === id;
+    el.classList.toggle('is-active', on);
+    if (on) el.setAttribute('aria-current', 'true'); else el.removeAttribute('aria-current');
+  });
+  setRail(false);
+  renderRunPane(it, { focus: true });
+}
+
+/* ---------- The run pane (full exchange + continue) ----------
+   The selected run as a conversation: the original task, the model's reply, any
+   tool actions it took, and (for agent runs) a compose box. Follow-ups call the
+   openrouter-agent function with { runId, prompt }, which resumes the stored
    transcript with the same model + tools and saves the whole thread back. */
-let runModalId = null;      // the historyItems id currently open
-let runModalBusy = false;   // a follow-up is in flight
 
 /* Turn a stored transcript into display turns: user + assistant bubbles, with a
    compact line for each tool the model ran. Falls back to the single output blob
@@ -1144,7 +1260,12 @@ function transcriptTurns(it) {
   return turns;
 }
 
-function runModalHtml(it) {
+function runPaneHtml(it) {
+  if (!it) {
+    return `<div class="hx__blank"><div class="empty">
+      <h3>Pick a run</h3><p>Choose a run from the list to read its full exchange here.</p>
+    </div></div>`;
+  }
   const turns = transcriptTurns(it);
   const bubbles = turns.map((t) => {
     if (t.kind === 'user') return `<div class="chatmsg chatmsg--user">${esc(t.content)}</div>`;
@@ -1159,66 +1280,88 @@ function runModalHtml(it) {
   const busy = isRunBusy(it);
   const stale = isRunStale(it);
   // Retry: error/cancelled + stale "running" rows — same continue path, fixed prompt.
-  const showRetry = can && !runModalBusy && (it.status === 'error' || it.status === 'cancelled' || stale);
-  const showStop = can && !runModalBusy && (busy || stale || it.status === 'running');
+  const showRetry = can && !runBusy && (it.status === 'error' || it.status === 'cancelled' || stale);
+  const showStop = can && !runBusy && (busy || stale || it.status === 'running');
   const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status || 'ran');
   const chipStatus = stale ? 'missed' : (it.status === 'cancelled' ? 'archived' : (it.status || 'ran')); // archived chip = muted "stopped"
-  const spin = (busy || runModalBusy) ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
+  const spin = (busy || runBusy) ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
+  const draft = runDrafts.get(it.id) || '';
   const compose = can
-    ? `<div class="modal__compose">
-        <textarea class="textarea chat__input" id="run-input" placeholder="Reply to the model — answer its question, grant permission, or ask for more… (Enter to send)" ${runModalBusy ? 'disabled' : ''}></textarea>
-        <div class="modal__compose-actions">
-          ${showStop ? `<button class="btn btn--danger-ghost" id="run-stop" type="button">Stop</button>` : ''}
-          ${showRetry ? `<button class="btn btn--secondary" id="run-retry" type="button">Retry</button>` : ''}
-          <button class="btn btn--primary" id="run-send" ${runModalBusy ? 'disabled' : ''}>Send</button>
+    ? `<div class="hx__compose">
+        <div class="hx__compose-inner">
+          <textarea class="textarea chat__input" id="run-input" placeholder="Reply to continue this run… (Enter to send)" ${runBusy ? 'disabled' : ''}>${esc(draft)}</textarea>
+          <button class="btn btn--primary" id="run-send" ${runBusy ? 'disabled' : ''}>Send</button>
         </div>
       </div>`
-    : `<div class="modal__note">This run isn't an interactive model chat, so it can't be continued here — it's shown for the record.</div>`;
-  return `<div class="modal">
-    <div class="modal__head">
+    : `<div class="hx__compose"><div class="hx__note">This run isn't an interactive model chat, so it can't be continued here — it's shown for the record.</div></div>`;
+  return `<div class="hx__head">
+      <button type="button" class="hx__railbtn" id="hx-railbtn" aria-label="Show the run list">☰ Runs</button>
       <span class="chip chip--${esc(chipStatus)}">${spin}${esc(statusLabel)}</span>
-      <h2 class="modal__title">${esc(it.title || 'Untitled')}</h2>
-      <span class="modal__time">${it.time ? fmt(it.time) : ''}</span>
-      <button class="drawer__close" id="run-close" aria-label="Close">×</button>
+      <h2 class="hx__title">${esc(it.title || 'Untitled')}</h2>
+      <span class="hx__time">${it.time ? fmt(it.time) : ''}</span>
+      <span class="hx__head-actions">
+        ${showStop ? `<button class="btn btn--danger-ghost btn--sm" id="run-stop" type="button" title="Stop this agent">Stop</button>` : ''}
+        ${showRetry ? `<button class="btn btn--secondary btn--sm" id="run-retry" type="button">Retry</button>` : ''}
+      </span>
     </div>
-    <div class="modal__thread" id="run-thread">
-      ${bubbles}
-      ${runModalBusy || busy ? '<div class="chatmsg chatmsg--bot chatmsg--busy"><span class="hist__spin" aria-hidden="true"></span> Working…</div>' : ''}
+    <div class="hx__thread" id="hx-thread">
+      <div class="hx__thread-inner">
+        ${bubbles}
+        ${runBusy || busy ? '<div class="chatmsg chatmsg--bot chatmsg--busy"><span class="hist__spin" aria-hidden="true"></span> Working…</div>' : ''}
+      </div>
     </div>
-    ${compose}
-  </div>`;
+    ${compose}`;
 }
 
-function openRunModal(it) {
-  runModalId = it.id;
-  let ov = $('#runOverlay');
-  if (!ov) {
-    ov = document.createElement('div');
-    ov.id = 'runOverlay';
-    ov.className = 'overlay overlay--modal';
-    document.body.appendChild(ov);
-    ov.addEventListener('click', (e) => { if (e.target === ov) closeRunModal(); });
-  }
-  ov.innerHTML = runModalHtml(it);
-  ov.classList.add('is-open');
-  const thread = $('#run-thread', ov);
-  if (thread) thread.scrollTop = thread.scrollHeight;
-  $('#run-close', ov)?.addEventListener('click', closeRunModal);
-  const input = $('#run-input', ov);
+function wireRunPane(it) {
+  const main = $('#hx-main'); if (!main || !it) return;
+  $('#hx-railbtn', main)?.addEventListener('click', () => setRail(!railOpen));
+  const input = $('#run-input', main);
   if (input) {
     const send = () => continueRun(it, input.value);
-    $('#run-send', ov)?.addEventListener('click', send);
+    // Keep the draft across live refreshes (the pane re-renders every poll).
+    input.addEventListener('input', () => runDrafts.set(it.id, input.value));
+    $('#run-send', main)?.addEventListener('click', send);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
-    if (!runModalBusy) setTimeout(() => input.focus(), 30);
   }
   // One-click resume: same agentPost path as a normal reply (simple-CORS text/plain).
-  $('#run-retry', ov)?.addEventListener('click', () => continueRun(it, RETRY_PROMPT));
-  $('#run-stop', ov)?.addEventListener('click', () => stopRun(it));
-  ensureHistoryPoll();
+  $('#run-retry', main)?.addEventListener('click', () => continueRun(it, RETRY_PROMPT));
+  $('#run-stop', main)?.addEventListener('click', () => stopRun(it));
+}
+
+/* Re-render the pane in place. Keeps the reader where they were unless they
+   were already pinned to the bottom (then it follows the new output). */
+function renderRunPane(it, { focus = false } = {}) {
+  const main = $('#hx-main'); if (!main) return;
+  const prev = $('#hx-thread', main);
+  const prevTop = prev ? prev.scrollTop : 0;
+  const wasBottom = prev ? (prev.scrollHeight - prev.scrollTop - prev.clientHeight < 48) : true;
+  main.innerHTML = runPaneHtml(it);
+  wireRunPane(it);
+  const thread = $('#hx-thread', main);
+  if (thread) thread.scrollTop = wasBottom ? thread.scrollHeight : prevTop;
+  if (focus && !runBusy) setTimeout(() => $('#run-input', main)?.focus(), 30);
+}
+
+/* Repaint the whole workspace from fresh data (a live poll, a filter flip, a
+   follow-up round-trip) without rebuilding it — focus, scroll and the unsent
+   draft all survive. */
+function refreshHistory() {
+  if (currentView !== 'history' || !$('#hx')) return;
+  const { items } = historyFiltered();
+  const current = selectedRun(items);
+  selectedRunId = current ? current.id : null;
+  $$('#hx [data-histf]').forEach((b) => {
+    const on = b.dataset.histf === historyFilter;
+    b.classList.toggle('btn--secondary', on);
+    b.classList.toggle('btn--ghost', !on);
+  });
+  refreshRail();
+  renderRunPane(current);
 }
 
 async function stopRun(it) {
-  if (!it?.runId || runModalBusy) return;
+  if (!it?.runId || runBusy) return;
   const { error } = await sessionForFire();
   if (error) { toast(error, 'error'); return; }
   toast('Stopping…');
@@ -1229,17 +1372,13 @@ async function stopRun(it) {
       toast(`Stop failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error');
       return;
     }
-    toast('Stopped — open the run and Retry to resume from the transcript.');
+    toast('Stopped — hit Retry to resume from the transcript.');
     try { await loadAll(); } catch { /* */ }
-    if (runModalId) refreshRunModal();
-    else if (currentView === 'history') renderHistory();
+    refreshHistory();
   } catch (e) {
     toast(`Stop request failed: ${e.message}`, 'error');
   }
 }
-function closeRunModal() { runModalId = null; $('#runOverlay')?.classList.remove('is-open'); }
-// Re-open the currently-open run from fresh data (after a follow-up round-trips).
-function refreshRunModal() { if (!runModalId) return; const it = historyItems().find((x) => x.id === runModalId); if (it) openRunModal(it); else closeRunModal(); }
 
 // POST to the openrouter-agent edge function as a *simple* CORS request:
 // text/plain content-type and no Authorization header, so the browser sends it
@@ -1267,36 +1406,42 @@ async function agentPost(body) {
 
 async function continueRun(it, raw) {
   const text = (raw || '').trim();
-  if (!text || runModalBusy || !isContinuable(it)) return;
+  if (!text || runBusy || !isContinuable(it)) return;
   const { error } = await sessionForFire();
   if (error) { toast(error, 'error'); return; }
-  runModalBusy = true;
+  runBusy = true;
+  runDrafts.delete(it.id);   // it's on its way — don't restore it into the box
   // Optimistically show the user's message + a thinking bubble.
   const optimistic = { ...it, messages: [...(Array.isArray(it.messages) ? it.messages : []), { role: 'user', content: text }] };
-  openRunModal(optimistic);
+  renderRunPane(optimistic);
   try {
     const r = await agentPost({ runId: it.runId, prompt: text });
     const data = await r.json().catch(() => ({}));
-    runModalBusy = false;
-    if (!r.ok || data.ok === false) { toast(`Reply failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error'); refreshRunModal(); return; }
+    runBusy = false;
+    if (!r.ok || data.ok === false) {
+      toast(`Reply failed (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error');
+      runDrafts.set(it.id, text);   // hand the message back so it isn't lost
+      refreshHistory(); return;
+    }
     const cost = Number(data.cost || 0);
     toast(`Replied — ${modelLabel(data.model || it.model)}${cost ? ` (~$${cost.toFixed(4)})` : ''}.`);
     try { await loadAll(); } catch { /* the row is saved regardless */ }
-    refreshRunModal();
+    refreshHistory();
   } catch (e) {
     // A long agent reply can outlast the platform's request timeout: the browser
     // fetch throws ("Load failed" / "Failed to fetch") even though the function
     // finished and persisted the reply onto the run row. Don't cry failure yet —
     // poll the row; if it advanced, the reply actually landed.
     const landed = await pollReplyLanded(it.runId, it.time);
-    runModalBusy = false;
+    runBusy = false;
     if (landed) {
       toast('Reply completed.');
       try { await loadAll(); } catch { /* the row is saved regardless */ }
     } else {
       toast(`Reply request failed: ${e.message}`, 'error');
+      runDrafts.set(it.id, text);   // hand the message back so it isn't lost
     }
-    refreshRunModal();
+    refreshHistory();
   }
 }
 
@@ -2212,10 +2357,29 @@ async function openSettings() {
 /* ---------- Tabs ---------- */
 function syncTabs() { $$('.tab').forEach((t) => t.classList.toggle('is-active', t.dataset.view === currentView)); }
 
+/* ---------- Account menu (top-right) ---------- */
+function closeAcctMenu() {
+  const m = $('#acctMenu'); if (!m) return;
+  m.classList.remove('is-open');
+  $('#userChip')?.setAttribute('aria-expanded', 'false');
+}
+function wireAcctMenu() {
+  const menu = $('#acctMenu'), btn = $('#userChip');
+  if (!menu || !btn) return;
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const open = !menu.classList.contains('is-open');
+    menu.classList.toggle('is-open', open);
+    btn.setAttribute('aria-expanded', String(open));
+  });
+  document.addEventListener('click', (e) => { if (!menu.contains(e.target)) closeAcctMenu(); });
+}
+
 /* ---------- Auth UI ---------- */
 function showAuth(mode = 'signin') {
-  ['#sidebar', '#topbar'].forEach((s) => { const e = $(s); if (e) e.style.display = 'none'; });
-  $('.app')?.classList.add('is-auth'); // sidebar is hidden → collapse the grid so the card centers
+  const bar = $('#topbar'); if (bar) bar.style.display = 'none';
+  $('.app')?.classList.add('is-auth');
+  $('.content')?.classList.remove('content--flush'); // the auth card wants the normal page scroll
 
   const signup = mode === 'signup';
   view.innerHTML = `<div class="auth">
@@ -2249,12 +2413,15 @@ function showAuth(mode = 'signin') {
 }
 
 function showApp() {
-  ['#sidebar', '#topbar'].forEach((s) => { const e = $(s); if (e) e.style.display = ''; });
-  $('.app')?.classList.remove('is-auth'); // restore the sidebar + content grid
+  const bar = $('#topbar'); if (bar) bar.style.display = '';
+  $('.app')?.classList.remove('is-auth');
 
   paintFireSwitch();
+  const email = session.user.email || '';
   const chip = $('#userChip');
-  if (chip) { chip.innerHTML = `<b>${esc(session.user.email)}</b>`; }
+  if (chip) { chip.textContent = (email[0] || '?').toUpperCase(); chip.title = `Signed in as ${email}`; }
+  const who = $('#acctWho');
+  if (who) who.textContent = email;
   syncTabs();
   loadAll();
 }
@@ -2264,11 +2431,16 @@ function wireOnce() {
   $('#newBtn').addEventListener('click', () => openDrawer());
   $('#budgetChip').addEventListener('click', openForecast);
   $('#fireSwitch').addEventListener('click', toggleFireSwitch);
-  $('#settingsBtn').addEventListener('click', openSettings);
-  $('#signOutBtn').addEventListener('click', async () => { await sb.auth.signOut(); });
+  $('#settingsBtn').addEventListener('click', () => { closeAcctMenu(); openSettings(); });
+  $('#signOutBtn').addEventListener('click', async () => { closeAcctMenu(); await sb.auth.signOut(); });
+  wireAcctMenu();
   $('#drawerClose').addEventListener('click', closeDrawer);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeDrawer(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeDrawer(); closeRunModal(); } });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    closeDrawer(); closeAcctMenu();
+    if (railOpen) setRail(false);
+  });
   $$('.tab').forEach((t) => t.addEventListener('click', () => { currentView = t.dataset.view; syncTabs(); render(); }));
   wireCalendarZoom();
   setInterval(paintStatus, 30000);
