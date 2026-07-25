@@ -1246,6 +1246,7 @@ function renderHistory() {
   </div>`;
   wireRail();
   wireRunPane(current);
+  fitHistoryPane();
   const thread = $('#hx-thread', view);
   if (thread) thread.scrollTop = thread.scrollHeight;
   ensureHistoryPoll();
@@ -1278,6 +1279,31 @@ function wireRail() {
   if (search) search.addEventListener('input', () => { historyQuery = search.value; refreshRail(); });
   $('#hx-scrim')?.addEventListener('click', () => setRail(false));
   wireRailSwipe();
+}
+
+/* Last-resort safety net for the pane's height.
+   The CSS chain is deliberately boring — fixed-height shell, absolutely
+   positioned #view, flex rows with min-height:0 — but this pane has now been
+   stuck twice on iPadOS, and a workspace you cannot scroll is useless. So after
+   every render we measure: from .hx's top edge, how much room is there before
+   the bottom of the *visual viewport*? If the laid-out height disagrees by more
+   than a pixel, pin it there in px. Measured space is engine-independent truth,
+   so this is correct even if some ancestor's height never resolved. When the
+   CSS works — every browser tested — the numbers already agree and nothing is
+   written. */
+function fitHistoryPane() {
+  const hx = $('#hx'); if (!hx) return;
+  const box = hx.getBoundingClientRect();
+  const vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight || 0;
+  const avail = Math.round(vh - box.top);
+  if (avail < 120) return;                       // nonsense measurement — leave it alone
+  hx.style.height = Math.abs(Math.round(box.height) - avail) > 1 ? `${avail}px` : '';
+  // Columns follow the pane; only pinned if they somehow outgrew it.
+  const h = Math.round(hx.getBoundingClientRect().height);
+  ['#hx-rail', '#hx-main'].forEach((sel) => {
+    const el = $(sel); if (!el) return;
+    el.style.height = Math.round(el.getBoundingClientRect().height) - h > 1 ? `${h}px` : '';
+  });
 }
 
 /* Mobile: the run list slides over the transcript. */
@@ -1465,6 +1491,7 @@ function refreshHistory() {
   });
   refreshRail();
   renderRunPane(current);
+  fitHistoryPane();
 }
 
 async function stopRun(it) {
@@ -2562,6 +2589,7 @@ function trackAppHeight() {
     const zoomed = vv && Math.abs((vv.scale || 1) - 1) > 0.02;
     const h = (!zoomed && vv && vv.height) || window.innerHeight || 0;
     if (h > 240) document.documentElement.style.setProperty('--app-h', `${Math.round(h)}px`);
+    fitHistoryPane();   // the pane is sized from the viewport too
   };
   apply();
   window.addEventListener('resize', apply);

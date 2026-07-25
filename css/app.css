@@ -50,8 +50,8 @@ a { color: var(--periwinkle); }
    flex-derived parent height unreliably, and when it failed the panes grew past
    the viewport, the overflow:hidden here clipped them, and nothing scrolled at
    all. Never reintroduce a percentage height in this chain. */
-.content--flush { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
-.content--flush > #view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.content--flush { padding: 0; overflow: hidden; position: relative; }
+.content--flush > #view { position: absolute; inset: 0; display: flex; flex-direction: column; }
 
 @media (min-width: 900px) {
   .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); }
@@ -602,17 +602,20 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
    ══════════════════════════════════════════════════ */
 .hx {
   position: relative;
-  display: grid;
-  grid-template-columns: 304px minmax(0, 1fr);
-  flex: 1 1 auto;   /* sized by the flex chain above — not a percentage height */
+  display: flex;          /* NOT grid — see the note above .content--flush */
+  align-items: stretch;
+  flex: 1 1 auto;
   min-height: 0;
+  overflow: hidden;
 }
 /* ── Left rail: the run list ── */
 .hx__rail {
   display: flex;
   flex-direction: column;
+  flex: 0 0 304px;
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
   border-right: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
 }
@@ -650,8 +653,10 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .hx__main {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
   background: var(--bg-base);
 }
 .hx__head {
@@ -956,7 +961,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   .brand__title { font-size: 18px; }
 
   /* History: single pane, rail slides in over it. */
-  .hx { grid-template-columns: minmax(0, 1fr); }
+  .hx__rail { flex: 0 0 auto; }  /* off-canvas below — see the absolute rule */
   .hx__rail {
     position: absolute;
     top: 0; bottom: 0; left: 0;

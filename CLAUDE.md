@@ -472,16 +472,31 @@ triggers runs it truly in parallel.
   projected spend from the scheduled queue), the Settings **accounts & triggers**
   manager, and the create/edit **drawer**. The Library holds every non-archived
   routine — scheduling doesn't remove it, only archiving takes one off the air.
-- **The shell is exactly one viewport tall, and nothing in that chain may use a
-  percentage height.** `.app` → `.content--flush` → `#view` → `.hx` is flex the
-  whole way with `min-height: 0` at every link. It used to give the pane
-  `height: 100%`; iPadOS Safari resolves that against a flex-derived parent
-  unreliably, and when it failed the panes grew past the viewport, the
-  `overflow: hidden` clipped them, and **nothing scrolled at all** — the run list
-  and transcript were both frozen. `trackAppHeight()` also measures
-  `visualViewport.height` into `--app-h` (dvh stays the fallback), which fixes
-  the same symptom from the other direction and keeps the reply box above the
-  on-screen keyboard.
+- **The shell is exactly one viewport tall, and the Chat pane got stuck twice
+  getting there.** Symptom both times, iPadOS only: the run list and transcript
+  would not scroll, content just ran off the bottom of the window. Cause both
+  times: a link in the height chain that Safari would not resolve, leaving the
+  columns unbounded so no scroll container existed, while the `overflow: hidden`
+  above them hid the evidence.
+  - *First:* the pane took a percentage height (`#view { height: 100% }`)
+    against a flex-derived parent.
+  - *Then:* `.hx` was a **grid** whose implicit row is `auto` — stretching an
+    auto row to a definite container height is a step Safari fumbles, so the row
+    sized to its content instead.
+  So today: `.content--flush` is `position: relative`, `#view` is
+  `position: absolute; inset: 0` (a definite box that needs no ancestor height
+  to resolve), and `.hx` is a **flex row** — never grid — with `min-height: 0`
+  and `overflow: hidden` on both columns. `trackAppHeight()` measures
+  `visualViewport.height` into `--app-h` (dvh stays the fallback), which also
+  keeps the reply box above the on-screen keyboard.
+- **`fitHistoryPane()` is the belt to that braces.** After every render and on
+  every resize it measures the space between `.hx`'s top edge and the bottom of
+  the visual viewport, and pins the pane there in pixels if the laid-out height
+  disagrees by more than 1px. Measured space is engine-independent, so the pane
+  is scrollable even if some future engine mis-resolves the CSS. It writes
+  nothing when the CSS is working (asserted in the tests, so it can't quietly
+  become load-bearing). If you touch this layout, run `round4` — it sabotages
+  the chain on purpose and checks the guard still rescues it.
 - **History is a Claude-Code-shaped workspace, not a list of cards.** A left rail
   (`#hx-rail`) lists every run — searchable, filterable to failures — and the
   right pane (`#hx-main`) holds the selected run's whole exchange *flat against
