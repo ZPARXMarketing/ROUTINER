@@ -39,12 +39,15 @@ import {
   buildResearchPrompt,
   parseGapFill,
   parseLeads,
+  extractPhones,
+  phoneCeiling,
+  phoneVerdict,
   scoreLead,
   scoreCeiling,
   toE164,
   verificationVerdict,
 } from "../_shared/lead-parse.ts";
-import type { SiteStatus } from "../_shared/lead-parse.ts";
+import type { PhoneStatus, SiteStatus } from "../_shared/lead-parse.ts";
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const ROICAL_DEFAULT_URL = "https://pqnycfugadzwcuntfhjp.supabase.co";
@@ -283,8 +286,18 @@ async function exclusionNames(location: string | null, limit = 60): Promise<stri
 // never mistaken for a fake one.
 const SITE_TIMEOUT_MS = 6000;
 
-async function checkSite(domain: string | null): Promise<SiteStatus> {
-  if (!domain) return "none";
+/** Biggest page body we will read while looking for a phone number. */
+const SITE_BODY_CAP = 400_000;
+
+/**
+ * Probe a site AND harvest the phone numbers it publishes.
+ *
+ * Reading the body here is what makes phone verification free: the request is
+ * already being made to prove the domain exists, so the numbers come at no
+ * extra cost and no model call.
+ */
+async function checkSite(domain: string | null): Promise<{ status: SiteStatus; phones: Set<string> }> {
+  if (!domain) return { status: "none", phones: new Set() };
   const bare = domain.replace(/^www\./, "");
   // MUST try www, not just the apex. Plenty of real businesses publish only
   // www.<domain> with no apex A record — an apex-only probe calls those dead and
@@ -297,13 +310,26 @@ async function checkSite(domain: string | null): Promise<SiteStatus> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), SITE_TIMEOUT_MS);
     try {
-      await fetch(url, {
+      const res = await fetch(url, {
         method: "GET",
         redirect: "follow",
         signal: ctrl.signal,
         headers: { "user-agent": "Mozilla/5.0 (compatible; ZPARX-lead-verify/1.0)" },
       });
-      return "alive";
+      // The domain answered — that alone settles `alive`. Reading the body is
+      // best-effort on top: a binary/huge/unreadable response still counts as
+      // alive, it just yields no phone numbers.
+      let phones = new Set<string>();
+      try {
+        const ct = res.headers.get("content-type") ?? "";
+        if (/text|html|xml/i.test(ct)) {
+          const body = (await res.text()).slice(0, SITE_BODY_CAP);
+          phones = extractPhones(body);
+        } else {
+          await res.body?.cancel();
+        }
+      } catch { /* unreadable body — alive, just no numbers */ }
+      return { status: "alive", phones };
     } catch (e) {
       const n = (e as Error).name;
       if (n === "AbortError" || n === "TimeoutError") sawTimeout = true;
@@ -313,12 +339,15 @@ async function checkSite(domain: string | null): Promise<SiteStatus> {
     }
   }
   // A host that only ever timed out is ambiguous, never evidence of fabrication.
-  return sawTimeout ? "unknown" : "dead";
+  return { status: sawTimeout ? "unknown" : "dead", phones: new Set() };
 }
 
-/** Liveness for many domains at once, bounded so a batch can't stall the run. */
-async function checkSites(domains: (string | null)[], concurrency = 6): Promise<SiteStatus[]> {
-  const out = new Array<SiteStatus>(domains.length).fill("none");
+/** Liveness + published phone numbers for many domains, bounded concurrency. */
+async function checkSites(
+  domains: (string | null)[],
+  concurrency = 6,
+): Promise<{ status: SiteStatus; phones: Set<string> }[]> {
+  const out = domains.map(() => ({ status: "none" as SiteStatus, phones: new Set<string>() }));
   let cursor = 0;
   const worker = async () => {
     while (true) {
@@ -415,7 +444,7 @@ async function deepenOne(
 async function runDeepen(
   key: string,
   opts: { model: string; limit: number; deadline: number; dmTitles: string[]; leadIds?: string[] },
-): Promise<{ eligible: number; scanned: number; filled: number; fields: Record<string, number>; unresolved: number; quarantined: number; remaining: number; cost: number; errors: string[] }> {
+): Promise<{ eligible: number; scanned: number; filled: number; fields: Record<string, number>; unresolved: number; quarantined: number; phoneConflicts: number; remaining: number; cost: number; errors: string[] }> {
   const sel =
     "id,business_name,website_domain,city,region,phone_e164,email,contact_name,contact_title,lead_score,vertical,enrichment";
   const filter = opts.leadIds?.length
@@ -426,7 +455,7 @@ async function runDeepen(
   try {
     rows = (await sbGet(`staged_leads?select=${sel}&${filter}&order=created_at.asc&limit=${opts.limit}`)) as StagedRow[];
   } catch (e) {
-    return { eligible: 0, scanned: 0, filled: 0, fields: {}, unresolved: 0, quarantined: 0, remaining: 0, cost: 0, errors: [(e as Error).message] };
+    return { eligible: 0, scanned: 0, filled: 0, fields: {}, unresolved: 0, quarantined: 0, phoneConflicts: 0, remaining: 0, cost: 0, errors: [(e as Error).message] };
   }
 
   // How many are still queued behind this batch — lets the caller loop to zero.
@@ -446,7 +475,7 @@ async function runDeepen(
 
   const fields: Record<string, number> = {};
   const errors: string[] = [];
-  let filled = 0, unresolved = 0, cost = 0, scanned = 0, quarantined = 0;
+  let filled = 0, unresolved = 0, cost = 0, scanned = 0, quarantined = 0, phoneConflicts = 0;
   let cursor = 0;
 
   const worker = async () => {
@@ -485,7 +514,8 @@ async function runDeepen(
       // pass just proposed, or the one the first pass claimed. A domain that
       // does not resolve is dropped rather than handed to the human as real.
       const finalDomain = (patch.website_domain ?? row.website_domain) as string | null;
-      let siteStatus: SiteStatus = await checkSite(finalDomain);
+      const probe = await checkSite(finalDomain);
+      let siteStatus: SiteStatus = probe.status;
       let deadDomain: string | null = null;
       if (siteStatus === "dead" && finalDomain) {
         deadDomain = finalDomain;
@@ -498,6 +528,11 @@ async function runDeepen(
           patch.website_domain = null; // clear the fabricated one already on the row
         }
       }
+
+      // The number we would ship, checked against the site's own published numbers.
+      const finalPhone = (patch.phone_e164 ?? row.phone_e164) as string | null;
+      const pv = phoneVerdict(finalPhone, siteStatus === "alive" ? probe.phones : null);
+      if (pv.status === "conflict") phoneConflicts++;
 
       const hasPhone = Boolean(patch.phone_e164 ?? row.phone_e164);
       const hasContact = Boolean(patch.contact_name ?? row.contact_name);
@@ -517,6 +552,9 @@ async function runDeepen(
         deepen_note: found?.note ?? null,
         deepen_confidence: found?.confidence ?? null,
         site_status: siteStatus,
+        phone_status: pv.status,
+        phone_note: pv.note,
+        ...(pv.candidates.length ? { site_phones: pv.candidates } : {}),
         ...(deadDomain ? { dead_domain: deadDomain } : {}),
         verification: verdict,
         verification_note: verdictNote,
@@ -543,6 +581,7 @@ async function runDeepen(
       patch.lead_score = Math.min(
         scoreLead(merged as unknown as Parameters<typeof scoreLead>[0]),
         scoreCeiling(verdict),
+        phoneCeiling(pv.status),
       );
 
       try {
@@ -560,7 +599,7 @@ async function runDeepen(
   const remaining = opts.leadIds?.length
     ? Math.max(0, eligible - scanned)
     : Math.max(0, queued - scanned);
-  return { eligible, scanned, filled, fields, unresolved, quarantined, remaining, cost: Number(cost.toFixed(4)), errors };
+  return { eligible, scanned, filled, fields, unresolved, quarantined, phoneConflicts, remaining, cost: Number(cost.toFixed(4)), errors };
 }
 
 async function loadTargets(body: Record<string, unknown>): Promise<Target[]> {
@@ -614,6 +653,70 @@ Deno.serve(async (req: Request) => {
     return allow.has(m) ? m : "perplexity/sonar-pro";
   })();
 
+  // ── mode:"verify" — re-check sites and phones on leads already in the queue ──
+  // Zero model calls, so it costs nothing but bandwidth. This is what lets the
+  // phone check be applied to leads that were sourced before it existed, and
+  // what you re-run after a batch to see which numbers actually hold up.
+  if (body.mode === "verify") {
+    const limit = Math.max(1, Math.min(Number(body.limit) || 100, 500));
+    const sel = "id,business_name,website_domain,phone_e164,lead_score,enrichment";
+    const filter = Array.isArray(body.leadIds) && body.leadIds.length
+      ? `id=in.(${(body.leadIds as string[]).join(",")})`
+      : `status=eq.${encodeURIComponent(String(body.status ?? "pending"))}`;
+
+    let rows: any[] = [];
+    try {
+      rows = await sbGet(`staged_leads?select=${sel}&${filter}&order=created_at.asc&limit=${limit}`);
+    } catch (e) {
+      return json({ ok: false, error: `verify: ${(e as Error).message}` }, 500);
+    }
+
+    const tally: Record<string, number> = { confirmed: 0, conflict: 0, unverified: 0, "no-phone": 0 };
+    let deadNow = 0, cursor = 0, checked = 0;
+    const conflicts: any[] = [];
+    const deadline = deadlineFrom(startedAt);
+
+    const worker = async () => {
+      while (true) {
+        if (Date.now() > deadline) return;
+        const i = cursor++;
+        if (i >= rows.length) return;
+        const row = rows[i];
+        const probe = await checkSite(row.website_domain);
+        const pv = phoneVerdict(row.phone_e164, probe.status === "alive" ? probe.phones : null);
+        tally[pv.status] = (tally[pv.status] ?? 0) + 1;
+        checked++;
+        if (probe.status === "dead" && row.website_domain) deadNow++;
+        if (pv.status === "conflict") {
+          conflicts.push({
+            business: row.business_name, held: row.phone_e164,
+            site_publishes: pv.candidates.map((c) => `+1${c}`),
+          });
+        }
+        const prev = (row.enrichment ?? {}) as Record<string, unknown>;
+        const patch: Record<string, unknown> = {
+          enrichment: {
+            ...prev,
+            site_status: probe.status,
+            phone_status: pv.status,
+            phone_note: pv.note,
+            ...(pv.candidates.length ? { site_phones: pv.candidates } : {}),
+            verified_at: new Date().toISOString(),
+          },
+        };
+        if (row.lead_score != null) patch.lead_score = Math.min(row.lead_score, phoneCeiling(pv.status));
+        try { await sbPatchStrict("staged_leads", `id=eq.${row.id}`, patch); } catch { /* best-effort */ }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, rows.length || 1) }, worker));
+
+    return json({
+      ok: true, mode: "verify", checked, deadSites: deadNow, phones: tally,
+      remaining: Math.max(0, rows.length - checked),
+      conflicts: conflicts.slice(0, 25),
+    });
+  }
+
   // ── mode:"deepen" — pure gap-fill over the pending queue, no discovery ──────
   // Callable on its own so the queue can be drained across several invocations
   // (and so old leads that predate this feature can be back-filled).
@@ -636,7 +739,8 @@ Deno.serve(async (req: Request) => {
           routineId: body.routineId ?? undefined,
           status: r.errors.length && !r.filled ? "error" : "success",
           summary: `Deepen: filled gaps on ${r.filled}/${r.scanned} lead(s) — ${gained}` +
-            `${r.quarantined ? `; QUARANTINED ${r.quarantined} unverifiable lead(s)` : ""}. ` +
+            `${r.quarantined ? `; QUARANTINED ${r.quarantined} unverifiable lead(s)` : ""}` +
+            `${r.phoneConflicts ? `; ${r.phoneConflicts} phone(s) contradicted by the business's own site` : ""}. ` +
             `${r.remaining} still queued (~$${r.cost.toFixed(4)}).`,
           details: r.errors.length ? `Errors:\n${r.errors.map((e) => `- ${e}`).join("\n")}` : undefined,
           models: [deepenModel],
@@ -706,18 +810,28 @@ Deno.serve(async (req: Request) => {
     // Verify every claimed website BEFORE anything is inserted. This also
     // covers leads the second pass will skip for having no gaps — a fully
     // fabricated lead can look "complete", and the DNS check is what catches it.
-    let deadSites = 0;
+    let deadSites = 0, phoneConflicts = 0;
     if (fresh.length) {
-      const statuses = await checkSites(fresh.map((l) => l.website_domain));
+      const probes = await checkSites(fresh.map((l) => l.website_domain));
       fresh.forEach((l, i) => {
-        const st = statuses[i];
-        (l.enrichment as Record<string, unknown>).site_status = st;
+        const { status: st, phones } = probes[i];
+        const e = l.enrichment as Record<string, unknown>;
+        e.site_status = st;
         if (st === "dead") {
           deadSites++;
-          (l.enrichment as Record<string, unknown>).dead_domain = l.website_domain;
+          e.dead_domain = l.website_domain;
           l.website_domain = null;
-          l.lead_score = scoreLead(l as unknown as Parameters<typeof scoreLead>[0]);
         }
+        // Same fetch, second question: does the site publish OUR number?
+        const pv = phoneVerdict(l.phone_e164, st === "alive" ? phones : null);
+        e.phone_status = pv.status;
+        e.phone_note = pv.note;
+        if (pv.candidates.length) e.site_phones = pv.candidates;
+        if (pv.status === "conflict") phoneConflicts++;
+        l.lead_score = Math.min(
+          scoreLead(l as unknown as Parameters<typeof scoreLead>[0]),
+          phoneCeiling(pv.status),
+        );
       });
     }
 
@@ -746,7 +860,7 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    const result = { requested: t.count, parsed, inserted: dryRun ? 0 : inserted, skipped, offArea, deadSites, mirrored, cost };
+    const result = { requested: t.count, parsed, inserted: dryRun ? 0 : inserted, skipped, offArea, deadSites, phoneConflicts, mirrored, cost };
     runs.push({ target: t.label, model, ...result, ...(insErr ? { error: insErr } : {}), ...(dryRun ? { dryRun: true, sample: fresh.slice(0, sampleSize) } : {}) });
     if (t.id) await sbPatch("lead_enrichment_targets", `id=eq.${t.id}`, { last_run_at: foundAt, last_result: result });
   }

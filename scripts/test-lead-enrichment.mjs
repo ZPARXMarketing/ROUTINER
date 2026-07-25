@@ -15,6 +15,9 @@ import {
   buildResearchPrompt,
   parseGapFill,
   parseLeads,
+  extractPhones,
+  phoneCeiling,
+  phoneVerdict,
   scoreCeiling,
   toE164,
   verificationVerdict,
@@ -140,6 +143,55 @@ console.log("\ntoE164 — never invent a country code");
   eq("too short → null", toE164("12345"), null);
   eq("too long → null", toE164("+1234567890123456"), null);
   eq("null in, null out", toE164(null), null);
+}
+
+console.log("\nextractPhones — reading numbers off a business's own page");
+{
+  const html = `
+    <a href="tel:+1-256-882-6555">Call us</a>
+    <p>Fax: (256) 882-6556</p>
+    <span>Open since 1998 · 1234 Whitesburg Dr · ZIP 35801</span>
+    <div>Prices from 1,250.00 to 9,999.99</div>`;
+  const found = extractPhones(html);
+  ok("finds the tel: link", found.has("2568826555"));
+  ok("finds a visible formatted number", found.has("2568826556"));
+  eq("ignores years, ZIPs, street numbers and prices", found.size, 2);
+
+  // Numbers split across markup must not fuse into a phantom number.
+  const split = extractPhones("<b>555</b><i>123</i><u>4567</u>");
+  eq("adjacent tags do not fuse into a false match", split.size, 0);
+
+  eq("strips a leading US 1 so formats compare equal",
+    [...extractPhones('<a href="tel:12568826555">x</a>')][0], "2568826555");
+  eq("empty page yields nothing", extractPhones("").size, 0);
+}
+
+console.log("\nphoneVerdict — the last unverified field");
+{
+  const site = new Set(["2568826555", "2568826556"]);
+
+  eq("number published on the site → confirmed",
+    phoneVerdict("+12568826555", site).status, "confirmed");
+  eq("formatting differences still match",
+    phoneVerdict("(256) 882-6555", site).status, "confirmed");
+
+  // The failure this was built for: a plausible number on a real business.
+  const c = phoneVerdict("+12568222228", site);
+  eq("number absent from the site → conflict", c.status, "conflict");
+  ok("the conflict names what the site actually publishes", c.note.includes("+12568826555"));
+  ok("and offers them as candidates", c.candidates.length === 2);
+
+  // Absence of evidence is not evidence of a wrong number.
+  eq("site unreachable → unverified, not conflict",
+    phoneVerdict("+12568826555", null).status, "unverified");
+  eq("site publishes no numbers → unverified",
+    phoneVerdict("+12568826555", new Set()).status, "unverified");
+  eq("no phone on the lead → no-phone",
+    phoneVerdict(null, site).status, "no-phone");
+
+  eq("a conflicted number is capped below a checked one", phoneCeiling("conflict"), 30);
+  eq("confirmed does not cap", phoneCeiling("confirmed"), 100);
+  eq("unverified does not cap — only a contradiction does", phoneCeiling("unverified"), 100);
 }
 
 console.log("\nverificationVerdict — the fabrication gate");

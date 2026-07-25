@@ -357,6 +357,87 @@ export function scoreCeiling(verdict: Verdict): number {
   return verdict === "failed" ? 0 : verdict === "unconfirmed" ? 20 : 100;
 }
 
+// ── Is the PHONE right? ──────────────────────────────────────────────────────
+// The last unverified field, and the one that actually gets dialled. The DNS
+// gate proves a website exists; nothing proved the number belonged to it — and
+// the same practice came back with two different numbers on different runs.
+//
+// The check is free: the site probe already fetches the page, so we read the
+// number off the business's own site and compare. No model, no extra request.
+
+export type PhoneStatus =
+  | "confirmed"   // the number appears on the business's own site
+  | "conflict"    // the site lists phone numbers, and ours is not among them
+  | "unverified"  // site unreachable, or no number published on it
+  | "no-phone";   // the lead has no number to check
+
+/**
+ * Pull phone numbers out of a page.
+ *
+ * `tel:` links are the reliable source — a visible number can be split across
+ * markup, and page text is full of numeric noise (prices, addresses, ZIPs,
+ * years) that looks phone-shaped. We take tel: hrefs first, then fall back to
+ * NANP-shaped runs in the text with the tags stripped so "…</b>555</span>…"
+ * doesn't fuse into a false match.
+ */
+export function extractPhones(html: string): Set<string> {
+  const out = new Set<string>();
+  const add = (raw: string) => {
+    const d = raw.replace(/[^\d]/g, "");
+    const ten = d.length === 11 && d.startsWith("1") ? d.slice(1) : d;
+    if (ten.length === 10) out.add(ten);
+  };
+  for (const m of html.matchAll(/href\s*=\s*["']tel:([^"']{7,25})["']/gi)) add(m[1]);
+  // Replace tags with a space so adjacent elements never merge into a number.
+  const text = html.replace(/<[^>]*>/g, " ");
+  for (const m of text.matchAll(/(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}/g)) add(m[0]);
+  return out;
+}
+
+/** Compare the lead's number against what its own website publishes. */
+export function phoneVerdict(
+  leadPhone: string | null,
+  sitePhones: Set<string> | null,
+): { status: PhoneStatus; note: string; candidates: string[] } {
+  if (!leadPhone) return { status: "no-phone", note: "No phone on the lead.", candidates: [] };
+
+  const d = leadPhone.replace(/[^\d]/g, "");
+  const ten = d.length === 11 && d.startsWith("1") ? d.slice(1) : d;
+
+  if (!sitePhones || sitePhones.size === 0) {
+    return {
+      status: "unverified",
+      note: "Could not read a phone number off the business's own site, so this number is unconfirmed.",
+      candidates: [],
+    };
+  }
+  if (sitePhones.has(ten)) {
+    return { status: "confirmed", note: "This number appears on the business's own website.", candidates: [] };
+  }
+  // The site publishes numbers and ours is not one of them. That is the exact
+  // failure this was built for: a plausible number on a real business.
+  const candidates = [...sitePhones].slice(0, 4);
+  return {
+    status: "conflict",
+    note:
+      `This number does NOT appear on the business's own site, which publishes ` +
+      `${candidates.map((c) => `+1${c}`).join(", ")}. Verify before dialling.`,
+    candidates,
+  };
+}
+
+/**
+ * Score ceiling for a conflicted number.
+ *
+ * Deliberately not an auto-correct: a site's number can legitimately differ
+ * from the one we hold (a tracking line, a department, a second location), so
+ * the site's numbers are recorded as candidates and a human decides. But a
+ * conflicted lead must never outrank one whose number checks out.
+ */
+export function phoneCeiling(status: PhoneStatus): number {
+  return status === "conflict" ? 30 : 100;
+}
+
 // ── Second pass: fill the gaps on ONE known business ─────────────────────────
 // The first pass optimises for breadth and routinely returns NONE for phone,
 // website, or the decision-maker. Re-asking about a single named business —
