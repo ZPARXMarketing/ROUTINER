@@ -118,20 +118,48 @@ select cron.schedule(
 An empty body (`{}`) means "all enabled targets." A per-target cadence is just
 another cron row with `{"targetId":"<uuid>"}` in the body.
 
-### B) A Routiner routine (keeps scheduling on the Board/Calendar)
+### B) A Routiner routine on an **`openrouter`-kind account** (also zero Claude)
 
-Add a scheduled routine whose prompt is a thin "call the engine, then stop" —
-minimal Claude, no lead reasoning:
+This keeps the run on the Calendar and in History **without putting Claude in
+the path**. An account whose `kind` is `openrouter` (the *Lead Finder* account)
+doesn't run a model to orchestrate anything — `routiner-scheduler` reads the
+routine's config and POSTs the engine directly. The only model spend is
+Perplexity, inside the engine.
 
+The routine's **`prompt` is JSON, not English**:
+
+```json
+{ "targetId": "<uuid from lead_enrichment_targets>",
+  "model": "perplexity/sonar-pro",
+  "toCommand": true, "toAbstrax": false, "deepenLimit": 12 }
 ```
-Trigger the lead-enrichment engine and report the result. Run exactly:
-  curl -s https://vonfdzttupyemtomsojy.supabase.co/functions/v1/lead-enrichment \
-    -H 'content-type: application/json' -d '{}'
-Then post the returned JSON to routiner-admin as a report. Do nothing else.
-```
 
-Set `recurrence` (e.g. `weekly`) and schedule it like any other routine. The
-engine still does all the work; the routine just kicks it and logs it.
+`targetId` is the preferred form — niche, location, titles and count stay in one
+editable row, and the engine stamps `last_run_at` / `last_result` back onto it.
+An inline `{ "niche": …, "location": …, "count": … }` works too. Optional
+`deepen: false` turns off the automatic second pass; `deepenModel` overrides it.
+
+Set `recurrence` (e.g. `weekly`) and schedule it like any other routine.
+
+> A **Claude** account can also run it (its prompt would be a shell `curl`), but
+> there is no reason to: it costs a Claude session to do what the scheduler
+> already does natively. Use `openrouter`-kind unless you specifically want a
+> model reading the results and writing commentary.
+
+### C) The drain job (recommended alongside A or B)
+
+The second pass is bounded by the invocation's wall clock, so a large run can
+leave a few leads un-deepened. One cron closes that hole for good — it costs
+nothing when the queue is empty (one indexed read, no model call):
+
+```sql
+select cron.schedule('leads-deepen-drain', '*/15 * * * *', $$
+  select net.http_post(
+    url     := 'https://vonfdzttupyemtomsojy.functions.supabase.co/lead-enrichment',
+    headers := jsonb_build_object('Content-Type','application/json'),
+    body    := '{"mode":"deepen","limit":12,"report":false}'::jsonb);
+$$);
+```
 
 > Either way, every run logs OpenRouter spend to `routiner_openrouter_usage`
 > (visible in `usage.html` / `scripts/usage-meter.mjs`) and posts a recap to the
