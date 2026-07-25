@@ -348,6 +348,44 @@ state is now dropped and counted as `offArea`. A lead with *no* address is never
 dropped — `parseLeads` back-fills the target city, so "unknown" must not be read
 as "wrong".
 
+## Pick niches by decision-maker rate, not by market size
+
+The single field that decides a lead's fate is the decision-maker: in the first
+26 leads, every lead that arrived with a named owner got **imported** and nearly
+every one without got **rejected**. That rate is not a property of the engine —
+it is a property of the **niche**, and it varies enormously.
+
+Sixteen niches measured in Huntsville, `count:8`, same day, same model:
+
+| Niche | parsed | with a decision-maker |
+|---|---|---|
+| dental practices | 8 | **8/8** |
+| veterinary clinics & animal hospitals | 8 | **7/7** |
+| physical therapy clinics | 8 | **6/6** |
+| pediatric dental | 6 | **5/5** |
+| dermatology clinics | 6 | **4/4** |
+| plastic / cosmetic surgery | 3 | 3/3 |
+| acupuncture & holistic medicine | 5 | 4/4 |
+| podiatry practices | 8 | 6/8 |
+| audiology & hearing aid | 5 | 4/5 |
+| oral surgery & periodontics | 8 | 5/8 |
+| orthopedic & sports medicine | 8 | 3/4 |
+| orthodontic practices | 4 | 2/4 |
+| **counseling & mental health** | 8 | **1/8** |
+| **optometry & eye care** | 4 | **0/4** |
+| **medical weight loss** | 7 | **0/6** |
+
+The pattern is consistent and worth internalising: **a practice led by a named,
+licensed practitioner has a findable owner** — dentists, vets, DPTs,
+dermatologists, surgeons all publish who they are, because the practitioner *is*
+the marketing. Categories that are chain-heavy, franchised, or
+privacy-oriented (optometry, weight-loss, mental health) do not, no matter how
+many businesses exist.
+
+So when the Review tab shows leads without a decision-maker, the fix is usually
+to **change niche**, not to push the engine harder. The second pass will rescue
+some of them, but starting at 8/8 beats rescuing 0/6.
+
 ## Auditing a target before you arm it
 
 `scripts/audit-leads.mjs` dry-runs a target (inserts nothing, safe against
