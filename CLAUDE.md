@@ -447,7 +447,7 @@ triggers runs it truly in parallel.
 - `index.html`, `css/tokens.css` (vendored ZPARX tokens), `css/app.css`,
   `js/app.js` (single-page UI, ES module).
 - **Shell:** one top rail (`.topbar`) carries the brand, the nav tabs and the
-  actions (clock · budget chip · New routine · account menu); the body below it
+  actions (clock · budget chip · a **+** for a new routine · account menu); the body below it
   is the only scrolling region. The rail stays a single row down to 1140px —
   shedding the clock, then the budget chip, then tightening the tabs as space
   runs out — so an iPad in landscape still gets one row; below that the nav wraps
@@ -455,7 +455,8 @@ triggers runs it truly in parallel.
   at 20 widths from 1920 to 360; only phone widths scroll the nav, and a fade on
   its trailing edge says so.
 - **The tab order leads with the work.** `Chat` (the `history` view — the runs
-  and their transcripts) sits first and carries no count badge; then Calendar,
+  and their transcripts) sits first, is what the app opens on, and carries no
+  count badge; then Calendar,
   Board, Scheduled, Library, Archived. The separate model-testing Chat view is
   gone. The view id stays `history` throughout the code — only the label reads
   "Chat".
@@ -471,16 +472,43 @@ triggers runs it truly in parallel.
   projected spend from the scheduled queue), the Settings **accounts & triggers**
   manager, and the create/edit **drawer**. The Library holds every non-archived
   routine — scheduling doesn't remove it, only archiving takes one off the air.
-- **The shell is exactly one viewport tall, and nothing in that chain may use a
-  percentage height.** `.app` → `.content--flush` → `#view` → `.hx` is flex the
-  whole way with `min-height: 0` at every link. It used to give the pane
-  `height: 100%`; iPadOS Safari resolves that against a flex-derived parent
-  unreliably, and when it failed the panes grew past the viewport, the
-  `overflow: hidden` clipped them, and **nothing scrolled at all** — the run list
-  and transcript were both frozen. `trackAppHeight()` also measures
-  `visualViewport.height` into `--app-h` (dvh stays the fallback), which fixes
-  the same symptom from the other direction and keeps the reply box above the
-  on-screen keyboard.
+- **The shell is exactly one viewport tall, and the Chat pane got stuck twice
+  getting there.** Symptom both times, iPadOS only: the run list and transcript
+  would not scroll, content just ran off the bottom of the window. Cause both
+  times: a link in the height chain that Safari would not resolve, leaving the
+  columns unbounded so no scroll container existed, while the `overflow: hidden`
+  above them hid the evidence.
+  - *First:* the pane took a percentage height (`#view { height: 100% }`)
+    against a flex-derived parent.
+  - *Then:* `.hx` was a **grid** whose implicit row is `auto` — stretching an
+    auto row to a definite container height is a step Safari fumbles, so the row
+    sized to its content instead.
+  So today: `.content--flush` is `position: relative`, `#view` is
+  `position: absolute; inset: 0` (a definite box that needs no ancestor height
+  to resolve), and `.hx` is a **flex row** — never grid — with `min-height: 0`
+  and `overflow: hidden` on both columns. `trackAppHeight()` measures
+  `visualViewport.height` into `--app-h` (dvh stays the fallback), which also
+  keeps the reply box above the on-screen keyboard.
+- **Two smaller things made the pane *feel* broken even once it worked.** Both
+  are worth not reintroducing:
+  - The scroll columns had `overscroll-behavior: contain`. When a column has
+    nothing to scroll — most `[Leads]` recaps are four lines — `contain`
+    swallows the gesture entirely, so there was no scroll *and* no rubber-band,
+    which reads as frozen. Nothing outside these columns scrolls, so containment
+    bought nothing; it's gone.
+  - The vendored token scale defines `--sp-1..4, 6, 8, 12, 16, 24` but **no
+    `--sp-5`**. A bare `var(--sp-5)` makes the whole declaration invalid and the
+    padding computes to `0`, silently — which is why the transcript, its header
+    and the composer all sat flush against their edges. Always write
+    `var(--sp-5, 20px)`; `.card` and `.cfg-sep` already did.
+- **`fitHistoryPane()` is the belt to that braces.** After every render and on
+  every resize it measures the space between `.hx`'s top edge and the bottom of
+  the visual viewport, and pins the pane there in pixels if the laid-out height
+  disagrees by more than 1px. Measured space is engine-independent, so the pane
+  is scrollable even if some future engine mis-resolves the CSS. It writes
+  nothing when the CSS is working (asserted in the tests, so it can't quietly
+  become load-bearing). If you touch this layout, run `round4` — it sabotages
+  the chain on purpose and checks the guard still rescues it.
 - **History is a Claude-Code-shaped workspace, not a list of cards.** A left rail
   (`#hx-rail`) lists every run — searchable, filterable to failures — and the
   right pane (`#hx-main`) holds the selected run's whole exchange *flat against
@@ -493,6 +521,35 @@ triggers runs it truly in parallel.
   `openrouter-agent` function, and Stop/Retry live in the pane header.
   Below 900px the rail becomes an off-canvas panel that slides over the
   transcript — via the **☰ Runs** button, an edge swipe, the scrim or Escape.
+- **Any run row can be replied to.** `isContinuable` is just "has a runId": the
+  `openrouter-agent` continue path seeds a system prompt, uses the row's stored
+  `output` as the assistant turn when there is no transcript, and falls back to
+  the default model when the row carries none — so a lead-enrichment recap or a
+  Claude-trigger report answers as readily as a full agent thread. `isAgentRun`
+  is the stricter test, and it gates **Retry**/**Stop** only: retrying a
+  lead-enrichment row would run the agent loop, not the enrichment engine. The
+  only rows with no composer are the ones synthesised from a routine that never
+  logged a run.
+- **Rail rows can be deleted, two ways, because touch and pointer need
+  different affordances.** On touch: **swipe the row left** to reveal Delete
+  (`wireRowSwipe`), the iOS list gesture. On a pointer: hover reveals a trash,
+  which opens a confirm strip in the row — there is no undo and the row is the
+  only copy of that transcript. The hover trash is hidden under
+  `@media (hover: none)` because iPadOS fakes `:hover` on tap and drops it on
+  the next tap, so it works *exactly once* — which is precisely how it was
+  reported. Both paths call `deleteRun`. Offered on run-backed rows only, and
+  never while one is running (stop it first; deleting mid-write just orphans the
+  agent's checkpoints). Rail rows are `div[role=button]`, not `<button>`, so
+  they can hold those controls — buttons cannot nest.
+  Two gesture details that matter: `touch-action: pan-y` on the row keeps
+  vertical scrolling native while the horizontal axis is ours, and
+  `wireRailSwipe` (the mobile rail's open/close swipe) bails when a gesture
+  starts on a row, so the two never fight. The rail still closes via ☰, the
+  scrim, Escape, or a swipe starting on its header.
+- **Run now on an agent instance lands in Chat** (`openRunInChat`) with the new
+  run selected and the reply box focused, rather than leaving the reader to go
+  find it. Claude-trigger fires create no row at fire time — the session reports
+  back later — so there is nothing to jump to there.
 - **A History row answers "where did this get to, and how long did it take."**
   The snippet is `lastWorkText` — the transcript read backwards to the last thing
   actually said or the last tool reached for, not the run's opening summary — so

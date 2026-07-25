@@ -35,7 +35,6 @@ a { color: var(--periwinkle); }
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior-y: contain;
   padding:
     var(--sp-6)
     max(var(--sp-8), env(safe-area-inset-right))
@@ -50,8 +49,8 @@ a { color: var(--periwinkle); }
    flex-derived parent height unreliably, and when it failed the panes grew past
    the viewport, the overflow:hidden here clipped them, and nothing scrolled at
    all. Never reintroduce a percentage height in this chain. */
-.content--flush { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
-.content--flush > #view { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.content--flush { padding: 0; overflow: hidden; position: relative; }
+.content--flush > #view { position: absolute; inset: 0; display: flex; flex-direction: column; }
 
 @media (min-width: 900px) {
   .content { padding-left: var(--sp-8); padding-right: max(var(--sp-12), env(safe-area-inset-right)); }
@@ -193,8 +192,6 @@ a { color: var(--periwinkle); }
 .acctmenu__item:hover { background: rgba(255,255,255,0.05); color: var(--text-hi); }
 .acctmenu__item--danger:hover { color: var(--danger); }
 
-.btn__narrow { display: none; }
-
 .clock {
   font-family: var(--font-mono);
   font-size: 13px;
@@ -236,6 +233,17 @@ a { color: var(--periwinkle); }
 .btn--ghost { background: transparent; color: var(--text-mid); border-color: var(--hairline); }
 .btn--ghost:hover { color: var(--text-hi); border-color: var(--grey-700); }
 .btn--sm { padding: var(--sp-2) var(--sp-3); font-size: 12px; font-weight: 600; }
+/* Icon-only primary action: a plus, like the Claude app's new-chat button. */
+.btn--icon {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1;
+}
 
 /* ── Master fire switch (top bar) ──────────────── */
 .fire-switch {
@@ -485,7 +493,7 @@ a { color: var(--periwinkle); }
   line-height: 1;
 }
 .drawer__close:hover { color: var(--text-hi); }
-.drawer__body { padding: var(--sp-6); overflow: auto; flex: 1; display: flex; flex-direction: column; gap: var(--sp-5); }
+.drawer__body { padding: var(--sp-6); overflow: auto; flex: 1; display: flex; flex-direction: column; gap: var(--sp-5, 20px); }
 .drawer__foot {
   padding: var(--sp-4) var(--sp-6);
   border-top: 1px solid var(--hairline);
@@ -556,7 +564,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   border: 1px solid var(--hairline);
   border-left: 3px solid var(--lime);
   border-radius: var(--r-md);
-  padding: var(--sp-3) var(--sp-5);
+  padding: var(--sp-3) var(--sp-5, 20px);
   box-shadow: var(--shadow-md);
   font-size: 14px;
   max-width: 90vw;
@@ -602,17 +610,20 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
    ══════════════════════════════════════════════════ */
 .hx {
   position: relative;
-  display: grid;
-  grid-template-columns: 304px minmax(0, 1fr);
-  flex: 1 1 auto;   /* sized by the flex chain above — not a percentage height */
+  display: flex;          /* NOT grid — see the note above .content--flush */
+  align-items: stretch;
+  flex: 1 1 auto;
   min-height: 0;
+  overflow: hidden;
 }
 /* ── Left rail: the run list ── */
 .hx__rail {
   display: flex;
   flex-direction: column;
+  flex: 0 0 304px;
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
   border-right: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(7,10,20,0.35));
 }
@@ -637,7 +648,6 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior: contain;
   padding: var(--sp-2);
   padding-left: max(var(--sp-2), env(safe-area-inset-left));
   padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom));
@@ -650,16 +660,18 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .hx__main {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
   background: var(--bg-base);
 }
 .hx__head {
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-5);
-  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+  padding: var(--sp-3) var(--sp-5, 20px);
+  padding-right: max(var(--sp-5, 20px), env(safe-area-inset-right));
   border-bottom: 1px solid var(--hairline);
   flex: 0 0 auto;
   min-height: 0;
@@ -667,13 +679,22 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .hx__title { font-family: var(--font-display); font-weight: 800; font-size: 16px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hx__time { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); white-space: nowrap; }
 .hx__head-actions { display: flex; gap: var(--sp-2); flex: 0 0 auto; }
+/* Heads up: the vendored token scale has no `--sp-5`, so a bare var(--sp-5)
+   makes the whole declaration invalid and the padding silently computes to 0.
+   That is why this pane's content sat flush against the header and the left
+   edge for so long. Always write var(--sp-5, 20px) — the rest of the sheet
+   already does. */
+/* No overscroll containment anywhere in this pane. `contain` swallows the
+   gesture when a column has nothing to scroll — which is most [Leads] recaps,
+   they're four lines long — so the pane felt dead rather than bottoming out
+   with the usual rubber-band. Nothing outside these columns scrolls, so
+   containment bought nothing and cost the bounce. */
 .hx__thread {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: var(--sp-6) var(--sp-5);
-  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+  padding: var(--sp-8) var(--sp-5, 20px) var(--sp-6);
+  padding-right: max(var(--sp-5, 20px), env(safe-area-inset-right));
 }
 .hx__thread-inner { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-3); }
 .hx__thread .chatmsg { max-width: 88%; }
@@ -684,8 +705,8 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   flex: 0 0 auto;
   border-top: 1px solid var(--hairline);
   background: linear-gradient(180deg, rgba(20,27,46,0.35), var(--bg-base));
-  padding: var(--sp-3) var(--sp-5) calc(var(--sp-3) + env(safe-area-inset-bottom));
-  padding-right: max(var(--sp-5), env(safe-area-inset-right));
+  padding: var(--sp-3) var(--sp-5, 20px) calc(var(--sp-3) + env(safe-area-inset-bottom));
+  padding-right: max(var(--sp-5, 20px), env(safe-area-inset-right));
 }
 .hx__compose-inner { max-width: 860px; margin: 0 auto; display: flex; gap: var(--sp-2); align-items: flex-end; }
 .hx__compose .chat__input {
@@ -709,8 +730,11 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 
 /* ── A run in the rail ── */
 .hxrow {
+  position: relative;
   display: block;
   width: 100%;
+  overflow: hidden;        /* the Delete panel hides behind the row */
+  touch-action: pan-y;     /* vertical scrolling stays native; we own horizontal */
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
@@ -728,13 +752,80 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .hxrow--stale { border-left-color: var(--yellow); }
 .hxrow--busy { border-left-color: var(--periwinkle); }
 .hxrow:focus-visible { outline: 2px solid var(--periwinkle); outline-offset: 1px; }
+/* The body slides; the Delete panel underneath it does not. */
+.hxrow__body { display: block; position: relative; z-index: 1; transition: transform .18s ease; }
+.hxrow.is-swiped .hxrow__body { transform: translateX(-88px); }
+.hxrow__swipedel {
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: 88px;
+  border: 0;
+  border-radius: 0;
+  background: var(--danger);
+  color: var(--white);
+  font-family: var(--font-body);
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  z-index: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .12s ease;
+}
+.hxrow.is-swiped .hxrow__swipedel { opacity: 1; pointer-events: auto; }
 .hxrow__top { display: flex; align-items: center; gap: var(--sp-2); }
 .hxrow__title {
   font-family: var(--font-display); font-weight: 600; font-size: 13.5px; color: var(--text-hi);
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .hxrow.is-active .hxrow__title { color: var(--lime); }
-.hxrow__time { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-low); white-space: nowrap; }
+.hxrow__time { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-low); white-space: nowrap; transition: opacity .12s ease; }
+/* Delete sits where the timestamp is — the stamp fades out on hover so the row
+   doesn't get busier, and the control is only a pointer away. */
+.hxrow__del {
+  position: absolute;
+  top: var(--sp-2);
+  right: var(--sp-2);
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-low);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease, background .12s ease, color .12s ease;
+}
+.hxrow:hover .hxrow__del, .hxrow__del:focus-visible { opacity: 1; }
+.hxrow:hover .hxrow__time { opacity: 0; }
+.hxrow__del:hover { background: rgba(255,77,94,0.14); color: var(--danger); }
+/* iPadOS fakes :hover on tap and drops it on the next tap, so a hover-revealed
+   trash works exactly once. Touch gets the swipe instead. */
+@media (hover: none) {
+  .hxrow__del { display: none; }
+  .hxrow:hover .hxrow__time { opacity: 1; }
+}
+/* Confirm strip — no undo, so deleting takes two deliberate taps. */
+.hxrow--confirm { background: rgba(255,77,94,0.08); border-color: rgba(255,77,94,0.35); }
+.hxrow__sub--confirm { gap: var(--sp-2); flex-wrap: wrap; }
+.hxrow__ask { color: var(--text-mid); font-weight: 600; }
+.hxrow__cbtn {
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  color: var(--text-mid);
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px var(--sp-2);
+  cursor: pointer;
+}
+.hxrow__cbtn:hover { color: var(--text-hi); border-color: var(--grey-700); }
+.hxrow__cbtn--yes { color: var(--danger); border-color: rgba(255,77,94,0.45); }
+.hxrow__cbtn--yes:hover { background: rgba(255,77,94,0.16); color: var(--danger); }
 .hxrow__sub { display: flex; align-items: center; gap: 6px; margin-top: 3px; font-size: 11.5px; color: var(--text-low); }
 .hxrow__status { font-weight: 700; display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; }
 .hxrow__snip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -944,9 +1035,6 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   }
 }
 @media (max-width: 560px) {
-  .btn__wide { display: none; }
-  .btn__narrow { display: inline; font-size: 18px; line-height: 1; }
-  #newBtn { padding: var(--sp-2) var(--sp-4); }
   .brand--bar .brand__wordmark { display: none; }
 }
 
@@ -956,7 +1044,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   .brand__title { font-size: 18px; }
 
   /* History: single pane, rail slides in over it. */
-  .hx { grid-template-columns: minmax(0, 1fr); }
+  .hx__rail { flex: 0 0 auto; }  /* off-canvas below — see the absolute rule */
   .hx__rail {
     position: absolute;
     top: 0; bottom: 0; left: 0;
@@ -999,7 +1087,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   .hx__head { padding: var(--sp-3) var(--sp-4); gap: var(--sp-2); }
   .hx__title { font-size: 14px; }
   .hx__time { display: none; }
-  .hx__thread { padding: var(--sp-4) var(--sp-4); }
+  .hx__thread { padding: var(--sp-5, 20px) var(--sp-4) var(--sp-4); }
   .hx__compose { padding-left: var(--sp-4); padding-right: var(--sp-4); }
 }
 

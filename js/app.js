@@ -238,7 +238,7 @@ function saveSettings() { localStorage.setItem(LS, JSON.stringify(settings)); }
 let routines = [];
 let runs = [];
 let notes = [];
-let currentView = 'calendar';
+let currentView = 'history';   // Chat — the first tab, and where the app opens
 let session = null;
 
 /* ---------- DOM helpers ---------- */
@@ -496,7 +496,7 @@ async function claimManualFire(routine) {
 const fireInFlight = new Set();
 
 async function fireTrigger(routine) {
-  if (!settings.firing) { toast('Firing is paused on this site (top-right switch). Toggle it live to fire.', 'error'); return; }
+  if (!settings.firing) { toast('Firing is paused on this site — turn it on in Settings → Firing.', 'error'); return; }
   if (routine?.id) {
     if (fireInFlight.has(routine.id)) { toast('Already firing this routine…'); return; }
     fireInFlight.add(routine.id);
@@ -628,10 +628,23 @@ async function fireAgent(routine) {
     } else {
       toast(`Done — ${modelLabel(model)} finished${data.steps ? ` in ${data.steps} step(s)` : ''}${cost ? ` (~$${cost.toFixed(4)})` : ''}. Open it in History to read the full reply or continue.`);
     }
-    try { await loadAll(); render(); } catch { /* non-fatal: the row is saved regardless */ }
+    try { await loadAll(); } catch { /* non-fatal: the row is saved regardless */ }
+    // Land in the thread it just created, with the reply box focused — the run
+    // is a conversation, so put the reader where they can answer it.
+    if (data.runId) openRunInChat(data.runId); else render();
   } catch (e) {
     toast(`Agent request failed: ${e.message}`, 'error');
   }
+}
+
+/* Jump to Chat with one run open and the reply box focused. */
+function openRunInChat(runId) {
+  selectedRunId = 'run-' + runId;
+  confirmDeleteId = null;
+  currentView = 'history';
+  syncTabs();
+  render();
+  setTimeout(() => $('#run-input')?.focus(), 80);
 }
 
 /* ---------- Optional live test (runs the prompt on the chosen model, picking
@@ -1063,10 +1076,18 @@ function friendlyText(raw) {
   if (s.length > 420) s = s.slice(0, 420).replace(/\s+\S*$/, '') + '…';
   return s;
 }
-/* An agent run carries a resumable transcript (or at least a model id), so it can
-   be reopened and continued. Claude-trigger and legacy rows can't — they open
-   read-only. */
-function isContinuable(it) { return !!(it && it.runId && (it.model || (Array.isArray(it.messages) && it.messages.length))); }
+/* Any run row can be replied to. The openrouter-agent function's continue path
+   seeds a system prompt and uses the row's stored `output` as the assistant turn
+   when there's no transcript, and falls back to the default model when the row
+   carries none — so a lead-enrichment recap or a Claude-trigger report is just
+   as answerable as a full agent thread. The only rows that aren't are the ones
+   synthesised from a routine that never logged a run: there is no run to
+   continue. */
+function isContinuable(it) { return !!(it && it.runId); }
+/* Retry and Stop mean "resume this agent's own work", so they stay on rows that
+   actually were an agent run — retrying a lead-enrichment row would run the
+   agent loop, not the enrichment engine, which isn't what the button says. */
+function isAgentRun(it) { return !!(it && it.runId && (it.model || (Array.isArray(it.messages) && it.messages.length))); }
 
 /* ══════════════════════════════════════════════════════════════
    History — a flat two-pane workspace, Claude Code style.
@@ -1078,6 +1099,8 @@ let historyFilter = 'all';   // 'all' | 'failures'
 let historyQuery = '';       // rail search box
 let selectedRunId = null;    // the historyItems id shown in the pane
 let railOpen = false;        // mobile: is the run list slid over the pane?
+let confirmDeleteId = null;  // the row currently asking "delete this run?"
+let swipedRowId = null;      // the row swiped open to reveal Delete (touch)
 let runBusy = false;         // a follow-up is in flight
 const runDrafts = new Map(); // id → unsent reply text, so re-renders never eat it
 
@@ -1193,19 +1216,40 @@ function railRowHtml(it, active) {
   // with how long it ran beside it.
   const startIso = runStartIso(it) || it.time;
   const dur = fmtDur(runElapsedMs(it));
-  const cls = ['hxrow', active ? 'is-active' : '', ok ? '' : 'hxrow--bad', busy ? 'hxrow--busy' : '', stale ? 'hxrow--stale' : '']
-    .filter(Boolean).join(' ');
+  const confirming = confirmDeleteId === it.id;
+  const cls = ['hxrow', active ? 'is-active' : '', ok ? '' : 'hxrow--bad', busy ? 'hxrow--busy' : '', stale ? 'hxrow--stale' : '',
+    confirming ? 'hxrow--confirm' : ''].filter(Boolean).join(' ');
   const tip = [it.title || 'Untitled', startIso ? `started ${fmt(startIso)}` : '', runDurationLabel(it)].filter(Boolean).join(' · ');
-  return `<button type="button" class="${cls}" data-hist="${esc(it.id)}"${active ? ' aria-current="true"' : ''} title="${esc(tip)}">
-    <span class="hxrow__top">
-      <span class="hxrow__title">${esc(it.title || 'Untitled')}</span>
-      <span class="hxrow__time">${esc(fmtShort(startIso))}${dur ? ` · ${esc(dur)}` : ''}</span>
+  // Only run-backed rows can be deleted — a row synthesised from a routine has
+  // no run to remove. A live run has to be stopped first, so it doesn't get one
+  // either (deleting the row mid-write just orphans the agent's checkpoints).
+  const del = (it.runId && !busy)
+    ? `<button type="button" class="hxrow__del" data-del="${esc(it.id)}" title="Delete this run" aria-label="Delete this run">🗑</button>`
+    : '';
+  const swiped = swipedRowId === it.id;
+  const sub = confirming
+    ? `<span class="hxrow__sub hxrow__sub--confirm">
+        <span class="hxrow__ask">Delete this run?</span>
+        <button type="button" class="hxrow__cbtn hxrow__cbtn--yes" data-delyes="${esc(it.id)}">Delete</button>
+        <button type="button" class="hxrow__cbtn" data-delno="1">Cancel</button>
+      </span>`
+    : `<span class="hxrow__sub">
+        <span class="hxrow__status hist__status ${statusClass}">${spin}${esc(statusLabel)}</span>
+        ${snip ? `<span class="hxrow__snip">${esc(snip)}</span>` : ''}
+      </span>`;
+  // A div, not a button: the delete control is a real button and buttons cannot
+  // nest. Keyboard activation is wired by hand below to keep it operable.
+  return `<div class="${cls}${swiped ? ' is-swiped' : ''}" data-hist="${esc(it.id)}" role="button" tabindex="0"${active ? ' aria-current="true"' : ''} title="${esc(tip)}">
+    <span class="hxrow__body">
+      <span class="hxrow__top">
+        <span class="hxrow__title">${esc(it.title || 'Untitled')}</span>
+        <span class="hxrow__time">${esc(fmtShort(startIso))}${dur ? ` · ${esc(dur)}` : ''}</span>
+        ${del}
+      </span>
+      ${sub}
     </span>
-    <span class="hxrow__sub">
-      <span class="hxrow__status hist__status ${statusClass}">${spin}${esc(statusLabel)}</span>
-      ${snip ? `<span class="hxrow__snip">${esc(snip)}</span>` : ''}
-    </span>
-  </button>`;
+    ${del ? `<button type="button" class="hxrow__swipedel" data-swipedel="${esc(it.id)}" tabindex="-1" aria-hidden="${swiped ? 'false' : 'true'}">Delete</button>` : ''}
+  </div>`;
 }
 
 function railListHtml(items) {
@@ -1246,6 +1290,7 @@ function renderHistory() {
   </div>`;
   wireRail();
   wireRunPane(current);
+  fitHistoryPane();
   const thread = $('#hx-thread', view);
   if (thread) thread.scrollTop = thread.scrollHeight;
   ensureHistoryPoll();
@@ -1264,13 +1309,122 @@ function refreshRail() {
 }
 
 function wireRailRows() {
-  $$('#hx-list [data-hist]').forEach((el) => el.addEventListener('click', () => selectRun(el.dataset.hist)));
+  $$('#hx-list [data-hist]').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-del],[data-delyes],[data-delno]')) return; // delete owns those
+      selectRun(el.dataset.hist);
+    });
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectRun(el.dataset.hist); }
+    });
+  });
+  $$('#hx-list [data-del]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    confirmDeleteId = b.dataset.del;
+    refreshRail();
+  }));
+  $$('#hx-list [data-delno]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    confirmDeleteId = null;
+    refreshRail();
+  }));
+  $$('#hx-list [data-delyes]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    deleteRun(b.dataset.delyes);
+  }));
+  $$('#hx-list [data-swipedel]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    deleteRun(b.dataset.swipedel);   // the swipe was the first half of the confirmation
+  }));
+  $$('#hx-list [data-hist]').forEach(wireRowSwipe);
+}
+
+/* Swipe a row left to reveal Delete — the iOS list gesture, and what the Claude
+   app does. This is the touch affordance: the hover trash is useless on iPadOS,
+   where a tap fakes :hover and the next tap takes it away again (which is why
+   deleting worked exactly once). `touch-action: pan-y` on the row keeps vertical
+   scrolling native while we own the horizontal axis. */
+const SWIPE_W = 88;    // how far the row slides, matching the button's width
+function wireRowSwipe(row) {
+  const body = row.querySelector('.hxrow__body');
+  const canDelete = !!row.querySelector('[data-swipedel]');
+  if (!body || !canDelete) return;
+  let x0 = 0, y0 = 0, dx = 0, tracking = false, decided = false;
+
+  const setOffset = (px, animate) => {
+    body.style.transition = animate ? '' : 'none';
+    body.style.transform = px ? `translateX(${px}px)` : '';
+  };
+  row.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    x0 = e.touches[0].clientX; y0 = e.touches[0].clientY;
+    dx = 0; tracking = true; decided = false;
+  }, { passive: true });
+
+  row.addEventListener('touchmove', (e) => {
+    if (!tracking) return;
+    const t = e.touches[0];
+    const mx = t.clientX - x0, my = t.clientY - y0;
+    if (!decided) {
+      if (Math.abs(mx) < 8 && Math.abs(my) < 8) return;
+      // A mostly-vertical drag is a scroll — let the list have it, for good.
+      if (Math.abs(my) > Math.abs(mx)) { tracking = false; return; }
+      decided = true;
+      if (swipedRowId && swipedRowId !== row.dataset.hist) closeSwipedRow();
+    }
+    const open = swipedRowId === row.dataset.hist ? -SWIPE_W : 0;
+    dx = Math.max(-SWIPE_W, Math.min(0, open + mx));
+    setOffset(dx, false);
+  }, { passive: true });
+
+  const end = () => {
+    if (!tracking) return;
+    tracking = false;
+    if (!decided) return;
+    const open = dx < -SWIPE_W / 2;
+    swipedRowId = open ? row.dataset.hist : null;
+    row.classList.toggle('is-swiped', open);
+    const btn = row.querySelector('[data-swipedel]');
+    if (btn) btn.setAttribute('aria-hidden', open ? 'false' : 'true');
+    setOffset(0, true);   // the class carries the open position from here
+  };
+  row.addEventListener('touchend', end, { passive: true });
+  row.addEventListener('touchcancel', end, { passive: true });
+}
+
+function closeSwipedRow() {
+  if (!swipedRowId) return;
+  const el = $(`#hx-list [data-hist="${CSS.escape(swipedRowId)}"]`);
+  if (el) {
+    el.classList.remove('is-swiped');
+    const body = el.querySelector('.hxrow__body');
+    if (body) { body.style.transition = ''; body.style.transform = ''; }
+  }
+  swipedRowId = null;
+}
+
+/* Delete one run for good. Two taps (trash → Delete) because there is no undo:
+   the row is the only copy of that transcript. */
+async function deleteRun(id) {
+  const it = historyItems().find((x) => x.id === id);
+  if (!it || !it.runId) return;
+  const { error } = await sb.from('routiner_runs').delete().eq('id', it.runId);
+  if (error) { toast('Delete failed: ' + error.message, 'error'); return; }
+  runs = runs.filter((r) => r.id !== it.runId);
+  runDrafts.delete(id);
+  confirmDeleteId = null;
+  swipedRowId = null;
+  if (selectedRunId === id) selectedRunId = null;   // fall back to the newest
+  toast('Run deleted.');
+  paintCounts();
+  renderHistory();
 }
 
 function wireRail() {
   wireRailRows();
   $$('#hx [data-histf]').forEach((b) => b.addEventListener('click', () => {
     historyFilter = b.dataset.histf;
+    confirmDeleteId = null;
     selectedRunId = null;            // fall back to the newest run in the new filter
     renderHistory();
   }));
@@ -1278,6 +1432,31 @@ function wireRail() {
   if (search) search.addEventListener('input', () => { historyQuery = search.value; refreshRail(); });
   $('#hx-scrim')?.addEventListener('click', () => setRail(false));
   wireRailSwipe();
+}
+
+/* Last-resort safety net for the pane's height.
+   The CSS chain is deliberately boring — fixed-height shell, absolutely
+   positioned #view, flex rows with min-height:0 — but this pane has now been
+   stuck twice on iPadOS, and a workspace you cannot scroll is useless. So after
+   every render we measure: from .hx's top edge, how much room is there before
+   the bottom of the *visual viewport*? If the laid-out height disagrees by more
+   than a pixel, pin it there in px. Measured space is engine-independent truth,
+   so this is correct even if some ancestor's height never resolved. When the
+   CSS works — every browser tested — the numbers already agree and nothing is
+   written. */
+function fitHistoryPane() {
+  const hx = $('#hx'); if (!hx) return;
+  const box = hx.getBoundingClientRect();
+  const vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight || 0;
+  const avail = Math.round(vh - box.top);
+  if (avail < 120) return;                       // nonsense measurement — leave it alone
+  hx.style.height = Math.abs(Math.round(box.height) - avail) > 1 ? `${avail}px` : '';
+  // Columns follow the pane; only pinned if they somehow outgrew it.
+  const h = Math.round(hx.getBoundingClientRect().height);
+  ['#hx-rail', '#hx-main'].forEach((sel) => {
+    const el = $(sel); if (!el) return;
+    el.style.height = Math.round(el.getBoundingClientRect().height) - h > 1 ? `${h}px` : '';
+  });
 }
 
 /* Mobile: the run list slides over the transcript. */
@@ -1295,6 +1474,10 @@ function wireRailSwipe() {
   hx.addEventListener('touchstart', (e) => {
     const t = e.touches[0];
     x0 = t.clientX; y0 = t.clientY;
+    // A gesture that starts on a run row belongs to that row (swipe-to-delete),
+    // never to the rail. The rail still closes via ☰, the scrim, Escape, or a
+    // swipe starting on its header.
+    if (e.target.closest('.hxrow')) { armed = false; return; }
     armed = railOpen || (t.clientX - hx.getBoundingClientRect().left) < 28;
   }, { passive: true });
   hx.addEventListener('touchend', (e) => {
@@ -1307,6 +1490,8 @@ function wireRailSwipe() {
 }
 
 function selectRun(id) {
+  // A tap while a row is swiped open just puts it away — same as iOS lists.
+  if (swipedRowId) { closeSwipedRow(); return; }
   const it = historyItems().find((x) => x.id === id);
   if (!it) return;
   selectedRunId = id;
@@ -1386,8 +1571,9 @@ function runPaneHtml(it) {
   const busy = isRunBusy(it);
   const stale = isRunStale(it);
   // Retry: error/cancelled + stale "running" rows — same continue path, fixed prompt.
-  const showRetry = can && !runBusy && (it.status === 'error' || it.status === 'cancelled' || stale);
-  const showStop = can && !runBusy && (busy || stale || it.status === 'running');
+  const agent = isAgentRun(it);
+  const showRetry = agent && !runBusy && (it.status === 'error' || it.status === 'cancelled' || stale);
+  const showStop = agent && !runBusy && (busy || stale || it.status === 'running');
   const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status || 'ran');
   const chipStatus = stale ? 'missed' : (it.status === 'cancelled' ? 'archived' : (it.status || 'ran')); // archived chip = muted "stopped"
   const spin = (busy || runBusy) ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
@@ -1400,7 +1586,7 @@ function runPaneHtml(it) {
           <button class="btn btn--primary" id="run-send" ${runBusy ? 'disabled' : ''}>Send</button>
         </div>
       </div>`
-    : `<div class="hx__compose"><div class="hx__note">This run isn't an interactive model chat, so it can't be continued here — it's shown for the record.</div></div>`;
+    : `<div class="hx__compose"><div class="hx__note">This entry is a routine whose run was never logged, so there's no conversation to continue.</div></div>`;
   return `<div class="hx__head">
       <button type="button" class="hx__railbtn" id="hx-railbtn" aria-label="Show the run list">☰ Runs</button>
       <span class="chip chip--${esc(chipStatus)}">${spin}${esc(statusLabel)}</span>
@@ -1465,6 +1651,7 @@ function refreshHistory() {
   });
   refreshRail();
   renderRunPane(current);
+  fitHistoryPane();
 }
 
 async function stopRun(it) {
@@ -2562,6 +2749,7 @@ function trackAppHeight() {
     const zoomed = vv && Math.abs((vv.scale || 1) - 1) > 0.02;
     const h = (!zoomed && vv && vv.height) || window.innerHeight || 0;
     if (h > 240) document.documentElement.style.setProperty('--app-h', `${Math.round(h)}px`);
+    fitHistoryPane();   // the pane is sized from the viewport too
   };
   apply();
   window.addEventListener('resize', apply);

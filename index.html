@@ -31,8 +31,8 @@
       </div>
 
       <nav class="tabs" id="tabs">
-        <button class="tab" data-view="history">Chat</button>
-        <button class="tab is-active" data-view="calendar">Calendar</button>
+        <button class="tab is-active" data-view="history">Chat</button>
+        <button class="tab" data-view="calendar">Calendar</button>
         <button class="tab" data-view="board">Board <span class="tab__count" data-count="board">0</span></button>
         <button class="tab" data-view="scheduled">Scheduled <span class="tab__count" data-count="scheduled">0</span></button>
         <button class="tab" data-view="library">Library <span class="tab__count" data-count="library">0</span></button>
@@ -42,9 +42,7 @@
       <div class="topbar__actions">
         <span class="clock clock--time" id="clock">—</span>
         <button class="clock budget-chip" id="budgetChip" title="Projected spend from everything scheduled — click for the breakdown" style="display:none">—</button>
-        <button class="btn btn--primary" id="newBtn" title="New routine">
-          <span class="btn__wide">New routine</span><span class="btn__narrow" aria-hidden="true">+</span>
-        </button>
+        <button class="btn btn--primary btn--icon" id="newBtn" title="New routine" aria-label="New routine">+</button>
         <div class="acctmenu" id="acctMenu">
           <button class="acctmenu__btn" id="userChip" title="Account" aria-haspopup="true" aria-expanded="false"></button>
           <div class="acctmenu__pop" id="acctPop" role="menu">
