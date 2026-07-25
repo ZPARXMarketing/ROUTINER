@@ -733,6 +733,8 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   position: relative;
   display: block;
   width: 100%;
+  overflow: hidden;        /* the Delete panel hides behind the row */
+  touch-action: pan-y;     /* vertical scrolling stays native; we own horizontal */
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
@@ -750,6 +752,27 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .hxrow--stale { border-left-color: var(--yellow); }
 .hxrow--busy { border-left-color: var(--periwinkle); }
 .hxrow:focus-visible { outline: 2px solid var(--periwinkle); outline-offset: 1px; }
+/* The body slides; the Delete panel underneath it does not. */
+.hxrow__body { display: block; position: relative; z-index: 1; transition: transform .18s ease; }
+.hxrow.is-swiped .hxrow__body { transform: translateX(-88px); }
+.hxrow__swipedel {
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: 88px;
+  border: 0;
+  border-radius: 0;
+  background: var(--danger);
+  color: var(--white);
+  font-family: var(--font-body);
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  z-index: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .12s ease;
+}
+.hxrow.is-swiped .hxrow__swipedel { opacity: 1; pointer-events: auto; }
 .hxrow__top { display: flex; align-items: center; gap: var(--sp-2); }
 .hxrow__title {
   font-family: var(--font-display); font-weight: 600; font-size: 13.5px; color: var(--text-hi);
@@ -779,7 +802,12 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .hxrow:hover .hxrow__del, .hxrow__del:focus-visible { opacity: 1; }
 .hxrow:hover .hxrow__time { opacity: 0; }
 .hxrow__del:hover { background: rgba(255,77,94,0.14); color: var(--danger); }
-@media (hover: none) { .hxrow__del { opacity: 0.55; } .hxrow:hover .hxrow__time { opacity: 1; } }
+/* iPadOS fakes :hover on tap and drops it on the next tap, so a hover-revealed
+   trash works exactly once. Touch gets the swipe instead. */
+@media (hover: none) {
+  .hxrow__del { display: none; }
+  .hxrow:hover .hxrow__time { opacity: 1; }
+}
 /* Confirm strip — no undo, so deleting takes two deliberate taps. */
 .hxrow--confirm { background: rgba(255,77,94,0.08); border-color: rgba(255,77,94,0.35); }
 .hxrow__sub--confirm { gap: var(--sp-2); flex-wrap: wrap; }

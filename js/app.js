@@ -1100,6 +1100,7 @@ let historyQuery = '';       // rail search box
 let selectedRunId = null;    // the historyItems id shown in the pane
 let railOpen = false;        // mobile: is the run list slid over the pane?
 let confirmDeleteId = null;  // the row currently asking "delete this run?"
+let swipedRowId = null;      // the row swiped open to reveal Delete (touch)
 let runBusy = false;         // a follow-up is in flight
 const runDrafts = new Map(); // id → unsent reply text, so re-renders never eat it
 
@@ -1225,6 +1226,7 @@ function railRowHtml(it, active) {
   const del = (it.runId && !busy)
     ? `<button type="button" class="hxrow__del" data-del="${esc(it.id)}" title="Delete this run" aria-label="Delete this run">🗑</button>`
     : '';
+  const swiped = swipedRowId === it.id;
   const sub = confirming
     ? `<span class="hxrow__sub hxrow__sub--confirm">
         <span class="hxrow__ask">Delete this run?</span>
@@ -1237,13 +1239,16 @@ function railRowHtml(it, active) {
       </span>`;
   // A div, not a button: the delete control is a real button and buttons cannot
   // nest. Keyboard activation is wired by hand below to keep it operable.
-  return `<div class="${cls}" data-hist="${esc(it.id)}" role="button" tabindex="0"${active ? ' aria-current="true"' : ''} title="${esc(tip)}">
-    <span class="hxrow__top">
-      <span class="hxrow__title">${esc(it.title || 'Untitled')}</span>
-      <span class="hxrow__time">${esc(fmtShort(startIso))}${dur ? ` · ${esc(dur)}` : ''}</span>
-      ${del}
+  return `<div class="${cls}${swiped ? ' is-swiped' : ''}" data-hist="${esc(it.id)}" role="button" tabindex="0"${active ? ' aria-current="true"' : ''} title="${esc(tip)}">
+    <span class="hxrow__body">
+      <span class="hxrow__top">
+        <span class="hxrow__title">${esc(it.title || 'Untitled')}</span>
+        <span class="hxrow__time">${esc(fmtShort(startIso))}${dur ? ` · ${esc(dur)}` : ''}</span>
+        ${del}
+      </span>
+      ${sub}
     </span>
-    ${sub}
+    ${del ? `<button type="button" class="hxrow__swipedel" data-swipedel="${esc(it.id)}" tabindex="-1" aria-hidden="${swiped ? 'false' : 'true'}">Delete</button>` : ''}
   </div>`;
 }
 
@@ -1327,6 +1332,75 @@ function wireRailRows() {
     e.stopPropagation();
     deleteRun(b.dataset.delyes);
   }));
+  $$('#hx-list [data-swipedel]').forEach((b) => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    deleteRun(b.dataset.swipedel);   // the swipe was the first half of the confirmation
+  }));
+  $$('#hx-list [data-hist]').forEach(wireRowSwipe);
+}
+
+/* Swipe a row left to reveal Delete — the iOS list gesture, and what the Claude
+   app does. This is the touch affordance: the hover trash is useless on iPadOS,
+   where a tap fakes :hover and the next tap takes it away again (which is why
+   deleting worked exactly once). `touch-action: pan-y` on the row keeps vertical
+   scrolling native while we own the horizontal axis. */
+const SWIPE_W = 88;    // how far the row slides, matching the button's width
+function wireRowSwipe(row) {
+  const body = row.querySelector('.hxrow__body');
+  const canDelete = !!row.querySelector('[data-swipedel]');
+  if (!body || !canDelete) return;
+  let x0 = 0, y0 = 0, dx = 0, tracking = false, decided = false;
+
+  const setOffset = (px, animate) => {
+    body.style.transition = animate ? '' : 'none';
+    body.style.transform = px ? `translateX(${px}px)` : '';
+  };
+  row.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    x0 = e.touches[0].clientX; y0 = e.touches[0].clientY;
+    dx = 0; tracking = true; decided = false;
+  }, { passive: true });
+
+  row.addEventListener('touchmove', (e) => {
+    if (!tracking) return;
+    const t = e.touches[0];
+    const mx = t.clientX - x0, my = t.clientY - y0;
+    if (!decided) {
+      if (Math.abs(mx) < 8 && Math.abs(my) < 8) return;
+      // A mostly-vertical drag is a scroll — let the list have it, for good.
+      if (Math.abs(my) > Math.abs(mx)) { tracking = false; return; }
+      decided = true;
+      if (swipedRowId && swipedRowId !== row.dataset.hist) closeSwipedRow();
+    }
+    const open = swipedRowId === row.dataset.hist ? -SWIPE_W : 0;
+    dx = Math.max(-SWIPE_W, Math.min(0, open + mx));
+    setOffset(dx, false);
+  }, { passive: true });
+
+  const end = () => {
+    if (!tracking) return;
+    tracking = false;
+    if (!decided) return;
+    const open = dx < -SWIPE_W / 2;
+    swipedRowId = open ? row.dataset.hist : null;
+    row.classList.toggle('is-swiped', open);
+    const btn = row.querySelector('[data-swipedel]');
+    if (btn) btn.setAttribute('aria-hidden', open ? 'false' : 'true');
+    setOffset(0, true);   // the class carries the open position from here
+  };
+  row.addEventListener('touchend', end, { passive: true });
+  row.addEventListener('touchcancel', end, { passive: true });
+}
+
+function closeSwipedRow() {
+  if (!swipedRowId) return;
+  const el = $(`#hx-list [data-hist="${CSS.escape(swipedRowId)}"]`);
+  if (el) {
+    el.classList.remove('is-swiped');
+    const body = el.querySelector('.hxrow__body');
+    if (body) { body.style.transition = ''; body.style.transform = ''; }
+  }
+  swipedRowId = null;
 }
 
 /* Delete one run for good. Two taps (trash → Delete) because there is no undo:
@@ -1339,6 +1413,7 @@ async function deleteRun(id) {
   runs = runs.filter((r) => r.id !== it.runId);
   runDrafts.delete(id);
   confirmDeleteId = null;
+  swipedRowId = null;
   if (selectedRunId === id) selectedRunId = null;   // fall back to the newest
   toast('Run deleted.');
   paintCounts();
@@ -1399,6 +1474,10 @@ function wireRailSwipe() {
   hx.addEventListener('touchstart', (e) => {
     const t = e.touches[0];
     x0 = t.clientX; y0 = t.clientY;
+    // A gesture that starts on a run row belongs to that row (swipe-to-delete),
+    // never to the rail. The rail still closes via ☰, the scrim, Escape, or a
+    // swipe starting on its header.
+    if (e.target.closest('.hxrow')) { armed = false; return; }
     armed = railOpen || (t.clientX - hx.getBoundingClientRect().left) < 28;
   }, { passive: true });
   hx.addEventListener('touchend', (e) => {
@@ -1411,6 +1490,8 @@ function wireRailSwipe() {
 }
 
 function selectRun(id) {
+  // A tap while a row is swiped open just puts it away — same as iOS lists.
+  if (swipedRowId) { closeSwipedRow(); return; }
   const it = historyItems().find((x) => x.id === id);
   if (!it) return;
   selectedRunId = id;

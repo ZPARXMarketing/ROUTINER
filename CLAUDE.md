@@ -530,12 +530,22 @@ triggers runs it truly in parallel.
   lead-enrichment row would run the agent loop, not the enrichment engine. The
   only rows with no composer are the ones synthesised from a routine that never
   logged a run.
-- **Rail rows can be deleted** (`deleteRun`) — trash, then a confirm strip in
-  the row, because there is no undo and the row is the only copy of that
-  transcript. Offered on run-backed rows only, and never while one is running
-  (stop it first; deleting mid-write just orphans the agent's checkpoints).
-  Rail rows are `div[role=button]`, not `<button>`, precisely so they can hold
-  those controls — buttons cannot nest.
+- **Rail rows can be deleted, two ways, because touch and pointer need
+  different affordances.** On touch: **swipe the row left** to reveal Delete
+  (`wireRowSwipe`), the iOS list gesture. On a pointer: hover reveals a trash,
+  which opens a confirm strip in the row — there is no undo and the row is the
+  only copy of that transcript. The hover trash is hidden under
+  `@media (hover: none)` because iPadOS fakes `:hover` on tap and drops it on
+  the next tap, so it works *exactly once* — which is precisely how it was
+  reported. Both paths call `deleteRun`. Offered on run-backed rows only, and
+  never while one is running (stop it first; deleting mid-write just orphans the
+  agent's checkpoints). Rail rows are `div[role=button]`, not `<button>`, so
+  they can hold those controls — buttons cannot nest.
+  Two gesture details that matter: `touch-action: pan-y` on the row keeps
+  vertical scrolling native while the horizontal axis is ours, and
+  `wireRailSwipe` (the mobile rail's open/close swipe) bails when a gesture
+  starts on a row, so the two never fight. The rail still closes via ☰, the
+  scrim, Escape, or a swipe starting on its header.
 - **Run now on an agent instance lands in Chat** (`openRunInChat`) with the new
   run selected and the reply box focused, rather than leaving the reader to go
   find it. Claude-trigger fires create no row at fire time — the session reports
