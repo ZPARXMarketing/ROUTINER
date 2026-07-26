@@ -765,14 +765,33 @@ function next7DayCosts() {
     return { day, usd };
   });
 }
-function paintBudgetChip() {
-  const el = $('#budgetChip'); if (!el) return;
+/* The always-on readout under the top rail: the headline rate, the horizons it
+   implies, and a 7-day sparkline of the same projection the drawer charts.
+   Hidden only when there is genuinely nothing priced to forecast. */
+function paintSpendBar() {
+  const el = $('#spendBar'); if (!el) return;
   const { rows, perDay, oneOff } = costForecast();
   if (!rows.length) { el.style.display = 'none'; return; }
   el.style.display = '';
-  el.innerHTML = perDay > 0
-    ? `est <b>${fmtUSD(perDay)}</b>/day${oneOff > 0 ? ` +${fmtUSD(oneOff)} queued` : ''}`
-    : `est <b>${fmtUSD(oneOff)}</b> queued`;
+  const stat = (t, opt) => `<span class="spendbar__stat${opt ? ' spendbar__stat--opt' : ' spendbar__stat--hi'}">${t}</span>`;
+  const stats = perDay > 0
+    ? stat(`est <b>${fmtUSD(perDay)}</b>/day`) + stat(`${fmtUSD(perDay * 7)}/wk`, true) + stat(`${fmtUSD(perDay * 30)}/mo`, true)
+      + (oneOff > 0 ? stat(`+${fmtUSD(oneOff)} queued`, true) : '')
+    : stat(`est <b>${fmtUSD(oneOff)}</b> queued`);
+  const days = next7DayCosts();
+  const maxUsd = Math.max(...days.map((d) => d.usd), 1e-9);
+  const spark = days.map((d, i) => {
+    // A zero day still gets a visible floor so the run of days reads as a week.
+    const hPct = d.usd > 0 ? Math.max(15, (d.usd / maxUsd) * 100) : 8;
+    const lbl = i === 0 ? 'Today' : d.day.toLocaleDateString([], { weekday: 'short' });
+    return `<span class="spendbar__col${i === 0 ? ' spendbar__col--today' : ''}" style="height:${hPct}%" title="${esc(lbl)} · ${fmtUSD(d.usd)} projected"></span>`;
+  }).join('');
+  el.innerHTML = `<span class="spendbar__label">Projected spend</span>${stats}
+    <span class="spendbar__spark" aria-hidden="true">${spark}</span>
+    <span class="spendbar__more">Breakdown ›</span>`;
+  el.setAttribute('aria-label', perDay > 0
+    ? `Projected spend: ${fmtUSD(perDay)} per day${oneOff > 0 ? `, plus ${fmtUSD(oneOff)} queued one-time` : ''}. Open the breakdown.`
+    : `Projected spend: ${fmtUSD(oneOff)} queued. Open the breakdown.`);
 }
 function openForecast() {
   editingId = null;
@@ -833,7 +852,7 @@ function paintStatus() {
 
 function render() {
   if (!session) return;
-  paintCounts(); paintStatus(); paintBudgetChip();
+  paintCounts(); paintStatus(); paintSpendBar();
   // History owns its whole pane (its own columns scroll); every other view rides
   // the normal page scroll.
   $('.content')?.classList.toggle('content--flush', currentView === 'history');
@@ -2686,6 +2705,8 @@ function wireAcctMenu() {
 /* ---------- Auth UI ---------- */
 function showAuth(mode = 'signin') {
   const bar = $('#topbar'); if (bar) bar.style.display = 'none';
+  // render() never runs signed out, so the spend bar is hidden here by hand.
+  const spend = $('#spendBar'); if (spend) spend.style.display = 'none';
   $('.app')?.classList.add('is-auth');
   $('.content')?.classList.remove('content--flush'); // the auth card wants the normal page scroll
 
@@ -2761,7 +2782,13 @@ function trackAppHeight() {
 function wireOnce() {
   trackAppHeight();
   $('#newBtn').addEventListener('click', () => openDrawer());
-  $('#budgetChip').addEventListener('click', openForecast);
+  // The spend bar is a div (so it can hold the sparkline), so it needs the
+  // keyboard half of a button written out.
+  const spendBar = $('#spendBar');
+  spendBar?.addEventListener('click', openForecast);
+  spendBar?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openForecast(); }
+  });
   $('#settingsBtn').addEventListener('click', () => { closeAcctMenu(); openSettings(); });
   $('#signOutBtn').addEventListener('click', async () => { closeAcctMenu(); await sb.auth.signOut(); });
   wireAcctMenu();

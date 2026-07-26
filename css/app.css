@@ -59,13 +59,16 @@ a { color: var(--periwinkle); }
 /* The top rail keeps every tab reachable without scrolling. Above 1140px it is
    one row and sheds the widest optional chips as space runs out; below that the
    nav takes a full row of its own, which buys the chips back. (Measured widths:
-   brand 186 · nav 612 · clock 206 · budget 144 · new 130.) Verified for overflow
-   at 19 widths from 1920 down to 360 — an iPad in landscape keeps one row. */
+   brand 186 · nav 612 · clock 206 · new 130.) Verified for overflow at 19 widths
+   from 1920 down to 360 — an iPad in landscape keeps one row.
+   The spend forecast is deliberately NOT in here: it was the widest optional
+   chip, so it was the first thing shed, which meant it was invisible at every
+   width an iPad or a normal laptop window actually uses. It has its own row
+   below the rail instead. */
 @media (min-width: 1141px) and (max-width: 1500px) {
   .clock--time.clock--next .clock__now { display: none; }  /* keep "next in 12m" */
   .clock--time:not(.clock--next) { display: none; }        /* nothing queued → drop it */
 }
-@media (min-width: 1141px) and (max-width: 1420px) { .budget-chip { display: none !important; } }
 @media (min-width: 1141px) and (max-width: 1300px) {
   .topbar { gap: var(--sp-3); }
   .fire-toggle__label { display: none; }
@@ -956,10 +959,46 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 }
 .chip .hist__spin { margin-right: 4px; }
 
-/* ── Budget chip + forecast panel ──────────────── */
-.budget-chip { cursor: pointer; transition: border-color .15s ease, color .15s ease; }
-.budget-chip:hover { color: var(--text-hi); border-color: var(--grey-700); }
-.budget-chip b { color: var(--yellow); }
+/* ── Spend bar + forecast panel ─────────────────
+   The forecast used to ride in the top rail as a chip, which put it in direct
+   competition with the nav for horizontal space — and it lost, at every width
+   between 1141–1420px and below 820px. A full-width row of its own costs ~32px
+   of height, is never shed, and has room for the 7-day sparkline the chip
+   couldn't carry. Clicking anywhere on it opens the same forecast drawer. */
+.spendbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding:
+    5px max(var(--sp-6), env(safe-area-inset-right))
+    5px max(var(--sp-6), env(safe-area-inset-left));
+  border-bottom: 1px solid var(--hairline);
+  background: linear-gradient(180deg, rgba(20,27,46,0.55), rgba(12,17,31,0.80));
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: background .15s ease;
+}
+.spendbar:hover, .spendbar:focus-visible { background: rgba(61,90,241,0.12); outline: none; }
+.spendbar__label {
+  font-family: var(--font-pixel); font-size: 8px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--text-low); flex: 0 0 auto;
+}
+.spendbar__stat { font-family: var(--font-mono); font-size: 12px; color: var(--text-low); flex: 0 0 auto; }
+.spendbar__stat--hi { color: var(--text-mid); }
+.spendbar__stat b { color: var(--yellow); font-weight: 600; }
+/* The prediction itself: one column per day, next 7 days, today first. */
+.spendbar__spark { margin-left: auto; display: flex; align-items: flex-end; gap: 3px; height: 18px; flex: 0 0 auto; }
+.spendbar__col { width: 6px; background: var(--blue-bright); border-radius: 2px 2px 0 0; opacity: 0.7; }
+.spendbar__col--today { background: var(--lime); opacity: 1; }
+.spendbar__more { font-family: var(--font-mono); font-size: 11px; color: var(--text-low); flex: 0 0 auto; }
+.spendbar:hover .spendbar__more { color: var(--text-mid); }
+/* Narrow: keep the headline number and the sparkline, shed the rest. */
+@media (max-width: 900px) { .spendbar__more { display: none; } }
+@media (max-width: 780px) { .spendbar__stat--opt { display: none; } }
+@media (max-width: 420px) { .spendbar__label { display: none; } }
 .fc__tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: var(--sp-2); }
 .fc__tile { background: var(--bg-void); border: 1px solid var(--hairline); border-radius: var(--r-md); padding: var(--sp-3); text-align: center; }
 .fc__tile-v { font-family: var(--font-mono); font-weight: 600; font-size: 16px; color: var(--text-hi); }
@@ -1023,7 +1062,6 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 }
 /* Row one still has to fit: shed the same chips, in the same order. */
 @media (max-width: 900px) { .clock--time { display: none; } .fire-toggle__label { display: none; } }
-@media (max-width: 820px) { .budget-chip { display: none !important; } }
 /* Phone: the nav row itself runs out of width — tighten the tabs before letting
    them scroll, and drop the count badges last. */
 @media (max-width: 780px) {

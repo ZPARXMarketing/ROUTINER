@@ -447,13 +447,25 @@ triggers runs it truly in parallel.
 - `index.html`, `css/tokens.css` (vendored ZPARX tokens), `css/app.css`,
   `js/app.js` (single-page UI, ES module).
 - **Shell:** one top rail (`.topbar`) carries the brand, the nav tabs and the
-  actions (clock · budget chip · a **+** for a new routine · account menu); the body below it
-  is the only scrolling region. The rail stays a single row down to 1140px —
-  shedding the clock, then the budget chip, then tightening the tabs as space
-  runs out — so an iPad in landscape still gets one row; below that the nav wraps
-  to a full-width second row, which buys those chips back. Verified for overflow
-  at 20 widths from 1920 to 360; only phone widths scroll the nav, and a fade on
-  its trailing edge says so.
+  actions (clock · a **+** for a new routine · account menu); under it a slim
+  full-width **spend bar** (`.spendbar`); the body below that is the only
+  scrolling region. The rail stays a single row down to 1140px — shedding the
+  clock, then tightening the tabs as space runs out — so an iPad in landscape
+  still gets one row; below that the nav wraps to a full-width second row, which
+  buys the clock back. Verified for overflow at 20 widths from 1920 to 360; only
+  phone widths scroll the nav, and a fade on its trailing edge says so.
+- **The spend forecast is a row, not a rail chip, and that was the whole fix.**
+  It used to be `#budgetChip` in `.topbar__actions`. Being the widest optional
+  chip, it was the first thing the rail shed, and the two rules that shed it
+  (`1141–1420px` and `≤820px`) between them covered every width an iPad or a
+  normal laptop window actually uses — so a feature that worked perfectly was
+  invisible to its own user, who reasonably reported it as gone. Nothing about
+  `costForecast()` had broken. A row of its own costs ~29px of height, competes
+  with nothing horizontally, and has room for a 7-day sparkline the chip never
+  could. `paintSpendBar()` fills it on every `render()`; clicking or pressing
+  Enter on it opens the same `openForecast()` drawer. **Don't move it back into
+  the rail** — the rail's whole design is to shed what doesn't fit, so anything
+  put there is one tight breakpoint away from vanishing again.
 - **The tab order leads with the work.** `Chat` (the `history` view — the runs
   and their transcripts) sits first, is what the app opens on, and carries no
   count badge; then Calendar,
@@ -468,8 +480,9 @@ triggers runs it truly in parallel.
 - Key views in `app.js`: **Board** (`renderBoard`), **Calendar**
   (`renderCalendar` — full 24h, blocks colored by trigger within a per-account
   hue family), Scheduled / Library / Archived, **History** (`renderHistory`),
-  the **budget forecast** (top-bar chip →
-  projected spend from the scheduled queue), the Settings **accounts & triggers**
+  the **budget forecast** (`paintSpendBar` → the always-on spend bar;
+  `openForecast` → the full breakdown drawer, both driven by `costForecast()` /
+  `next7DayCosts()` over the scheduled queue), the Settings **accounts & triggers**
   manager, and the create/edit **drawer**. The Library holds every non-archived
   routine — scheduling doesn't remove it, only archiving takes one off the air.
 - **The shell is exactly one viewport tall, and the Chat pane got stuck twice

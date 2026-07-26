@@ -41,7 +41,6 @@
 
       <div class="topbar__actions">
         <span class="clock clock--time" id="clock">—</span>
-        <button class="clock budget-chip" id="budgetChip" title="Projected spend from everything scheduled — click for the breakdown" style="display:none">—</button>
         <button class="btn btn--primary btn--icon" id="newBtn" title="New routine" aria-label="New routine">+</button>
         <div class="acctmenu" id="acctMenu">
           <button class="acctmenu__btn" id="userChip" title="Account" aria-haspopup="true" aria-expanded="false"></button>
@@ -54,6 +53,12 @@
         </div>
       </div>
     </header>
+
+    <!-- ── Spend bar: what the scheduled queue is projected to cost, always on
+         screen. Its own row, not a chip in the rail — see css/app.css. ── -->
+    <div class="spendbar" id="spendBar" role="button" tabindex="0"
+         title="Projected spend from everything scheduled — click for the breakdown"
+         style="display:none"></div>
 
     <div class="content">
       <main id="view"></main>
