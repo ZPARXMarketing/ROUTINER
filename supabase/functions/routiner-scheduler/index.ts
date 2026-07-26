@@ -42,6 +42,35 @@ const OPENROUTER_AGENT_URL = Deno.env.get("OPENROUTER_AGENT_URL") ??
   `${SUPABASE_URL}/functions/v1/openrouter-agent`;
 const DEFAULT_AGENT_MODEL = "moonshotai/kimi-k2.7-code";
 
+// Auto-routing for openrouter-agent accounts, the non-Claude mirror of
+// ROUTING_POLICY below. Used only when neither the routine nor the agent
+// instance pins a model, so it is a sane floor rather than an override.
+// Kimi K3 is the reach-for-it model on hard work; GLM 5.2 carries the ordinary
+// coding load; the cheap models handle mechanical/low-stakes steps.
+const AGENT_ROUTING_POLICY: Record<string, Record<string, string>> = {
+  planning: {
+    low: "z-ai/glm-5.2",
+    medium: "z-ai/glm-5.2",
+    high: "moonshotai/kimi-k3",
+  },
+  execution: {
+    low: "deepseek/deepseek-chat",
+    medium: "z-ai/glm-5.2",
+    high: "moonshotai/kimi-k3",
+  },
+  general: {
+    low: "deepseek/deepseek-chat",
+    medium: "z-ai/glm-5.2",
+    high: "moonshotai/kimi-k3",
+  },
+};
+
+// An agent routine's auto-routed model from its task_type + complexity.
+function agentModelForTask(taskType?: string, complexity?: string): string {
+  const row = AGENT_ROUTING_POLICY[taskType || "general"] || AGENT_ROUTING_POLICY.general;
+  return row[complexity || "medium"] || row.medium || DEFAULT_AGENT_MODEL;
+}
+
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
 const SCHEDULER_BATCH = num("SCHEDULER_BATCH", 50);   // max routines processed per invocation
@@ -296,7 +325,18 @@ function pickAgentInstance(accounts: unknown, account: string, triggerKey?: stri
 async function fireAgent(r: Record<string, any>, accounts: unknown): Promise<{ status: string; output: string; persisted: boolean }> {
   if (!r.prompt || !String(r.prompt).trim()) return { status: "error", output: "Agent routine has no directions.", persisted: false };
   const inst = pickAgentInstance(accounts, r.account, r.trigger_key);
-  const model = inst.model || (typeof r.model === "string" && r.model && r.model !== "auto" ? r.model : DEFAULT_AGENT_MODEL);
+  // Model precedence, most specific first:
+  //   1. the routine's own pick — so a plan can delegate per task (a hard block to
+  //      Kimi K3, a mechanical one to GLM) without needing one account per model.
+  //      Claude ids are ignored here: they'd be sent to OpenRouter and 404.
+  //   2. the agent instance's model (the lane's configured default),
+  //   3. auto-routing from task_type + complexity, then the built-in default.
+  // Note this reverses the old order, where the instance always beat the row and
+  // a routine's stored model was silently dead on this path.
+  const pinned = typeof r.model === "string" && r.model && r.model !== "auto" && !/^claude-/i.test(r.model)
+    ? r.model
+    : null;
+  const model = pinned || inst.model || agentModelForTask(r.task_type, r.complexity);
   const tools = inst.tools || ["read", "research", "write"];
   try {
     const f = await fetch(OPENROUTER_AGENT_URL, {

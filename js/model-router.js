@@ -143,6 +143,38 @@ export const ROUTING_POLICY = {
   },
 };
 
+/* The same decision for **openrouter-agent** accounts, whose runs never touch
+   Anthropic — so every cell is an OpenRouter id. Used only when neither the
+   routine nor the agent instance pins a model, i.e. as a floor, not an override.
+   Kimi K3 is the reach-for-it model on hard work, GLM 5.2 carries the ordinary
+   coding load, and the cheap models take mechanical steps.
+   ⚠ Mirrored as AGENT_ROUTING_POLICY in
+   supabase/functions/routiner-scheduler/index.ts — update both together. */
+export const AGENT_ROUTING_POLICY = {
+  planning: {
+    low: 'z-ai/glm-5.2',
+    medium: 'z-ai/glm-5.2',
+    high: 'moonshotai/kimi-k3',
+  },
+  execution: {
+    low: 'deepseek/deepseek-chat',
+    medium: 'z-ai/glm-5.2',
+    high: 'moonshotai/kimi-k3',
+  },
+  general: {
+    low: 'deepseek/deepseek-chat',
+    medium: 'z-ai/glm-5.2',
+    high: 'moonshotai/kimi-k3',
+  },
+};
+export const DEFAULT_AGENT_MODEL = 'moonshotai/kimi-k2.7-code';
+
+/* An agent routine's auto-routed model from its task type + complexity. */
+export function agentModelForTask(taskType = DEFAULT_TASK_TYPE, complexity = DEFAULT_COMPLEXITY) {
+  const row = AGENT_ROUTING_POLICY[taskType] || AGENT_ROUTING_POLICY[DEFAULT_TASK_TYPE];
+  return row[complexity] || row[DEFAULT_COMPLEXITY] || DEFAULT_AGENT_MODEL;
+}
+
 /* Validate a stored/loaded policy into the ROUTING_POLICY shape. Returns a
    normalized copy, or null if it isn't usable (so callers fall back to the
    built-in default). Every task_type × complexity cell must be a non-empty

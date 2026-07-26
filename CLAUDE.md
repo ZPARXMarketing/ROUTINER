@@ -269,6 +269,24 @@ for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
 > must match exactly and be unique (or pass `replace_all`), and a bad edit comes
 > back as an actionable tool error the model can correct rather than a dead run.
 
+**Which model an agent routine runs.** Precedence, most specific first: the
+**routine's own `model`** (a non-Claude id) → the **instance's** model (the
+lane's configured default) → **`AGENT_ROUTING_POLICY`** auto-routing from
+`task_type` × `complexity` → `DEFAULT_AGENT_MODEL`. The routine winning is what
+lets one plan delegate per task — a hard block to `moonshotai/kimi-k3`, a
+mechanical one to `z-ai/glm-5.2` — without standing up one account per model.
+Claude ids on an agent routine are ignored rather than forwarded (OpenRouter
+would 404 them). The policy lives in **two mirrored copies** —
+`AGENT_ROUTING_POLICY` in `js/model-router.js` and in
+`supabase/functions/routiner-scheduler/index.ts` — plus `agentModelFor` in
+`js/app.js` for Run-now; update them together or a scheduled fire and a manual
+one will disagree.
+
+> Before this, `pickAgentInstance`'s model *always* beat the row, so a routine's
+> stored `model` was silently dead on the agent path and per-task delegation was
+> impossible. Routing by *account* still works and is the safer habit — the
+> instance model and the row agree — but the row can now override it.
+
 **Setup (one-time, human — Supabase → Edge Functions → secrets):**
 
 - `GITHUB_TOKEN` — a fine-grained PAT with **Contents** + **Pull requests**

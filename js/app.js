@@ -14,7 +14,7 @@ import {
   MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
   effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel,
   ROUTING_POLICY, setActivePolicy, getActivePolicy, normalizePolicy,
-  estimateRunCost, fmtUSD,
+  estimateRunCost, fmtUSD, agentModelForTask, DEFAULT_AGENT_MODEL,
 } from './model-router.js';
 import { nextOccurrence, nextOccurrences } from './schedule.js';
 
@@ -77,7 +77,6 @@ const DEFAULT_PERPLEXITY_MODEL = 'perplexity/sonar-pro';
    OpenRouter model (default Kimi) via the `openrouter-agent` edge function, and
    its full result lands in History (resumable). This is DISTINCT from the built-in
    `openrouter` (Perplexity enrichment) account above, which is left untouched. */
-const DEFAULT_AGENT_MODEL = 'moonshotai/kimi-k2.7-code';
 const AGENT_TOOLS = [
   { id: 'read', label: 'Read your data + run history' },
   { id: 'research', label: 'Web research' },
@@ -156,6 +155,20 @@ const triggerModel = (accId, tId) => {
 const triggerTools = (accId, tId) => {
   const t = triggerCfg(accId, tId) || accountTriggers(accId)[0];
   return normalizeTools(t && t.tools);
+};
+/* Which model an agent routine actually runs. The routine's own pick wins so a
+   plan can delegate per task (a hard block to Kimi K3, a mechanical one to GLM)
+   without one account per model; otherwise the instance's configured model, then
+   the agent auto-route. Claude ids are ignored — they'd be sent to OpenRouter and
+   404. Mirrors fireAgent in supabase/functions/routiner-scheduler/index.ts, so
+   Run-now and a scheduled fire pick the SAME model — keep the two in step. */
+const agentModelFor = (routine) => {
+  const m = routine?.model;
+  if (typeof m === 'string' && m && m !== 'auto' && !/^claude-/i.test(m)) return m;
+  const tId = routine?.triggerKey ?? routine?.trigger_key;
+  const t = triggerCfg(routine?.account, tId) || accountTriggers(routine?.account)[0];
+  return (t && t.model)
+    || agentModelForTask(routine?.taskType ?? routine?.task_type, routine?.complexity);
 };
 
 /* Color engine: each account gets a themed set of DISTINCT hues (not just
@@ -610,7 +623,7 @@ async function fireEnrichment(routine) {
 async function fireAgent(routine) {
   const account = routine?.account;
   const triggerKey = routine?.triggerKey || null;
-  const model = triggerModel(account, triggerKey);
+  const model = agentModelFor(routine);
   const tools = triggerTools(account, triggerKey);
   if (!routine?.prompt || !routine.prompt.trim()) { toast('This routine has no directions.', 'error'); return; }
   const { error } = await sessionForFire();
