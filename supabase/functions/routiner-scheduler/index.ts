@@ -14,8 +14,12 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 //   • Atomic claim — each due row is claimed with a conditional PATCH that only
 //     matches while it's still status=scheduled at its original scheduled_at, so
 //     two overlapping invocations can never both fire the same routine.
-//   • Parallel — due routines are processed with Promise.allSettled, bounded by
-//     SCHEDULER_BATCH per run so a backlog can't blow the function's wall clock.
+//   • Parallel, but not for agents — Claude and lead-enrichment fires all go at
+//     once (cheap POSTs that hand off elsewhere); `openrouter-agent` fires go
+//     through a pool of AGENT_FIRE_CONCURRENCY, because firing several agent
+//     loops simultaneously makes them starve each other. SCHEDULER_BATCH still
+//     caps how many are *claimed* per run so a backlog can't blow the wall clock
+//     — it never bounded how many ran at once, which is what bit us.
 //   • Bounded retry — a one-off whose fire fails for a *transient* reason is
 //     re-armed with exponential backoff and gives up after MAX_RETRIES, instead
 //     of being silently lost. A *permanent* failure (misconfigured account /
@@ -52,6 +56,15 @@ const FIRE_TIMEOUT_MS = num("SCHEDULER_FIRE_TIMEOUT_MS", 30_000); // don't let o
 // Agent runs insert status=running and bump fired_at each checkpoint (~≤3 min while alive).
 // Silent longer than this → edge function died mid-flight; flip to error so History is honest.
 const REAP_RUN_MIN = num("SCHEDULER_REAP_RUN_MIN", 10);
+// Max `openrouter-agent` routines fired at once. A Claude /fire is a cheap POST
+// that returns immediately (the session runs elsewhere), but an agent fire spins
+// up a whole tool loop inside another edge function — firing several at once
+// makes them starve each other. Measured on the run log: the SAME model
+// (moonshotai/kimi-k2.7-code) on the SAME key errored 0% across 10 runs fired
+// alone and 90% across 10 runs fired alongside others. It was never the key —
+// per-call success actually IMPROVES under load — it is invocation contention.
+// Set to 0 for the old unbounded behaviour.
+const AGENT_FIRE_CONCURRENCY = num("SCHEDULER_AGENT_CONCURRENCY", 1);
 const REAP_DIED_MSG =
   "⚠ Run died mid-flight — the edge function was killed before it could finish. Partial progress is saved; open this run and Retry (or reply 'continue') to resume.";
 
@@ -215,6 +228,30 @@ function pickCreds(
   const trigs = Array.isArray(a.triggers) ? a.triggers : [];
   const t = (triggerKey && trigs.find((x: { id?: string }) => x && x.id === triggerKey)) || trigs[0];
   return t ? { trigger: t.trigger || "", token: t.token || "" } : null;
+}
+
+// Bounded worker pool. Runs `fn` over `idx` (indices into the caller's array)
+// with at most `limit` in flight, writing each outcome into `out` BY INDEX so
+// the caller's out[i] ↔ items[i] mapping survives out-of-order completion.
+// `limit <= 0` means unbounded. Never rejects: a thrown fn is captured as a
+// rejected slot, matching Promise.allSettled's contract, so one bad fire can't
+// take down the batch.
+async function drainWithLimit<T>(
+  idx: number[],
+  limit: number,
+  out: PromiseSettledResult<T>[],
+  fn: (i: number) => Promise<T>,
+): Promise<void> {
+  if (!idx.length) return;
+  const width = limit > 0 ? Math.min(limit, idx.length) : idx.length;
+  let next = 0;
+  await Promise.all(Array.from({ length: width }, async () => {
+    for (let k = next++; k < idx.length; k = next++) {
+      const i = idx[k];
+      try { out[i] = { status: "fulfilled", value: await fn(i) }; }
+      catch (e) { out[i] = { status: "rejected", reason: e }; }
+    }
+  }));
 }
 
 // An account's executor kind. "claude" (default) fires a Claude routine /fire;
@@ -628,13 +665,26 @@ Deno.serve(async () => {
     } catch { /* fall back to the default policy + env-var creds per routine */ }
   }
 
-  // Process independently and in parallel; one slow/failed routine can't block
-  // the others, and the batch limit keeps this within the function's wall clock.
-  const settled = await Promise.allSettled(
-    due.map((r: Record<string, any>) =>
-      processOne(r, nowIso, policyByUser[r.user_id] || ROUTING_POLICY, accountsByUser[r.user_id] ?? null)
-    ),
-  );
+  // Process independently; one slow/failed routine can't block the others, and
+  // the batch limit keeps this within the function's wall clock. Claude and
+  // lead-enrichment fires all go at once — they are cheap POSTs that hand the
+  // work off elsewhere. Agent fires go through a small pool instead: firing
+  // several at once is what actually broke them (see AGENT_FIRE_CONCURRENCY).
+  const run = (r: Record<string, any>) =>
+    processOne(r, nowIso, policyByUser[r.user_id] || ROUTING_POLICY, accountsByUser[r.user_id] ?? null);
+
+  const settled: PromiseSettledResult<any>[] = new Array(due.length);
+  const agentIdx: number[] = [];
+  const lightIdx: number[] = [];
+  due.forEach((r: Record<string, any>, i: number) => {
+    const agent = accountKind(accountsByUser[r.user_id] ?? null, r.account) === "openrouter-agent";
+    (agent ? agentIdx : lightIdx).push(i);
+  });
+
+  await Promise.all([
+    drainWithLimit(lightIdx, 0, settled, (i) => run(due[i])),
+    drainWithLimit(agentIdx, AGENT_FIRE_CONCURRENCY, settled, (i) => run(due[i])),
+  ]);
 
   const results = settled.map((s, i) => ({
     id: due[i].id,

@@ -48,11 +48,31 @@ for (const s of [
   "Internal Server Error",
 ]) eq(`transient: ${s}`, m.isTransientModelError(s), true);
 for (const s of [
-  "Key limit exceeded (total limit). Manage it using https://openrouter.ai/...",
   "Invalid API key",
   'Model "foo/bar" is not allowed.',
   "Daily spend cap reached ($5.00 of $5.00).",
+  "Insufficient credits to run this request.",
 ]) eq(`permanent: ${s.slice(0, 34)}`, m.isTransientModelError(s), false);
+
+// A 429 that says "Key limit exceeded" is a throttle that clears, NOT a spend
+// cap. Classifying it permanent stopped every retry and every model fallback,
+// and killed agent runs in ~0.3s. The usage log disproved the "cap" reading:
+// the error first fired at $1.51 of lifetime spend on the key, and that same
+// key then spent $5.87 more afterwards. Do not re-add it to the deny-list.
+const KEY_LIMIT =
+  "Key limit exceeded (total limit). Manage it using https://openrouter.ai/...";
+eq("key-limit 429 is transient", m.isTransientModelError(KEY_LIMIT, 429), true);
+eq("key-limit statusless is transient", m.isTransientModelError(KEY_LIMIT), true);
+eq("402 out-of-credit stays permanent", m.isTransientModelError("Insufficient credits", 402), false);
+eq("401 stays permanent", m.isTransientModelError("No auth credentials found", 401), false);
+eq("403 stays permanent", m.isTransientModelError("Forbidden", 403), false);
+
+// Status beats body prose in both directions.
+eq("429 beats permanent-looking prose", m.isTransientModelError("quota exceeded", 429), true);
+eq("503 is transient on any prose", m.isTransientModelError("something odd", 503), true);
+eq("402 beats transient-looking prose", m.isTransientModelError("try again later", 402), false);
+// A local cap is ours, not OpenRouter's, and carries no status — still permanent.
+eq("local daily cap permanent", m.isTransientModelError("Daily spend cap reached ($5.00 of $5.00)."), false);
 
 console.log("\n— compactMessages (context budget) —");
 const big = (n) => "x".repeat(n);
