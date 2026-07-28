@@ -500,7 +500,11 @@ type OrOpts = {
   /** absolute epoch-ms wall deadline; no retry is started that can't fit */
   deadlineAt?: number;
 };
-type OrResult = { ok: boolean; message?: any; usage?: any; error?: string };
+// `status` is the HTTP status OpenRouter answered with. It is the only reliable
+// transient/permanent signal: the body message is provider prose and has already
+// caused one outage by reading as permanent when it wasn't (see
+// isTransientModelError). Keep it populated on every error path that has one.
+type OrResult = { ok: boolean; message?: any; usage?: any; error?: string; status?: number };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -527,9 +531,14 @@ async function openrouter(
     if (r.ok) return r;
     last = r;
     // A permanent error repeats identically — don't burn budget or spend on it.
-    if (!isTransientModelError(r.error || "")) return r;
+    if (!isTransientModelError(r.error || "", r.status)) return r;
     if (attempt < retries) {
-      const backoff = Math.min(4_000, 750 * 2 ** attempt);
+      // A throttle needs longer than a flaky provider: backing off 750ms into a
+      // rate limit just spends the retry budget re-hitting it.
+      const throttled = r.status === 429;
+      const backoff = throttled
+        ? Math.min(8_000, 2_000 * 2 ** attempt)
+        : Math.min(4_000, 750 * 2 ** attempt);
       if (Date.now() + backoff + 3_000 > deadlineAt) break;
       await sleep(backoff);
     }
@@ -565,7 +574,13 @@ async function openrouterOnce(
       signal: AbortSignal.timeout(tMs),
     });
     const data = await resp.json();
-    if (!resp.ok) return { ok: false, error: data?.error?.message || `OpenRouter HTTP ${resp.status}` };
+    if (!resp.ok) {
+      return {
+        ok: false,
+        status: resp.status,
+        error: data?.error?.message || `OpenRouter HTTP ${resp.status}`,
+      };
+    }
     return { ok: true, message: data?.choices?.[0]?.message || {}, usage: data?.usage || null };
   } catch (e) {
     const msg = e instanceof DOMException && e.name === "TimeoutError" ? `OpenRouter call timed out (${tMs}ms)` : (e as Error).message;
@@ -1080,14 +1095,35 @@ function isHardError(text: string): boolean {
 // Worth another attempt. Deliberately broad: OpenRouter surfaces upstream
 // provider flakiness through several unrelated strings, and treating any of them
 // as fatal ends a run that would have succeeded on the next call. Anything NOT
-// matched here is treated as permanent and fails fast — keep real
-// configuration errors (bad key, spend cap, unknown model) out of this list.
-function isTransientModelError(err: string): boolean {
+// matched here is treated as permanent and fails fast — keep genuinely
+// unrecoverable errors (bad key, out of credit, unknown model) out of this list.
+// "Unrecoverable" means it repeats identically on the next call: a throttle does
+// not qualify, however final its wording sounds.
+function isTransientModelError(err: string, status?: number): boolean {
   const e = err || "";
+  // The HTTP status wins when we have it. The body message is provider prose and
+  // is not a reliable classifier — "Key limit exceeded (total limit)" is a 429
+  // throttle that clears, but for days it was matched as a permanent spend cap
+  // and killed runs instantly with no retry and no model fallback. The usage log
+  // settled it: that error first fired at $1.51 of lifetime spend on the key, and
+  // the same key then went on to spend $5.87 more. A real cap does not do that.
+  if (status) {
+    // Credentials and authorization genuinely repeat identically — fail fast.
+    if (status === 401 || status === 403) return false;
+    // 402 is OpenRouter's out-of-credit status. That is the real "ran out".
+    if (status === 402) return false;
+    if (status === 429) return true; // rate limit / key throttle — always retry
+    if (status >= 500) return true;
+  }
   // Never retry these, even though some contain retryable-looking words.
-  if (/key limit exceeded|insufficient credit|quota exceeded|daily spend cap|not allowed|invalid api key|unauthorized|no auth credentials/i.test(e)) {
+  // NOTE: "key limit exceeded" is deliberately NOT here — see above. Retrying it
+  // is free when it is real (a rejected call bills $0 and logs 0 tokens), and it
+  // rescues the run when it is a throttle, which is what it usually is.
+  if (/insufficient credit|quota exceeded|daily spend cap|not allowed|invalid api key|unauthorized|no auth credentials/i.test(e)) {
     return false;
   }
+  // Statusless fallback: the phrase alone, when we never saw a status code.
+  if (/key limit exceeded/i.test(e)) return true;
   return /timed out|timeout|rate.?limit|overloaded|temporar|capacity|try again|provider returned error|no endpoints|no allowed providers|internal server error|service unavailable|bad gateway|gateway time|fetch failed|connection|socket|stream|econnreset|429|500|502|503|504|520|522|524|529/i
     .test(e);
 }
@@ -1277,7 +1313,7 @@ async function runAgentLoop(opts: {
       // Retries inside openrouter() are already spent by here. If the chosen
       // model is the thing that's broken, finish the job on a reliable one
       // instead of ending the run — the user cares about the task, not the model.
-      const canFallBack = isTransientModelError(err) && !fellBack && FALLBACK_MODEL &&
+      const canFallBack = isTransientModelError(err, r.status) && !fellBack && FALLBACK_MODEL &&
         FALLBACK_MODEL !== activeModel && allowedModels().has(FALLBACK_MODEL) &&
         callBudget() >= MIN_MODEL_CALL_MS;
       if (canFallBack) {
@@ -1286,7 +1322,7 @@ async function runAgentLoop(opts: {
         activeModel = FALLBACK_MODEL;
         continue; // costs one step; far cheaper than losing the run
       }
-      if (isTransientModelError(err)) {
+      if (isTransientModelError(err, r.status)) {
         // Soft stop — checkpoint + auto-continue (do not mark as hard failure).
         finalText = `Paused on step ${steps}: ${err}. Continuing in the background if possible.`;
         incomplete = true;

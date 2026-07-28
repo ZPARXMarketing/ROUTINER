@@ -138,7 +138,7 @@ After deploy, these optional secrets tune the agent path:
 |--------|---------|------|
 | `AGENT_REASONING_EFFORT` | `low` | OpenRouter `reasoning` on agent model calls (`low`/`medium`/`high`/`off`/`unset`) |
 | `RESPONDER_REASONING_EFFORT` | `low` | Same for `dynamic-responder` (body `reasoning` wins) |
-| `AGENT_MODEL_RETRIES` | `2` | Retries for a **transient** OpenRouter failure inside one step (`Provider returned error`, 5xx, timeout). Permanent errors — bad key, spend cap, disallowed model — still fail fast |
+| `AGENT_MODEL_RETRIES` | `2` | Retries for a **transient** OpenRouter failure inside one step (`Provider returned error`, 5xx, timeout, **429 throttle**). Permanent errors — bad key (401/403), out of credit (402), disallowed model — still fail fast |
 | `AGENT_FALLBACK_MODEL` | `moonshotai/kimi-k2.7-code` | If the chosen model keeps failing transiently, the run finishes on this one instead of dying. Set to `""` to disable |
 | `AGENT_CONTEXT_TOOL_BUDGET` | `60000` | Total chars of tool output kept at full size in the model's context. Older results are floored at 400 chars |
 | `AGENT_MAX_STEPS` | `5` | Tool-loop steps per edge invocation (non-code) |
@@ -153,6 +153,20 @@ A run silent longer than `SCHEDULER_REAP_RUN_MIN` is auto-marked `error` (transc
 kept); open it in History and **Retry** (or reply `continue`) to resume. The
 History UI also shows **"May have stalled"** for running rows past the same
 threshold before the reaper fires.
+
+> **Classify retries on the HTTP status, never on the provider's prose.** For
+> five days every agent run died on `Key limit exceeded (total limit)`, which
+> reads like an exhausted key — so the retry classifier listed it as permanent
+> and runs failed in ~0.3s with no retry and no model fallback. It was a **429
+> throttle**, and the usage log proved it: the error first fired at **$1.51** of
+> lifetime spend on that key, and the same key then spent **$5.87 more**. A real
+> cap does not do that. Two bugs compounded — `openrouterOnce` discarded
+> `resp.status` whenever the body carried a message, so the 429 never reached the
+> classifier, and the deny-list regex short-circuited ahead of the `429|rate.?limit`
+> branch that would have caught it. `OrResult` now carries `status`, and status
+> wins over text in both directions. Retrying a genuine cap is free anyway — a
+> rejected call bills $0 and logs 0 tokens — so when the two signals disagree,
+> prefer the retry.
 
 ### Tracking spend — the usage meter
 
