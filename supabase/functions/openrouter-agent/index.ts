@@ -523,7 +523,10 @@ async function openrouter(
   let last: OrResult = { ok: false, error: "no attempt was made" };
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const perAttempt = Math.max(3_000, Math.min(opts.timeoutMs ?? CALL_TIMEOUT_MS, CALL_TIMEOUT_MS));
+    // Cap an attempt at the wall time actually left, not at CALL_TIMEOUT_MS —
+    // a 50s clamp on a model that needs 70s fails identically on every retry.
+    const wallMs = Number.isFinite(deadlineAt) ? Math.max(0, deadlineAt - Date.now() - 2_000) : CALL_TIMEOUT_MS;
+    const perAttempt = Math.max(3_000, Math.min(opts.timeoutMs ?? CALL_TIMEOUT_MS, wallMs));
     // Only start an attempt that can actually finish inside the wall budget.
     if (attempt > 0 && Date.now() + perAttempt > deadlineAt) break;
 
@@ -552,7 +555,9 @@ async function openrouterOnce(
   messages: unknown[],
   opts: OrOpts = {},
 ): Promise<OrResult> {
-  const tMs = Math.max(3_000, Math.min(opts.timeoutMs ?? CALL_TIMEOUT_MS, CALL_TIMEOUT_MS));
+  // Honour the caller-computed budget (already wall-aware in openrouter());
+  // re-clamping to CALL_TIMEOUT_MS here silently undid that.
+  const tMs = Math.max(3_000, opts.timeoutMs ?? CALL_TIMEOUT_MS);
   const reasoning = resolveReasoning(opts.reasoning);
   try {
     const resp = await fetch(OPENROUTER_URL, {
@@ -1273,7 +1278,10 @@ async function runAgentLoop(opts: {
   const callBudget = () => {
     const raw = remaining() - 8_000;
     if (raw < MIN_MODEL_CALL_MS) return 0;
-    return Math.min(CALL_TIMEOUT_MS, raw);
+    // Do NOT cap at CALL_TIMEOUT_MS here: slow models (Kimi/GLM) on a large
+    // transcript need more than 50s, and clamping every attempt to 50s was
+    // the chronic timeout that killed runs. The wall deadline bounds it.
+    return raw;
   };
 
   // Returns true if the checkpoint revealed the run was cancelled (Stop pressed),
