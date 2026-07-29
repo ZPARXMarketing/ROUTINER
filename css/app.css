@@ -449,6 +449,31 @@ a { color: var(--periwinkle); }
 .empty h3 { font-family: var(--font-display); color: var(--text-mid); font-weight: 600; margin-bottom: var(--sp-2); }
 .empty p { font-size: 14px; max-width: 420px; margin: 0 auto var(--sp-4); }
 
+/* ── Loading / boot state ──────────────────────────
+   Shown by index.html before any JS runs, and again by showLoading() while the
+   first fetch is in flight. It replaces what used to be an empty <main>, so a
+   slow or failed start says so instead of looking like a broken page. */
+.loadstate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-4);
+  text-align: center;
+  padding: var(--sp-16) var(--sp-6);
+  color: var(--text-mid);
+  font-size: 14px;
+}
+.loadstate__spin {
+  width: 18px; height: 18px;
+  border: 2px solid var(--hairline);
+  border-top-color: var(--lime);
+  border-radius: 50%;
+  animation: hist-spin .7s linear infinite;
+}
+.loadstate__hint { font-size: 13px; color: var(--text-low); max-width: 420px; margin: 0 auto var(--sp-4); }
+.loadstate .btn { min-width: 140px; justify-content: center; }
+@media (prefers-reduced-motion: reduce) { .loadstate__spin { animation-duration: 2s; } }
+
 /* ── Modal / drawer ────────────────────────────── */
 .overlay {
   position: fixed;
