@@ -13,10 +13,19 @@
   <link rel="apple-touch-icon" sizes="152x152" href="assets/apple-touch-icon-152x152.png" />
   <link rel="apple-touch-icon" sizes="120x120" href="assets/apple-touch-icon-120x120.png" />
 
-  <!-- ZPARX brand fonts (Google Fonts CDN) -->
+  <!-- ZPARX brand fonts (Google Fonts CDN) — loaded NON-blocking.
+       A plain <link rel="stylesheet"> to a third-party host blocks first paint,
+       so whenever fonts.googleapis.com was slow or unreachable the page was
+       white — not "unstyled", *empty* — with no way to tell a slow load from a
+       broken one. `media="print"` makes the fetch non-render-blocking; the
+       onload flips it back to `all` once it lands. Type renders immediately in
+       the fallback and swaps when the webfont arrives (the URL already carries
+       display=swap), and if Google never answers the app still works. -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Hanken+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&family=Silkscreen:wght@400;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Hanken+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&family=Silkscreen:wght@400;700&display=swap"
+        rel="stylesheet" media="print" onload="this.media='all'" />
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Hanken+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&family=Silkscreen:wght@400;700&display=swap" /></noscript>
 
   <link rel="stylesheet" href="css/tokens.css" />
   <link rel="stylesheet" href="css/app.css" />
@@ -56,7 +65,20 @@
     </header>
 
     <div class="content">
-      <main id="view"></main>
+      <main id="view">
+        <!-- Boot placeholder. The app replaces this the moment it has decided
+             whether to show the sign-in card or the workspace; the watchdog at
+             the bottom of this file turns it into an actionable error if that
+             never happens. Before it existed, any failure to boot left this
+             element empty and the topbar hidden — a blank white page whose only
+             affordance was a refresh. -->
+        <div class="loadstate" id="boot">
+          <span class="loadstate__spin" id="bootSpin" aria-hidden="true"></span>
+          <p id="bootMsg" role="status">Loading Routiner…</p>
+          <p class="loadstate__hint" id="bootHint" hidden></p>
+          <button class="btn btn--primary" id="bootRetry" hidden>Reload</button>
+        </div>
+      </main>
     </div>
   </div>
 
@@ -74,6 +96,51 @@
 
   <div class="toasts" id="toasts"></div>
 
+  <!-- ── Boot watchdog ──
+       A classic (non-module) script so it runs even if the module graph below
+       is what's broken. Its whole job is to make sure a failed or slow boot
+       says something instead of showing an empty page: a stuck load is
+       indistinguishable from a broken one, and the only move a blank page
+       leaves you is refreshing until it happens to work. -->
+  <script>
+    (function () {
+      var el = function (id) { return document.getElementById(id); };
+      var settled = false;
+      /* Long enough that a slow-but-working connection is never accused of
+         failing; short enough that nobody sits on a dead page. */
+      var timer = setTimeout(function () {
+        stall('Still loading…', 'Routiner is taking longer than usual to reach Supabase. Check your connection, then reload.');
+      }, 12000);
+
+      function stall(msg, hint) {
+        if (settled) return;
+        var m = el('bootMsg'), h = el('bootHint'), r = el('bootRetry'), s = el('bootSpin');
+        if (!m) return;
+        m.textContent = msg;
+        if (h) { h.textContent = hint; h.hidden = false; }
+        if (r) { r.hidden = false; r.onclick = function () { location.reload(); }; }
+        if (s) s.hidden = true;
+      }
+
+      /* Called by js/app.js once init() has resolved and painted something. */
+      window.__routinerBooted = function () { settled = true; clearTimeout(timer); };
+      window.__routinerBootFailed = function (why) {
+        clearTimeout(timer);
+        stall('Routiner didn’t start', why || 'Something went wrong while starting up. Reload to try again.');
+        settled = true;
+      };
+
+      /* The module itself failed to download or parse — the case that used to
+         produce a permanently blank page. Report it immediately rather than
+         waiting out the watchdog. */
+      window.addEventListener('error', function (e) {
+        if (e && e.target && e.target.tagName === 'SCRIPT' && !settled) {
+          clearTimeout(timer);
+          stall('Routiner didn’t start', 'A required script failed to load. Reload to try again.');
+        }
+      }, true);
+    })();
+  </script>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

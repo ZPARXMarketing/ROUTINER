@@ -8,7 +8,15 @@
    prompt as a session turn.
    ============================================================ */
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+/* Vendored, same-origin (js/vendor/supabase-js.js) — NOT a CDN import.
+   This used to be `https://esm.sh/@supabase/supabase-js@2`, which put two
+   serial third-party round trips in front of every cold load: esm.sh resolves
+   the unpinned `@2` tag with a short-TTL redirect stub, then serves the build.
+   A module that fails to load takes the whole app with it, and because the
+   topbar starts hidden the result was a blank white page with nothing to click
+   — the "refresh a few times and it finally works" bug. Regenerate the bundle
+   with `node scripts/vendor-supabase.mjs`. */
+import { createClient } from './vendor/supabase-js.js';
 import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 import {
   MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
@@ -301,18 +309,40 @@ const toRow = (o) => ({
 const localTz = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch { return null; } };
 
 /* ---------- Data layer ---------- */
+/* The first load is the one that decides whether the app "works", so it does
+   not get to fail on a single dropped request. One silent retry absorbs the
+   ordinary blip (a sleeping iPad's first request after wake almost always
+   fails); anything past that becomes a visible error with a Try again button,
+   because the old behaviour — a toast over an empty page — left refreshing as
+   the only way forward. */
 async function loadAll() {
+  try {
+    await loadAllOnce();
+  } catch (e) {
+    try {
+      await loadAllOnce();
+    } catch (e2) {
+      console.warn('[routiner] initial load failed:', e2);
+      showLoadError(e2, () => loadAll());
+    }
+  }
+}
+
+async function loadAllOnce() {
   const [rRes, runRes, setRes] = await Promise.all([
     sb.from('routiner_routines').select('*').order('updated_at', { ascending: false }),
     sb.from('routiner_runs').select('*').order('fired_at', { ascending: false }).limit(200),
     sb.from('routiner_settings').select('*').maybeSingle(),
   ]);
+  /* postgrest-js resolves rather than throws on a network error, so a failed
+     fetch arrives here as `error` on the result — surface it as a throw so the
+     retry path above sees it. */
+  if (rRes.error) throw new Error(rRes.error.message || 'Could not read your routines');
   accountsCfg = normalizeAccounts(setRes && setRes.data && setRes.data.accounts, false);
   // Apply the user's saved auto-routing policy so previews/cards match what the
   // scheduler will fire (null/invalid → built-in default).
   settingsPolicy = normalizePolicy(setRes && setRes.data && setRes.data.model_policy);
   setActivePolicy(settingsPolicy);
-  if (rRes.error) { toast('Load failed: ' + rRes.error.message, 'error'); return; }
   routines = (rRes.data || []).map(fromRow);
   runs = (runRes.data || []).map((x) => ({
     id: x.id, routineId: x.routine_id, title: x.title, status: x.status, output: x.output, firedAt: x.fired_at,
@@ -2723,6 +2753,7 @@ function showAuth(mode = 'signin') {
 function showApp() {
   const bar = $('#topbar'); if (bar) bar.style.display = '';
   $('.app')?.classList.remove('is-auth');
+  $('.content')?.classList.remove('content--flush');
 
   const email = session.user.email || '';
   const chip = $('#userChip');
@@ -2730,7 +2761,65 @@ function showApp() {
   const who = $('#acctWho');
   if (who) who.textContent = email;
   syncTabs();
+  /* Paint a loading state *now*. loadAll() is a network round trip and it is
+     render() at the end of it that finally replaces the view — so until this
+     existed, a signed-in user stared at the sign-in card they had just used
+     while their data loaded, and at a stalled load they stared at it forever.
+     That reads as "it didn't load" and gets refreshed. */
+  showLoading('Loading your routines…');
   loadAll();
+}
+
+/* ---------- Load / boot failure surfaces ----------
+   Every one of these exists because the alternative was a screen with nothing
+   on it. A blank page is indistinguishable from a hung one, so the only move it
+   leaves the reader is a refresh — which is the bug being reported. */
+function showLoading(msg) {
+  view.innerHTML = `<div class="loadstate"><span class="loadstate__spin" aria-hidden="true"></span>
+    <p>${esc(msg)}</p></div>`;
+}
+
+/* A dead end the reader can act on: what failed, and a button that retries the
+   fetch in place (no full reload, so an unsaved drawer or scroll isn't lost). */
+function showLoadError(err, retry) {
+  const why = (err && err.message) || String(err || 'Unknown error');
+  view.innerHTML = `<div class="grid"><div class="empty">
+    <h3>Couldn’t load your routines</h3>
+    <p>${esc(why)}</p>
+    <p class="loadstate__hint">This is usually a dropped connection. Retrying is safe — nothing was changed.</p>
+    <button class="btn btn--primary" data-act="retry">Try again</button>
+  </div></div>`;
+  $('[data-act="retry"]', view)?.addEventListener('click', () => { showLoading('Retrying…'); retry(); });
+}
+
+/* Reject after `ms` instead of waiting forever.
+   supabase-js serializes auth-storage access behind a Web Lock. A lock held by
+   a tab the OS killed — or a token refresh stuck on a connection that went away
+   without closing, which is routine on iPadOS when Safari suspends a
+   backgrounded tab — leaves getSession() pending with no timeout of its own.
+   Every caller here awaits it, so one wedged lock froze the whole boot. */
+function withTimeout(p, ms, what) {
+  let t;
+  return Promise.race([
+    Promise.resolve(p).finally(() => clearTimeout(t)),
+    new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out after ${Math.round(ms / 1000)}s`)), ms); }),
+  ]);
+}
+
+/* Read the persisted session straight out of storage, bypassing the lock.
+   Only used when getSession() times out: it lets a boot that would otherwise
+   dead-end still come up signed in. Returns null unless the token is present
+   and not already expired — a stale token would just fail on first use. */
+function sessionFromStorage() {
+  try {
+    const raw = localStorage.getItem('routiner-auth');
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    const sess = s && (s.currentSession || s.session || s);
+    if (!sess || !sess.access_token || !sess.user) return null;
+    if (sess.expires_at && sess.expires_at * 1000 <= Date.now()) return null;
+    return sess;
+  } catch { return null; }
 }
 
 /* ---------- Viewport height ----------
@@ -2779,15 +2868,35 @@ function wireOnce() {
 
 async function init() {
   wireOnce();
-  const { data } = await sb.auth.getSession();
-  session = data.session;
+
+  let s = null;
+  try {
+    ({ data: { session: s } } = await withTimeout(sb.auth.getSession(), 8000, 'Reading your session'));
+  } catch (e) {
+    // The auth lock is wedged (see withTimeout). Don't strand the reader on an
+    // empty page: fall back to the stored session so the app still comes up,
+    // and let it fall through to sign-in if there isn't a usable one.
+    console.warn('[routiner] getSession stalled, falling back to stored session:', e);
+    s = sessionFromStorage();
+  }
+  session = s;
   session ? showApp() : showAuth('signin');
-  sb.auth.onAuthStateChange((_event, s) => {
-    const was = !!session; session = s;
-    if (s && !was) { showApp(); toast('Signed in.'); }
-    else if (!s && was) { routines = []; runs = []; notes = []; showAuth('signin'); }
-    else if (s && was) { /* token refresh — ignore */ }
+
+  sb.auth.onAuthStateChange((_event, s2) => {
+    const was = !!session; session = s2;
+    if (s2 && !was) { showApp(); toast('Signed in.'); }
+    else if (!s2 && was) { routines = []; runs = []; notes = []; showAuth('signin'); }
+    else if (s2 && was) { /* token refresh — ignore */ }
   });
 }
 
-init();
+/* Tell index.html's boot watchdog we got this far, so it stops counting and
+   takes its placeholder down. Anything that throws before this point leaves the
+   page blank, so it has to be reported rather than swallowed. */
+init().then(
+  () => window.__routinerBooted?.(),
+  (e) => {
+    console.error('[routiner] boot failed:', e);
+    window.__routinerBootFailed?.((e && e.message) || String(e));
+  },
+);

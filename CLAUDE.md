@@ -477,6 +477,39 @@ triggers runs it truly in parallel.
 
 - `index.html`, `css/tokens.css` (vendored ZPARX tokens), `css/app.css`,
   `js/app.js` (single-page UI, ES module).
+- **Nothing the browser waits on to boot may be third-party, and nothing may
+  fail silently.** For a long time the app "frequently had trouble loading —
+  refresh a few times and it works". That was never one bug; it was four ways to
+  reach the same blank white page, and a blank page hides its own cause, which
+  is why it read as flakiness rather than as a defect. Verified end-to-end in a
+  real browser by **`node scripts/test-boot.mjs`** (Playwright; skips cleanly if
+  Chromium isn't installed) — run it if you touch the boot path.
+  - **supabase-js is vendored** at `js/vendor/supabase-js.js`, *not* imported
+    from esm.sh. A CDN import put two serial third-party round trips in front of
+    every cold load (esm.sh resolves the unpinned `@2` tag with a short-TTL
+    redirect stub, then serves the build) — and a module that fails to fetch
+    takes the whole graph with it. Regenerate with
+    `node scripts/vendor-supabase.mjs [version]`; it is a hand-run script, not a
+    deploy step (the site publishes the repo as-is).
+  - **The Google Fonts stylesheet loads non-blocking** (`media="print"`,
+    flipped to `all` on load). A plain `<link rel="stylesheet">` to a third-party
+    host blocks first paint, so a slow font CDN produced an *empty* page — not an
+    unstyled one. Measured: with the blocking link, a font host that hangs paints
+    nothing for 10s+; the test asserts this behaviourally, not just by attribute.
+  - **`getSession()` is raced against a timeout**, with the stored session as a
+    fallback. supabase-js serializes auth-storage access behind a Web Lock, and a
+    lock held by a tab the OS killed — routine on iPadOS, which suspends
+    backgrounded tabs — never resolves. `init()` awaited it with no timeout, so
+    one wedged lock froze boot outright.
+  - **The first data load retries once, then shows a *Try again* button.** It
+    used to toast the error over an empty `<main>`, leaving refresh as the only
+    way forward. Related: `showApp()` now paints a loading state immediately —
+    before, a signed-in user stared at the sign-in card they had just used until
+    `loadAll()`'s `render()` finally replaced it.
+  - **`index.html` carries a boot watchdog** (a classic script, so it survives
+    the module graph being what's broken) plus a placeholder in `#view`. If
+    nothing has booted in 12s, or a script errors, it says so and offers Reload.
+    `js/app.js` calls `window.__routinerBooted()` / `__routinerBootFailed()`.
 - **Shell:** one top rail (`.topbar`) carries the brand, the nav tabs and the
   actions (clock · budget chip · a **+** for a new routine · account menu); the body below it
   is the only scrolling region. The rail stays a single row down to 1140px —
