@@ -19,7 +19,9 @@ src = src.replace(/^import "jsr:.*$/m, "// jsr import stripped");
 src += `
 export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudgetStop,
          normalizeAgentBranch, deniedWritePath, segmentMadeProgress, resolveReasoning,
-         parseReasoningEffort, exhaustedMessage, detectOpenedPr };
+         parseReasoningEffort, exhaustedMessage, detectOpenedPr,
+         looksLikeKeyLimit, isKeyExhausted };
+export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
 writeFileSync(OUT, src);
@@ -73,6 +75,64 @@ eq("503 is transient on any prose", m.isTransientModelError("something odd", 503
 eq("402 beats transient-looking prose", m.isTransientModelError("try again later", 402), false);
 // A local cap is ours, not OpenRouter's, and carries no status — still permanent.
 eq("local daily cap permanent", m.isTransientModelError("Daily spend cap reached ($5.00 of $5.00)."), false);
+
+// ── Throttled key vs spent key ───────────────────────────────────────────────
+// Both emit the SAME "Key limit exceeded (total limit)" text, so the string
+// cannot decide it and neither can the 429. We were burned in both directions
+// on this exact message: read as permanent while the key still had $10.49 left
+// (runs died in 0.3s for five days), then read as transient once the key was
+// truly spent at $12.12 of $12 (one run retried a dead key for 8h45m across 45
+// messages). The only honest signal is OpenRouter's own limit_remaining.
+console.log("\n— key exhaustion (throttle vs spent) —");
+eq("429 looks like a key limit", m.looksLikeKeyLimit("anything", 429), true);
+eq("key-limit prose matches statusless", m.looksLikeKeyLimit(KEY_LIMIT), true);
+eq("an unrelated 500 does not", m.looksLikeKeyLimit("Provider returned error", 500), false);
+
+const withKeyApi = async (payload, { ok = true } = {}) => {
+  m.__resetKeyCache();
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok, json: async () => payload });
+  try { return await m.isKeyExhausted("sk-test"); }
+  finally { globalThis.fetch = real; }
+};
+
+eq("spent key (0 left) is exhausted",
+  await withKeyApi({ data: { limit: 12, limit_remaining: 0 } }), true);
+eq("overspent key is exhausted",
+  await withKeyApi({ data: { limit: 12, limit_remaining: -0.13 } }), true);
+eq("throttled key with credit left is NOT exhausted",
+  await withKeyApi({ data: { limit: 12, limit_remaining: 10.49 } }), false);
+// A key with no limit set can never be exhausted this way — it must stay retryable.
+eq("unlimited key is not exhausted",
+  await withKeyApi({ data: { limit: null, limit_remaining: null } }), false);
+// The probe must never manufacture a hard stop when it cannot answer: an
+// unreachable balance endpoint has to leave the error retryable, or a blip in
+// OpenRouter's API would start killing otherwise-healthy runs.
+eq("probe HTTP error stays retryable", await withKeyApi({}, { ok: false }), false);
+eq("probe garbage response stays retryable", await withKeyApi({ data: {} }), false);
+{
+  m.__resetKeyCache();
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("network down"); };
+  eq("probe network failure stays retryable", await m.isKeyExhausted("sk-test"), false);
+  globalThis.fetch = real;
+}
+
+// A "no" must never be cached. The run this fix exists for had credit at 15:58
+// and was spent by 16:04 — caching the first answer would have missed it and
+// let the run retry a dead key for another eight hours.
+{
+  m.__resetKeyCache();
+  const real = globalThis.fetch;
+  let left = 10.49;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ data: { limit: 12, limit_remaining: left } }) });
+  eq("has credit → not exhausted", await m.isKeyExhausted("sk-test"), false);
+  left = 0;
+  eq("runs out mid-run → still detected", await m.isKeyExhausted("sk-test"), true);
+  globalThis.fetch = async () => { throw new Error("must not be called"); };
+  eq("a spent key is cached, not re-probed", await m.isKeyExhausted("sk-test"), true);
+  globalThis.fetch = real;
+}
 
 console.log("\n— compactMessages (context budget) —");
 const big = (n) => "x".repeat(n);

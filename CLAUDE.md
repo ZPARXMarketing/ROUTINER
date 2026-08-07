@@ -181,9 +181,26 @@ threshold before the reaper fires.
 > `resp.status` whenever the body carried a message, so the 429 never reached the
 > classifier, and the deny-list regex short-circuited ahead of the `429|rate.?limit`
 > branch that would have caught it. `OrResult` now carries `status`, and status
-> wins over text in both directions. Retrying a genuine cap is free anyway — a
-> rejected call bills $0 and logs 0 tokens — so when the two signals disagree,
-> prefer the retry.
+> wins over text in both directions.
+
+> **…but "always retry it" was the other half of the same mistake — ask the key,
+> don't infer.** The rule above was then wrong in the opposite direction, because
+> a *throttled* key and a *spent* key emit the **identical** string with the
+> identical 429. On **2026-08-04 16:04 UTC** the key genuinely hit its cap
+> (**$12.12 of a $12 limit**, `limit_remaining: 0`) and every run since has failed
+> — but now nothing failed fast: one run retried a dead key for **8h 45m across
+> 45 messages**, then closed with "Retry to resume", which could only fail the
+> same way. Both readings of that string are unfalsifiable from the string, so
+> **stop classifying it by text or status at all**: OpenRouter reports the answer
+> as a number on `GET /api/v1/key`, and `limit_remaining <= 0` is authoritative.
+> `isKeyExhausted()` probes it *only* when a key-limit error fires; on `true` the
+> run hard-stops with a message naming the real fix, skips the fallback model
+> (same key — futile), and does not auto-continue. Three invariants the tests
+> pin down: an unreachable or garbled probe must stay **retryable** (an
+> OpenRouter API blip must never manufacture a hard stop), a key with **no limit
+> set** can never be "exhausted", and a `false` is **never cached** — the run
+> above had credit at 15:58 and was spent by 16:04, so a cached "no" would miss
+> exactly the case this exists for. Only `true` is final.
 
 ### Tracking spend — the usage meter
 
