@@ -504,7 +504,12 @@ type OrOpts = {
 // transient/permanent signal: the body message is provider prose and has already
 // caused one outage by reading as permanent when it wasn't (see
 // isTransientModelError). Keep it populated on every error path that has one.
-type OrResult = { ok: boolean; message?: any; usage?: any; error?: string; status?: number };
+// `exhausted` marks the one failure that no retry, no fallback model and no
+// auto-continue can rescue: the key has spent its whole limit. It is set only
+// from OpenRouter's own limit_remaining, never inferred from the message.
+type OrResult = {
+  ok: boolean; message?: any; usage?: any; error?: string; status?: number; exhausted?: boolean;
+};
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -535,6 +540,12 @@ async function openrouter(
     last = r;
     // A permanent error repeats identically — don't burn budget or spend on it.
     if (!isTransientModelError(r.error || "", r.status)) return r;
+    // A key-limit error is retryable only while the key still has credit. Ask
+    // OpenRouter rather than guessing from the message, which reads the same
+    // whether the key is throttled for a minute or spent for good.
+    if (looksLikeKeyLimit(r.error || "", r.status) && await isKeyExhausted(key)) {
+      return { ...r, error: keyExhaustedMessage(), exhausted: true };
+    }
     if (attempt < retries) {
       // A throttle needs longer than a flaky provider: backing off 750ms into a
       // rate limit just spends the retry budget re-hitting it.
@@ -1133,6 +1144,66 @@ function isTransientModelError(err: string, status?: number): boolean {
     .test(e);
 }
 
+// ── Is the key throttled, or actually spent? ─────────────────────────────────
+// "Key limit exceeded (total limit)" is emitted for BOTH, and the text is
+// identical in both cases, so neither the prose nor the 429 status can tell them
+// apart. Getting it wrong is expensive in both directions, and we have now been
+// bitten each way on the same error string:
+//
+//   • Read as permanent when it was a throttle (key at $1.51 of $12): runs died
+//     in ~0.3s with no retry and no fallback, for five days.
+//   • Read as transient when the key was genuinely spent ($12.12 of $12): one
+//     run retried a dead key for 8h 45m across 45 messages before giving up,
+//     then told the reader to "Retry" — which could only fail the same way.
+//
+// So stop inferring it. OpenRouter reports the answer as a number on
+// GET /api/v1/key, and `limit_remaining <= 0` is authoritative: the key is spent
+// and every subsequent call fails identically until a human raises the limit.
+// Anything else (no limit set, balance left, or the probe itself failing) keeps
+// the retry behaviour — an unreachable probe must never manufacture a hard stop.
+const KEY_URL = "https://openrouter.ai/api/v1/key";
+
+function looksLikeKeyLimit(err: string, status?: number): boolean {
+  return status === 429 || /key limit exceeded|rate.?limit/i.test(err || "");
+}
+
+// Only a `true` is cached, and deliberately so. A spent key cannot become
+// unspent mid-run, so that answer is final and worth reusing — but the reverse
+// is not true, and caching a `false` would have missed the very run this fix is
+// for: it had credit at 15:58, ran out at 16:04, and kept going for 8h45m. The
+// probe only ever fires on a key-limit error, so re-asking costs nothing real.
+let keySpentCache: boolean | null = null;
+
+async function isKeyExhausted(key: string): Promise<boolean> {
+  if (keySpentCache === true) return true;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 5_000);
+    const r = await fetch(KEY_URL, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: ctl.signal,
+    }).finally(() => clearTimeout(t));
+    if (!r.ok) return false; // can't tell → keep retrying, don't invent a cap
+    const d = await r.json().catch(() => null);
+    const limit = d?.data?.limit;
+    const left = d?.data?.limit_remaining;
+    // No limit configured on the key → it can never be "exhausted" this way.
+    if (limit == null || left == null) return false;
+    const spent = Number(left) <= 0;
+    if (spent) keySpentCache = true; // final — a spent key never refills mid-run
+    return spent;
+  } catch {
+    return false; // network/abort → unknown, so stay retryable
+  }
+}
+
+function keyExhaustedMessage(): string {
+  return "OpenRouter key is out of credit — it has spent its entire configured limit, " +
+    "so every model call is rejected before it runs. Retrying cannot fix this: raise or " +
+    "reset the key's limit at https://openrouter.ai/settings/keys (or set a new " +
+    "OPENROUTER_API_KEY in Supabase edge secrets), then Retry this run.";
+}
+
 
 // Persist transcript mid-run so History shows progress and auto-continue can resume.
 // Never overwrites a user-cancelled run (status=cancelled) with running/success/error.
@@ -1321,7 +1392,10 @@ async function runAgentLoop(opts: {
       // Retries inside openrouter() are already spent by here. If the chosen
       // model is the thing that's broken, finish the job on a reliable one
       // instead of ending the run — the user cares about the task, not the model.
-      const canFallBack = isTransientModelError(err, r.status) && !fellBack && FALLBACK_MODEL &&
+      // The fallback model runs on the SAME key, so a spent key makes it futile:
+      // switching models here just spends another step to fail identically.
+      const canFallBack = !r.exhausted &&
+        isTransientModelError(err, r.status) && !fellBack && FALLBACK_MODEL &&
         FALLBACK_MODEL !== activeModel && allowedModels().has(FALLBACK_MODEL) &&
         callBudget() >= MIN_MODEL_CALL_MS;
       if (canFallBack) {
@@ -1330,7 +1404,12 @@ async function runAgentLoop(opts: {
         activeModel = FALLBACK_MODEL;
         continue; // costs one step; far cheaper than losing the run
       }
-      if (isTransientModelError(err, r.status)) {
+      if (r.exhausted) {
+        // Hard stop. A soft stop would auto-continue and invite a Retry, and both
+        // can only fail the same way until a human raises the key's limit.
+        finalText = `⚠ Run stopped on step ${steps}: ${err}`;
+        incomplete = false;
+      } else if (isTransientModelError(err, r.status)) {
         // Soft stop — checkpoint + auto-continue (do not mark as hard failure).
         finalText = `Paused on step ${steps}: ${err}. Continuing in the background if possible.`;
         incomplete = true;
