@@ -171,6 +171,26 @@ threshold before the reaper fires.
 > hands off elsewhere (4 fired at once, 0 errors), so only agent fires are pooled.
 > Covered by `scripts/test-scheduler.mjs`.
 
+> **"Just add more OpenRouter keys" is the intuitive fix, and the measurement
+> says it would not work.** The symptom invites it — two jobs fired at the same
+> instant fail, so it looks like they are fighting over one key. But the numbers
+> above already rule that out: per-*call* success **improves** under load (92.6%
+> at 8+ calls/min vs 84.3% at 1–3/min), which is the opposite of what a
+> contended key does. What collides is **concurrent edge-function invocations**,
+> each running a whole tool loop inside one Supabase function — a second key
+> would give them a second way to be throttled by the same wall clock, not more
+> room. If you want genuine parallelism, the thing to buy is concurrent
+> *execution*, not concurrent credentials: raise `SCHEDULER_AGENT_CONCURRENCY`
+> only alongside shorter tool loops (smaller `AGENT_CODE_MAX_STEPS`, tighter
+> prompts), or move the loop off the edge function. Until then leave the pool at
+> 1 and **stagger** scheduled agent routines — ~15 minutes apart held 6-for-6 on
+> 2026-08-07, against a 90%-failure baseline when fired together.
+>
+> Practical scheduling note from that same batch: a routine's model comes from
+> the **trigger**, not the row (`pickAgentInstance` — `inst.model` wins over
+> `r.model`), so "give this job a faster model" means switching the account or
+> editing the trigger, not setting `routiner_routines.model`.
+
 > **Classify retries on the HTTP status, never on the provider's prose.** For
 > five days every agent run died on `Key limit exceeded (total limit)`, which
 > reads like an exhausted key — so the retry classifier listed it as permanent
