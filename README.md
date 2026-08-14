@@ -27,6 +27,32 @@ A powerful Claude Code routine planner and scheduler with multi-agent orchestrat
 
 ---
 
+## 🔒 Before You Fork or Publish
+
+This repo ships **no secrets** — API keys and tokens all live in Supabase edge
+secrets / Netlify env vars, never in code. The Supabase URL and publishable
+(anon) key in [`js/config.js`](js/config.js) are *meant* to be public (RLS
+protects every row per-user) — that part is safe as-is.
+
+The one thing that **is** on you before going public: the OpenRouter proxy
+(`supabase/functions/dynamic-responder`) is deployed with `verify_jwt=false`
+and, unless you set `RESPONDER_SECRET`, it is **world-callable** — anyone who
+finds your Supabase URL (trivially visible in this repo) can invoke it and
+spend against your OpenRouter key. Two edge secrets close that:
+
+| Secret | What it does |
+|--------|---------------|
+| `RESPONDER_SECRET` | Requires callers to present a shared secret (`Authorization: Bearer <secret>` or `x-responder-secret`). Without it, the proxy is open. |
+| `MAX_DAILY_SPEND` | Hard USD cap per UTC day, enforced server-side even if the secret leaks. |
+
+Set both in **Supabase → Project Settings → Edge Functions → Secrets** before
+you make the repo public. (`openrouter-agent`, the code-writing agent, is
+already gated — it refuses unauthenticated callers by default.) See
+[`CLAUDE.md`](CLAUDE.md) for the full hardening list (`ALLOWED_MODELS`,
+`GITHUB_ALLOWED_REPOS`, `AGENT_ALLOW_MERGE`, etc.).
+
+---
+
 ## 🎯 What is Routiner?
 
 Routiner is a **swarm-based task orchestration platform** that schedules and executes Claude Code routines across multiple accounts simultaneously. 
