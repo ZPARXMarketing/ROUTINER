@@ -8,8 +8,6 @@ routines carry it out on a schedule. Two surfaces matter:
 - **Calendar** — scheduled routines render as timed, color-coded blocks.
 
 All live state is in **Supabase** (RLS per user), *not* in this repo's files.
-(The `routines/` folder is a legacy file-based executor — see the note at the
-bottom; it is no longer used.)
 
 ## Offloading cheap work to OpenRouter (optional, you decide)
 
@@ -658,7 +656,6 @@ triggers runs it truly in parallel.
 - Styling follows the ZPARX design system: dark-mode-first; lime and yellow are
   dark-surface-only accents.
 
-> **Legacy:** the `routines/` folder (`scheduled/`, `done/`, `logs/`,
-> `README.md`) is an older file-based executor that predates the Supabase
-> backend. It is retained for reference only — the app no longer reads or writes
-> those files. Don't use it; plan/schedule through Supabase as above.
+> **Legacy:** an older file-based executor (a `routines/` folder with
+> `scheduled/`/`done/`/`logs/` subfolders) predated the Supabase backend and has
+> been removed. Plan/schedule through Supabase as above.
