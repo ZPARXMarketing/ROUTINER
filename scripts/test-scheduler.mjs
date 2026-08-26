@@ -16,11 +16,17 @@ import { readFileSync, writeFileSync } from "node:fs";
 const SRC = new URL("../supabase/functions/routiner-scheduler/index.ts", import.meta.url).pathname;
 let src = readFileSync(SRC, "utf8");
 src = src.replace(/^import "jsr:.*$/m, "// jsr import stripped");
-src += `\nexport { drainWithLimit, accountKind };\n`;
+src += `\nexport { drainWithLimit, accountKind, checkKeyBalance };\n`;
 const OUT = `${process.env.TMPDIR || "/tmp"}/scheduler_under_test.ts`;
 writeFileSync(OUT, src);
 
-globalThis.Deno = { env: { get: () => undefined }, serve: () => {} };
+// A key must be present or the balance alarm short-circuits on "no-key" before
+// it ever reaches the logic under test. Everything else stays unset so the
+// module's own defaults are what get exercised.
+globalThis.Deno = {
+  env: { get: (n) => (n === "OPENROUTER_API_KEY" ? "sk-test" : undefined) },
+  serve: () => {},
+};
 const m = await import(OUT);
 
 let pass = 0, fail = 0;
@@ -105,6 +111,65 @@ eq("agent detected", m.accountKind(accts, "a_agent"), "openrouter-agent");
 eq("lead enrichment detected", m.accountKind(accts, "a_leads"), "openrouter");
 eq("unknown account → claude", m.accountKind(accts, "nope"), "claude");
 eq("no settings → claude", m.accountKind(null, "a_agent"), "claude");
+
+console.log("\n— key-balance alarm —");
+// The largest outage this system has had was silent: the key hit its cap and
+// every agent run failed for three weeks because nothing watched the balance.
+// These pin the two ways a watchdog can be worse than none — crying wolf, and
+// staying quiet when it matters.
+const KEY_API = "https://openrouter.ai/api/v1/key";
+const withKey = async (payload, { ok = true, throws = false, board = [], insertOk = true } = {}) => {
+  const real = globalThis.fetch;
+  const writes = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u === KEY_API) {
+      if (throws) throw new Error("network down");
+      return { ok, json: async () => payload };
+    }
+    if (u.includes("routiner_notes") && (init.method || "GET") === "GET") {
+      return { ok: true, json: async () => board };
+    }
+    if (u.includes("routiner_notes")) { writes.push(JSON.parse(init.body)); return { ok: insertOk }; }
+    if (u.includes("routiner_routines")) {
+      return { ok: true, json: async () => [{ user_id: "user-1" }] };
+    }
+    return { ok: true, json: async () => [] };
+  };
+  try { return { result: await m.checkKeyBalance(), writes }; }
+  finally { globalThis.fetch = real; }
+};
+
+const LIMITED = (left) => ({ data: { limit: 12, limit_remaining: left } });
+
+let r = await withKey(LIMITED(9.5));
+eq("healthy balance stays quiet", r.result, "ok");
+eq("…and writes nothing", r.writes.length, 0);
+
+r = await withKey(LIMITED(0));
+eq("a spent key warns", r.result, "warned-spent");
+eq("…names the remaining balance", /\$0\.00 remaining/.test(r.writes[0].body), true);
+eq("…carries the marker for cooldown lookups", r.writes[0].body.includes("[key-balance]"), true);
+eq("…and lands as an active board note", r.writes[0].status, "active");
+
+r = await withKey(LIMITED(0.4));
+eq("a nearly-spent key warns before it dies", r.result, "warned-low");
+
+// A key with no cap configured can never run out this way — alarming on it
+// would cry wolf every 15 minutes forever.
+r = await withKey({ data: { limit: null, limit_remaining: null } });
+eq("an uncapped key never alarms", r.result, "no-limit");
+
+// An unreachable or garbled probe must stay silent: an OpenRouter blip must not
+// manufacture a scare note on a key that is perfectly healthy.
+eq("an HTTP error is silent", (await withKey({}, { ok: false })).result, "probe-failed");
+eq("a network failure is silent", (await withKey(LIMITED(0), { throws: true })).result, "probe-failed");
+eq("a garbled payload is silent", (await withKey({ data: {} })).result, "no-limit");
+
+// Cooldown: one note per window, or a spent key files 1,440 notes a day.
+r = await withKey(LIMITED(0), { board: [{ id: "existing" }] });
+eq("an existing recent note suppresses a duplicate", r.result, "already-warned");
+eq("…and writes nothing", r.writes.length, 0);
 
 console.log(`\n${fail ? "FAILURES" : "ALL PASS"}: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

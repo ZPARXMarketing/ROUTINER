@@ -1815,6 +1815,28 @@ function segmentMadeProgress(actions: string[], finalText: string): boolean {
 // would inherit the same obstacle and burn a segment failing the same way —
 // which is exactly what happened when a spent key was retried for 8h45m. A
 // block is a state with a named cause, so it stops the chain and says why.
+/**
+ * Reconcile a goal against how the run actually ended.
+ *
+ * The first live smoke test filed `success` while its own goal still read
+ * `phase: active`, `done: []` — the model set the goal once and never touched
+ * it again. On a one-segment run that is only untidy, but the goal exists to
+ * carry intent ACROSS segments: a stale "nothing done yet" is read by the next
+ * segment's orientation turn as work still outstanding, so the run is invited
+ * to redo what it already finished. Trusting the model to keep it current is
+ * what failed; the run's real outcome is the authority.
+ *
+ * Only the terminal transition is inferred. `done`/`remaining` are the model's
+ * to describe and are never invented here.
+ */
+function reconcileGoal(goal: RunGoal | null, status: string): RunGoal | null {
+  if (!goal) return null;
+  if (status === "success" && goal.phase === "active") {
+    return { ...goal, phase: "complete" };
+  }
+  return goal;
+}
+
 function goalBlockStop(goal: RunGoal | null, finalText = ""): string | null {
   if (!goal || goal.phase !== "blocked" || !goal.blocked_reason) return null;
   const notice = `⛔ Blocked (${goal.blocked_reason.code}): ${goal.blocked_reason.message}\n\n`
@@ -1909,8 +1931,20 @@ async function runAgentLoop(opts: {
     // touches, so re-reading it costs a few hundred tokens and replaces an
     // archaeology exercise over floored tool results.
     const carried = renderGoal(goalRef.current);
+    // A goal carried into a later segment with nothing marked done is the
+    // failure this nudge exists for: the first live run set its goal once and
+    // never updated it, so a resumed segment would read "nothing done yet" and
+    // be invited to redo finished work. Say so where it is actionable.
+    const staleGoal = (opts.depth ?? 0) > 0
+      && goalRef.current !== null
+      && goalRef.current.done.length === 0;
+    const upkeep = staleGoal
+      ? "This goal still lists nothing as done, though a previous segment already ran. "
+        + "Before doing anything else, call set_goal to move what is finished into `done` — "
+        + "an out-of-date goal will have you repeat work you have already completed."
+      : "Update this with set_goal as you make progress.";
     const body = carried
-      ? `${segmentOrientation(opts.depth ?? 0, elapsed, DEADLINE_MS)}\n\n${carried}\n\nUpdate this with set_goal as you make progress.`
+      ? `${segmentOrientation(opts.depth ?? 0, elapsed, DEADLINE_MS)}\n\n${carried}\n\n${upkeep}`
       : `${segmentOrientation(opts.depth ?? 0, elapsed, DEADLINE_MS)}\n\n`
         + "No goal recorded yet. Call set_goal early with the objective and your plan — it is the only part of your intent that survives into the next segment.";
     messages.push({ role: "user", content: body, _source: SRC_ORIENTATION });
@@ -2252,7 +2286,8 @@ async function handleRequest(req: Request): Promise<Response> {
       : finalText;
     const output = `${note}${recap}`.slice(0, OUTPUT_CAP);
 
-    await checkpointRun(runId, { status, output, messages, model: modelUsed, ...(goal ? { goal } : {}) });
+    const finalGoal = reconcileGoal(goal, status);
+    await checkpointRun(runId, { status, output, messages, model: modelUsed, ...(finalGoal ? { goal: finalGoal } : {}) });
 
     return json({
       ok: true, runId, output, steps, cost: Number(cost.toFixed(6)), model: modelUsed, keySource,
@@ -2360,7 +2395,8 @@ async function handleRequest(req: Request): Promise<Response> {
   const output = `${note}${recap}`.slice(0, OUTPUT_CAP);
 
   if (newRunId) {
-    await checkpointRun(newRunId, { status, output, messages, model: modelUsed, ...(goal ? { goal } : {}) });
+    const finalGoal = reconcileGoal(goal, status);
+    await checkpointRun(newRunId, { status, output, messages, model: modelUsed, ...(finalGoal ? { goal: finalGoal } : {}) });
   } else if (userId) {
     // Fallback: no early id (insert failed) — try one final insert.
     newRunId = await insertRunningRun({

@@ -56,6 +56,23 @@ const FIRE_TIMEOUT_MS = num("SCHEDULER_FIRE_TIMEOUT_MS", 30_000); // don't let o
 // Agent runs insert status=running and bump fired_at each checkpoint (~≤3 min while alive).
 // Silent longer than this → edge function died mid-flight; flip to error so History is honest.
 const REAP_RUN_MIN = num("SCHEDULER_REAP_RUN_MIN", 10);
+// ── Key-balance alarm ────────────────────────────────────────────────────────
+// The single largest outage this system has had was silent: the OpenRouter key
+// hit its cap on 2026-08-04 and every agent run failed for three weeks, because
+// nothing watched the balance and the usage meter only helps a human who
+// thinks to open it. The number is authoritative and one HTTP call away —
+// `limit_remaining` on GET /api/v1/key — so the scheduler that already wakes
+// every minute checks it and writes a Board note the first time it goes low.
+// A note, not a run row: History is a log of work, and this is not work.
+const KEY_ALERT_USD = Number(Deno.env.get("SCHEDULER_KEY_ALERT_USD") ?? "1");
+// Re-alert at most this often, so a spent key files one note a day, not 1,440.
+const KEY_ALERT_COOLDOWN_H = num("SCHEDULER_KEY_ALERT_COOLDOWN_H", 24);
+const KEY_URL = "https://openrouter.ai/api/v1/key";
+// The scheduler wakes every minute; probing the balance that often would be
+// 1,440 calls a day to answer a question that changes slowly. An edge function
+// keeps no state between invocations, so pace it off the wall clock instead:
+// run the probe only on minutes divisible by this.
+const KEY_CHECK_EVERY_MIN = num("SCHEDULER_KEY_CHECK_EVERY_MIN", 15);
 // Max `openrouter-agent` routines fired at once. A Claude /fire is a cheap POST
 // that returns immediately (the session runs elsewhere), but an agent fire spins
 // up a whole tool loop inside another edge function — firing several at once
@@ -390,6 +407,93 @@ async function logRun(r: Record<string, unknown>, status: string, output: string
   });
 }
 
+/**
+ * Warn on the Board when the OpenRouter key is nearly or fully spent.
+ *
+ * Deliberately conservative in both directions. It writes only when the key
+ * reports a real limit AND the remaining balance is at or below the threshold,
+ * so a key with no cap configured never alarms; and an unreachable or garbled
+ * probe writes nothing at all, because an OpenRouter API blip must not
+ * manufacture a scare note every minute.
+ *
+ * @returns what happened, for the scheduler's JSON response.
+ */
+async function checkKeyBalance(): Promise<string> {
+  const key = Deno.env.get("OPENROUTER_API_KEY");
+  if (!key) return "no-key";
+  let left: number | null = null;
+  let limit: number | null = null;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 5_000);
+    const r = await fetch(KEY_URL, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: ctl.signal,
+    }).finally(() => clearTimeout(t));
+    if (!r.ok) return "probe-failed";
+    const d = await r.json().catch(() => null);
+    limit = d?.data?.limit ?? null;
+    left = d?.data?.limit_remaining ?? null;
+  } catch {
+    return "probe-failed";
+  }
+  // No cap on the key → there is no balance to run out of.
+  if (limit == null || left == null) return "no-limit";
+  if (Number(left) > KEY_ALERT_USD) return "ok";
+
+  // Cooldown: one note per window, found by its own marker so no extra table
+  // is needed and a human deleting the note simply re-arms the alarm.
+  const since = new Date(Date.now() - KEY_ALERT_COOLDOWN_H * 3_600_000).toISOString();
+  try {
+    const recent = await fetch(
+      rest(`routiner_notes?body=like.${encodeURIComponent("%[key-balance]%")}` +
+           `&created_at=gte.${encodeURIComponent(since)}&select=id&limit=1`),
+      { headers: dbHeaders },
+    );
+    const rows = recent.ok ? await recent.json().catch(() => []) : [];
+    if (Array.isArray(rows) && rows.length > 0) return "already-warned";
+  } catch {
+    // Can't read the board — fall through and write. A duplicate note is a far
+    // smaller problem than a missed one.
+  }
+
+  const spent = Number(left) <= 0;
+  const body = `[key-balance] ⚠ OpenRouter key ${spent ? "is SPENT" : "is nearly spent"}: `
+    + `$${Number(left).toFixed(2)} remaining of a $${Number(limit).toFixed(2)} limit.\n\n`
+    + (spent
+      ? "Every agent run will fail until the limit is raised or the key is replaced. "
+      : `Agent runs will start failing once this reaches $0. `)
+    + "Raise the cap at https://openrouter.ai/settings/keys, or set a new "
+    + "OPENROUTER_API_KEY edge secret.\n\n"
+    + "This note is written by the scheduler at most once per "
+    + `${KEY_ALERT_COOLDOWN_H}h; delete it to re-arm the alarm sooner.`;
+
+  // Owner: the account that owns the routines this key actually fires. Picking
+  // the most recent routine's owner keeps the note in front of the person whose
+  // work is about to stop.
+  let userId: string | null = null;
+  try {
+    const who = await fetch(
+      rest("routiner_routines?select=user_id&order=created_at.desc&limit=1"),
+      { headers: dbHeaders },
+    );
+    const rows = who.ok ? await who.json().catch(() => []) : [];
+    userId = Array.isArray(rows) && rows[0]?.user_id ? String(rows[0].user_id) : null;
+  } catch { /* fall through: without an owner the note cannot be filed */ }
+  if (!userId) return "no-owner";
+
+  try {
+    const ins = await fetch(rest("routiner_notes"), {
+      method: "POST",
+      headers: { ...dbHeaders, "Content-Type": "application/json", Prefer: "return=minimal" },
+      body: JSON.stringify({ user_id: userId, body, status: "active" }),
+    });
+    return ins.ok ? (spent ? "warned-spent" : "warned-low") : "write-failed";
+  } catch {
+    return "write-failed";
+  }
+}
+
 // Mark agent runs that stayed status=running with no fired_at bump for REAP_RUN_MIN
 // as error. Only openrouter-agent writes status=running (scheduler logRun writes
 // success/error/missed), so this cannot touch Claude-trigger rows. Does not auto-
@@ -623,6 +727,18 @@ Deno.serve(async () => {
     console.error("reapStaleRuns failed", e);
   }
 
+  // Watch the key's balance on a slow cadence. Never allowed to block firing:
+  // a failed balance probe must not stop the routines that still have credit.
+  let keyCheck = "skipped";
+  if (new Date().getUTCMinutes() % Math.max(1, KEY_CHECK_EVERY_MIN) === 0) {
+    try {
+      keyCheck = await checkKeyBalance();
+    } catch (e) {
+      console.error("checkKeyBalance failed", e);
+      keyCheck = "probe-failed";
+    }
+  }
+
   const nowIso = new Date().toISOString();
   const dueRes = await fetch(
     rest(
@@ -692,7 +808,7 @@ Deno.serve(async () => {
   }));
   const fired = results.filter((r) => r.status === "success").length;
 
-  return new Response(JSON.stringify({ ok: true, due: due.length, fired, reaped, results }), {
+  return new Response(JSON.stringify({ ok: true, due: due.length, fired, reaped, keyCheck, results }), {
     headers: { "Content-Type": "application/json" },
   });
 });
