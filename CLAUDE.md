@@ -138,7 +138,9 @@ After deploy, these optional secrets tune the agent path:
 | `RESPONDER_REASONING_EFFORT` | `low` | Same for `dynamic-responder` (body `reasoning` wins) |
 | `AGENT_MODEL_RETRIES` | `2` | Retries for a **transient** OpenRouter failure inside one step (`Provider returned error`, 5xx, timeout, **429 throttle**). Permanent errors — bad key (401/403), out of credit (402), disallowed model — still fail fast |
 | `AGENT_FALLBACK_MODEL` | `moonshotai/kimi-k2.7-code` | If the chosen model keeps failing transiently, the run finishes on this one instead of dying. Set to `""` to disable |
-| `AGENT_CONTEXT_TOOL_BUDGET` | `60000` | Total chars of tool output kept at full size in the model's context. Older results are floored at 400 chars |
+| `AGENT_CONTEXT_TOOL_BUDGET` | `60000` | Total chars of tool output kept at full size in the model's context. Older results are floored at 400 chars — **head *and* tail**, not head-only |
+| `AGENT_REPEAT_THRESHOLDS` | `3,5,8` | Consecutive identical tool calls that trigger an advisory nudge. `off` disables. Must be distinct integers ≥ 2 |
+| `AGENT_REPEAT_EXCLUDE` | *(empty)* | Comma-separated tool-name patterns (`*` wildcards) that are **transparent** to the repeat chain — they neither count nor reset it |
 | `AGENT_MAX_STEPS` | `5` | Tool-loop steps per edge invocation (non-code) |
 | `AGENT_CODE_MAX_STEPS` | `12` | Tool-loop steps when the `code` tool group is enabled |
 | `AGENT_MAX_NO_PROGRESS` | `2` | Consecutive auto-continue segments with no tools/text before the chain stops with `error` |
@@ -168,6 +170,43 @@ threshold before the reaper fires.
 > model or network faults. A Claude `/fire` is exempt: it's a cheap POST that
 > hands off elsewhere (4 fired at once, 0 errors), so only agent fires are pooled.
 > Covered by `scripts/test-scheduler.mjs`.
+
+> **"Did any tool run?" is not a test for progress.** `segmentMadeProgress` asks
+> whether *any* tool ran or the model produced real text — so an agent calling
+> `gh_read_file` with the identical path twelve times in a row scored full
+> progress every segment, burned the step budget, and auto-continued into another
+> segment doing the same thing. The repeat guard counts **consecutive identical**
+> calls — keyed on `(tool name, deep-key-sorted arguments)`, so argument order
+> can't disguise a repeat — and injects an escalating nudge at
+> `AGENT_REPEAT_THRESHOLDS`. Three properties are load-bearing and pinned by
+> `scripts/test-agent.mjs`: it is **advisory** (it never vetoes or rewrites a
+> call — a legitimately repeated call must not be blocked); excluded tools are
+> **transparent**, neither counting nor resetting, or a bookkeeping call
+> interleaved into a loop launders it; and the chain is derived from the stored
+> transcript rather than held in memory, because an auto-continue segment is a
+> fresh edge invocation and in-memory state would reset at exactly the boundary a
+> stuck run is most likely to cross. A *human* reply resets the chain; the
+> injected `[auto-continue]` prompt does not.
+
+> **A turn the machine injected is not a turn the human typed.** Both were a bare
+> `role:"user"`, so History rendered every `[auto-continue]` prompt as if the
+> human had sent it, and any "did the user say something?" test counted a machine
+> nudge as a human interjection — which is precisely the reset the repeat guard
+> above must not honour. Injected turns now carry `_source`
+> (`auto-continue` / `repeat-guard`), which stays in the stored transcript and
+> renders as a collapsed notice, never a user bubble. It is stripped in
+> `compactMessages` before the request: it is ours, not OpenAI's, and an unknown
+> message field is a 400 on the strict providers.
+
+> **The context floor keeps a tail, and slices by code point.** For every GitHub
+> tool here the answer tends to sit at the *end* — `gh_read_pr`'s per-file
+> patches, an error line appended after a successful-looking preamble, the last
+> entries of a directory listing. Head-only flooring discarded exactly the part
+> the model needed and sent it back to re-read the same file, manufacturing the
+> loop the repeat guard then has to catch. Same 400 chars, split head/tail.
+> Slicing is by Unicode code point: `String.slice` cuts a surrogate pair in half
+> and emits a lone surrogate, which then rides into a jsonb column and a JSON
+> request body as invalid text.
 
 > **Classify retries on the HTTP status, never on the provider's prose.** For
 > five days every agent run died on `Key limit exceeded (total limit)`, which

@@ -945,6 +945,27 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   word-break: break-word;
   color: var(--text-mid);
 }
+/* Machine-injected turns (auto-continue, repeat guard). Deliberately NOT a user
+   bubble: the human did not say this, and rendering it as though they had made
+   the transcript misleading about who drove the run. */
+.transcript__notice { align-self: flex-start; max-width: 100%; font-size: 12px; }
+.transcript__notice summary {
+  cursor: pointer;
+  color: var(--text-low);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.transcript__notice pre {
+  margin-top: var(--sp-2);
+  background: var(--bg-elevated);
+  border: 1px dashed var(--hairline);
+  border-radius: var(--r-sm);
+  padding: var(--sp-3);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-mid);
+}
 /* Model thoughts: collapsible, muted — separate from the answer bubble (Claude-style). */
 .transcript__thought {
   align-self: stretch;

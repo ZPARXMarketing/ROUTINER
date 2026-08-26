@@ -20,7 +20,8 @@ src += `
 export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudgetStop,
          normalizeAgentBranch, deniedWritePath, segmentMadeProgress, resolveReasoning,
          parseReasoningEffort, exhaustedMessage, detectOpenedPr,
-         looksLikeKeyLimit, isKeyExhausted };
+         looksLikeKeyLimit, isKeyExhausted,
+         repeatKey, repeatChainCount, repeatReminder, isHumanTurn, headTail };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -145,13 +146,101 @@ const msgs = [
 ];
 const out = m.compactMessages(msgs, 60_000);
 const toolLens = out.filter((x) => x.role === "tool").map((x) => x.content.length);
-eq("newest kept full, older floored", toolLens, [425, 425, 50_000]);
+const FLOORED = 400 + "\n…[truncated for context]…\n".length;
+eq("newest kept full, older floored", toolLens, [FLOORED, FLOORED, 50_000]);
 eq("total tool chars under control", toolLens.reduce((a, b) => a + b, 0) <= 61_000, true);
 eq("input not mutated", msgs[1].content.length, 50_000);
 eq("non-tool untouched", out[0].content, "sys");
 const small = [{ role: "tool", content: "tiny" }, { role: "tool", content: big(70_000) }];
 eq("small results never truncated", m.compactMessages(small, 10)[0].content, "tiny");
-eq("zero budget floors big ones", m.compactMessages(small, 0)[1].content.length, 425);
+eq("zero budget floors big ones", m.compactMessages(small, 0)[1].content.length, FLOORED);
+
+// The floor keeps a TAIL, not just a head. For every GitHub tool here the answer
+// tends to sit at the end (gh_read_pr patches, a trailing error line), and
+// head-only flooring discarded exactly that — sending the model back to re-read
+// the same file, which is the loop the repeat guard below then has to catch.
+const marked = `HEAD${"m".repeat(5_000)}TAIL`;
+const floored = m.compactMessages([{ role: "tool", content: marked }], 0)[0].content;
+eq("floor keeps the head", floored.startsWith("HEAD"), true);
+eq("floor keeps the tail", floored.endsWith("TAIL"), true);
+
+// Slicing by UTF-16 unit splits a surrogate pair and emits a lone surrogate,
+// which then rides into a jsonb column and a JSON request body as invalid text.
+const emoji = "🙂".repeat(5_000);
+const cut = m.compactMessages([{ role: "tool", content: emoji }], 0)[0].content;
+eq("no lone surrogate survives truncation", /[\uD800-\uDFFF]/.test(cut.replace(/🙂/g, "")), false);
+eq("head/tail are whole emoji", cut.startsWith("🙂") && cut.endsWith("🙂"), true);
+
+// `_source` is ours, not OpenAI's — it must never reach a provider.
+const tagged = [{ role: "user", content: "go", _source: "auto-continue" }];
+eq("_source stripped from the request", "_source" in m.compactMessages(tagged, 100)[0], false);
+eq("_source kept on the stored message", tagged[0]._source, "auto-continue");
+
+console.log("\n— repeat-tool guard (loop hygiene) —");
+// segmentMadeProgress only asks "did ANY tool run" — so twelve identical reads
+// scored full progress and burned the whole step budget. These pin the chain.
+const call = (name, args) => ({
+  role: "assistant",
+  tool_calls: [{ id: "x", function: { name, arguments: JSON.stringify(args) } }],
+});
+const res = () => ({ role: "tool", tool_call_id: "x", content: "ok" });
+const chainOf = (...turns) => m.repeatChainCount(turns.flat());
+
+eq("key ignores argument order",
+  m.repeatKey("gh_read_file", '{"a":1,"b":2}') === m.repeatKey("gh_read_file", '{"b":2,"a":1}'), true);
+eq("key separates different tools",
+  m.repeatKey("gh_read_file", "{}") === m.repeatKey("gh_list_prs", "{}"), false);
+
+eq("one call is a chain of 1",
+  chainOf([call("gh_read_file", { path: "a" }), res()]).count, 1);
+eq("three identical calls count 3", chainOf(
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "a" }), res()],
+).count, 3);
+eq("a different argument resets", chainOf(
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "b" }), res()],
+).count, 1);
+eq("a human turn resets the chain", chainOf(
+  [call("gh_read_file", { path: "a" }), res()],
+  [{ role: "user", content: "actually, do this instead" }],
+  [call("gh_read_file", { path: "a" }), res()],
+).count, 1);
+// The auto-continue prompt is a machine turn: a run stuck on one call across a
+// segment boundary is exactly the case this guard exists for, so it must NOT
+// launder the chain the way a genuine human interjection does.
+eq("an auto-continue prompt does NOT reset", chainOf(
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "a" }), res()],
+  [{ role: "user", content: "[auto-continue] …", _source: "auto-continue" }],
+  [call("gh_read_file", { path: "a" }), res()],
+).count, 3);
+eq("isHumanTurn: bare user turn", m.isHumanTurn({ role: "user", content: "hi" }), true);
+eq("isHumanTurn: injected turn", m.isHumanTurn({ role: "user", content: "hi", _source: "auto-continue" }), false);
+
+const threeSame = [
+  call("gh_read_file", { path: "a" }), res(),
+  call("gh_read_file", { path: "a" }), res(),
+  call("gh_read_file", { path: "a" }), res(),
+];
+eq("no nudge below the first threshold",
+  m.repeatReminder(threeSame.slice(0, 4)), null);
+const nudge3 = m.repeatReminder(threeSame);
+eq("first threshold nudges", !!nudge3, true);
+eq("first threshold is the gentle form", nudge3.text.includes("consecutive_calls"), false);
+const five = [...threeSame, call("gh_read_file", { path: "a" }), res(), call("gh_read_file", { path: "a" }), res()];
+const nudge5 = m.repeatReminder(five);
+eq("later threshold is the detailed form", nudge5.text.includes("consecutive_calls: 5"), true);
+eq("detailed form names the tool", nudge5.tool, "gh_read_file");
+
+// The preview cap bounds the REMINDER; the chain key always compares full args,
+// so a looping whole-file gh_propose_change payload cannot ride into the request.
+const fat = (n) => [call("gh_propose_change", { body: "z".repeat(20_000) }), res()];
+const fatNudge = m.repeatReminder([...fat(), ...fat(), ...fat(), ...fat(), ...fat()]);
+eq("huge arguments are previewed, not quoted whole", fatNudge.text.length < 2_000, true);
+eq("preview says how much it dropped", /\+\d+ more chars/.test(fatNudge.text), true);
 
 console.log("\n— applyEdits (gh_propose_edit core) —");
 const file = "line one\nline two\nline three\n";

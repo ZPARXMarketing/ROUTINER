@@ -66,6 +66,20 @@ const allowedModels = (): Set<string> => {
 
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
+// Character-budget knobs where zero or a negative can never be meant: `num`
+// passes a negative straight through, and a negative CONTEXT_TOOL_BUDGET made
+// compactMessages floor EVERY tool result to the 400-char floor — silently.
+// An invalid override is a misconfiguration: name it and use the default.
+const budgetNum = (name: string, def: number): number => {
+  const raw = Deno.env.get(name);
+  if (raw == null || raw.trim() === "") return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(`${name}="${raw}" is not a positive number; using default ${def}`);
+    return def;
+  }
+  return Math.floor(n);
+};
 // Per-invocation step budget. Long jobs continue via auto-continue chains
 // (see MAX_AUTO_CONTINUES) so one fire can span several edge invocations.
 const MAX_STEPS = num("AGENT_MAX_STEPS", 5);
@@ -83,11 +97,11 @@ const DEADLINE_MS = num("AGENT_DEADLINE_MS", 100_000);
 // Smaller tool payloads → less context bloat → more steps fit before timeout.
 // Non-file tools stay modest; gh_read_file uses GH_READ_RESULT_CAP (was 3500 for
 // everything, which made the model report "file too large" on any real source file).
-const TOOL_RESULT_CAP = num("AGENT_TOOL_RESULT_CAP", 8_000);
+const TOOL_RESULT_CAP = budgetNum("AGENT_TOOL_RESULT_CAP", 8_000);
 // File reads need room for real source (js/app.js alone is ~136k). Still capped so
 // a single blob can't explode the context window.
-const GH_READ_RESULT_CAP = Math.min(num("AGENT_GH_READ_RESULT_CAP", 120_000), 400_000);
-const OUTPUT_CAP = num("AGENT_OUTPUT_CAP", 60_000);
+const GH_READ_RESULT_CAP = Math.min(budgetNum("AGENT_GH_READ_RESULT_CAP", 120_000), 400_000);
+const OUTPUT_CAP = budgetNum("AGENT_OUTPUT_CAP", 60_000);
 // How many background segments after the first (total segments = 1 + this).
 // 5 × ~100s ≈ set-and-forget multi-minute jobs without blowing one request.
 const MAX_AUTO_CONTINUES = Math.min(num("AGENT_MAX_AUTO_CONTINUES", 5), 12);
@@ -108,9 +122,56 @@ const FALLBACK_MODEL = (Deno.env.get("AGENT_FALLBACK_MODEL") ?? "moonshotai/kimi
 // single gh_read_file can now return 120k chars, so "keep the last 6 in full"
 // could push ~700k chars (~180k tokens) into one request — which times out or
 // 400s. This budget is what actually protects the context window.
-const CONTEXT_TOOL_BUDGET = num("AGENT_CONTEXT_TOOL_BUDGET", 60_000);
+const CONTEXT_TOOL_BUDGET = budgetNum("AGENT_CONTEXT_TOOL_BUDGET", 60_000);
 const AUTO_CONTINUE_PROMPT =
   "[auto-continue] Resume the task from the transcript. Do NOT re-read files or re-list directories you already saw. Prefer finishing work (gh_propose_edit / write tools) over exploring — if you have read enough to make the change, make it now. When done, reply with a short final summary including any PR links — use no further tools if the work is complete.";
+
+// ── Message provenance ───────────────────────────────────────────────────────
+// A turn the machine injected is NOT a turn the human typed, and until now the
+// transcript could not tell them apart: both were a bare `role:"user"`, so
+// History rendered every [auto-continue] prompt as if the human had sent it,
+// and any "did the user say something?" test counted a machine nudge as a human
+// interjection. `_source` is carried on the message itself so the distinction
+// survives into the stored transcript and the UI, not just this invocation.
+const SRC_AUTO_CONTINUE = "auto-continue";
+const SRC_REPEAT_GUARD = "repeat-guard";
+/** A `user` turn actually typed by a person (no `_source` = a human reply). */
+function isHumanTurn(m: any): boolean {
+  return m?.role === "user" && !m?._source;
+}
+
+// ── Repeat-tool guard ────────────────────────────────────────────────────────
+// The only loop-hygiene signal this function had was segmentMadeProgress, which
+// asks "did ANY tool run, or was there real text?" — so a model calling
+// gh_read_file with the identical path twelve times in a row scored full
+// progress every segment, burned the step budget, and auto-continued into
+// another segment doing the same thing. This counts CONSECUTIVE identical calls
+// and injects an escalating nudge. It is advisory: it never vetoes or rewrites
+// a call, because a legitimately repeated call must not be blocked.
+const REPEAT_THRESHOLDS = ((): number[] => {
+  const raw = (Deno.env.get("AGENT_REPEAT_THRESHOLDS") || "").trim();
+  if (!raw) return [3, 5, 8];
+  if (/^(off|none|0)$/i.test(raw)) return [];
+  const parsed = raw.split(",").map((s) => Number(s.trim()));
+  const bad = parsed.some((n) => !Number.isInteger(n) || n < 2);
+  if (bad || parsed.length === 0 || new Set(parsed).size !== parsed.length) {
+    // The harness throws at plugin load here. An edge function cannot: a throw
+    // at module scope 500s every invocation with no run row and nothing in
+    // History, which hides the misconfiguration far better than it reports it.
+    // Naming it in the edge logs and using the default is the loud-enough form.
+    console.error(`AGENT_REPEAT_THRESHOLDS="${raw}" is not distinct integers >= 2; using 3,5,8`);
+    return [3, 5, 8];
+  }
+  return [...parsed].sort((a, b) => a - b);
+})();
+// Tool-name patterns (with `*` wildcards) that are TRANSPARENT to the chain:
+// they neither increment nor reset it. That is what makes exclusion useful —
+// gh_read_file(X) → read_runs → gh_read_file(X) must still count as two
+// consecutive gh_read_file(X), or a bookkeeping call interleaved into a loop
+// launders it. Empty by default: every tool is tracked.
+const REPEAT_EXCLUDE = (Deno.env.get("AGENT_REPEAT_EXCLUDE") || "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const REPEAT_ARGS_PREVIEW = 400;
 
 // ── GitHub (the "code" tool group) ───────────────────────────────────────────
 // Lets a non-Claude instance read the repo, inspect PRs, and — the whole point —
@@ -1063,22 +1124,156 @@ Do not claim to have done something a tool did not confirm.`;
 // `budget` characters are spent, then everything older is cut to a small floor.
 // (Counting messages instead of characters is what let three large file reads
 // put ~360k chars into a single request.) Never mutates the input.
+//
+// The floor keeps a HEAD **and** a TAIL, because for every GitHub tool here the
+// answer tends to sit at the end: gh_read_pr's per-file patches, an error line
+// appended after a successful-looking preamble, the last entries of a directory
+// listing. Head-only flooring threw away exactly the part the model needed and
+// sent it back to re-read the same file — the repeat loop the guard below
+// watches for. Splitting the same 400 chars costs nothing extra.
 const TOOL_FLOOR_CHARS = 400;
+const TOOL_FLOOR_MARKER = "\n…[truncated for context]…\n";
+const TOOL_FLOOR_HEAD = 280;
+const TOOL_FLOOR_TAIL = TOOL_FLOOR_CHARS - TOOL_FLOOR_HEAD;
+
+// Slice by Unicode code point, never by UTF-16 unit: `"…".slice(0, n)` can cut
+// a surrogate pair in half and emit a lone surrogate, which then rides into a
+// jsonb column and a JSON request body as invalid text.
+function headTail(text: string, head: number, tail: number): string {
+  const points = Array.from(text);
+  if (points.length <= head + tail) return text;
+  return points.slice(0, head).join("") + TOOL_FLOOR_MARKER + points.slice(points.length - tail).join("");
+}
+
+function toolFloorLength(text: string): number {
+  return Math.min(Array.from(text).length, TOOL_FLOOR_CHARS);
+}
+
 function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET): any[] {
   const cap = Number.isFinite(budget) && budget > 0 ? budget : 0;
-  const out = messages.slice();
+  // `_source` is ours, not OpenAI's: it stays in the stored transcript (that is
+  // the whole point) but must never reach a provider, where an unknown message
+  // field is a 400 on the strict ones.
+  const out = messages.map((m) => {
+    if (!m || m._source === undefined) return m;
+    const { _source: _drop, ...rest } = m;
+    return rest;
+  });
   let spent = 0;
   // Newest → oldest, so the model always keeps the results it's reasoning about.
   for (let i = out.length - 1; i >= 0; i--) {
     const m = out[i];
     if (m?.role !== "tool") continue;
     const c = String(m.content ?? "");
-    if (c.length <= TOOL_FLOOR_CHARS) { spent += c.length; continue; }
-    if (spent + c.length <= cap) { spent += c.length; continue; }
-    out[i] = { ...m, content: c.slice(0, TOOL_FLOOR_CHARS) + "\n…[truncated for context]" };
-    spent += TOOL_FLOOR_CHARS;
+    const len = Array.from(c).length;
+    if (len <= TOOL_FLOOR_CHARS) { spent += len; continue; }
+    if (spent + len <= cap) { spent += len; continue; }
+    out[i] = { ...m, content: headTail(c, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL) };
+    spent += toolFloorLength(c);
   }
   return out;
+}
+
+// ── Repeat-tool chain ────────────────────────────────────────────────────────
+
+/** Deep key-sort so two argument objects differing only in key order canonicalize alike. */
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJsonValue);
+  if (value !== null && typeof value === "object") {
+    const rec = value as Record<string, unknown>;
+    const sorted: Record<string, unknown> = {};
+    for (const k of Object.keys(rec).sort()) sorted[k] = sortJsonValue(rec[k]);
+    return sorted;
+  }
+  return value;
+}
+
+/** Canonical identity of one call: `[tool name, deep-key-sorted args]`. */
+function repeatKey(name: string, args: unknown): string {
+  let parsed: unknown = args;
+  if (typeof args === "string") {
+    // Tool-call arguments arrive as a JSON string; malformed JSON keeps the raw
+    // string, which still compares correctly against an identical repeat.
+    try { parsed = JSON.parse(args || "{}"); } catch { parsed = args; }
+  }
+  return JSON.stringify([name, JSON.stringify(sortJsonValue(parsed))]);
+}
+
+/** Compile one `*`-wildcard pattern to an anchored RegExp; every other metacharacter is literal. */
+function wildcardToRegExp(pattern: string): RegExp {
+  const escaped = pattern.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+  return new RegExp(`^${escaped.replaceAll("*", ".*")}$`);
+}
+const REPEAT_EXCLUDE_RE = REPEAT_EXCLUDE.map(wildcardToRegExp);
+function repeatTracked(name: string): boolean {
+  return !REPEAT_EXCLUDE_RE.some((re) => re.test(name));
+}
+
+/**
+ * Length of the run of consecutive identical tracked calls ending at the newest
+ * call in `messages`. Derived from the transcript rather than held in memory,
+ * because an auto-continue segment is a fresh edge invocation: in-memory state
+ * would reset at exactly the boundary a stuck run is most likely to cross.
+ * A human reply resets the chain (the context changed, so repetition across it
+ * is not a loop); an injected auto-continue prompt does not.
+ */
+function repeatChainCount(messages: any[]): { key: string; count: number } {
+  let key = "";
+  let count = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (isHumanTurn(m)) break;
+    if (m?.role !== "assistant" || !Array.isArray(m.tool_calls)) continue;
+    // Within one assistant turn the calls are ordered oldest→newest.
+    for (let j = m.tool_calls.length - 1; j >= 0; j--) {
+      const tc = m.tool_calls[j];
+      const name = tc?.function?.name || "";
+      if (!repeatTracked(name)) continue; // transparent: neither counts nor resets
+      const k = repeatKey(name, tc?.function?.arguments);
+      if (count === 0) { key = k; count = 1; continue; }
+      if (k !== key) return { key, count };
+      count++;
+    }
+  }
+  return { key, count };
+}
+
+const REPEAT_GENTLE =
+  "You are repeating the exact same tool call with identical arguments. Carefully "
+  + "analyze the previous result before calling again: if the task is not complete, "
+  + "try a different approach or different arguments instead of repeating the call.";
+
+function repeatDetailed(name: string, count: number, args: string): string {
+  const shown = Array.from(args).length > REPEAT_ARGS_PREVIEW
+    ? Array.from(args).slice(0, REPEAT_ARGS_PREVIEW).join("") + `… (+${Array.from(args).length - REPEAT_ARGS_PREVIEW} more chars)`
+    : args;
+  return "Repeated tool call detected:\n"
+    + `- tool: ${name}\n`
+    + `- consecutive_calls: ${count}\n`
+    + `- arguments: ${shown}\n`
+    + "The repeated calls are not making progress. Do not call this tool with these "
+    + "exact arguments again. Inspect the latest result and choose a different action, "
+    + "different arguments, or finish the task if enough evidence has been gathered.";
+}
+
+/**
+ * The reminder to inject after this step's tool results, or `null` when the run
+ * length has not reached a configured threshold. The preview cap bounds the
+ * reminder only — the chain key always compares the full canonical arguments,
+ * so a looping `gh_propose_change` payload cannot ride into the next request.
+ */
+function repeatReminder(messages: any[]): { text: string; tool: string; count: number } | null {
+  if (REPEAT_THRESHOLDS.length === 0) return null;
+  const { key, count } = repeatChainCount(messages);
+  if (!REPEAT_THRESHOLDS.includes(count)) return null;
+  let name = "the tool";
+  let args = "";
+  try {
+    const [n, a] = JSON.parse(key) as [string, string];
+    name = n; args = a;
+  } catch { /* key is always our own JSON; a parse failure only costs detail */ }
+  const text = count === REPEAT_THRESHOLDS[0] ? REPEAT_GENTLE : repeatDetailed(name, count, args);
+  return { text, tool: name, count };
 }
 
 // Did THIS tool call actually open a pull request?
@@ -1462,6 +1657,13 @@ async function runAgentLoop(opts: {
       const pr = detectOpenedPr(name, result);
       if (pr.opened) { openedPr = true; prUrl = pr.url; }
     }
+    // Advisory only, and after the results so the model sees what it just got
+    // back before being told to stop asking for it again.
+    const nudge = repeatReminder(messages);
+    if (nudge) {
+      messages.push({ role: "user", content: nudge.text, _source: SRC_REPEAT_GUARD });
+      actions.push(`repeat-guard: ${nudge.tool} called ${nudge.count}× with identical arguments`);
+    }
     // Checkpoint after every tool batch so History stays live — and reuse its
     // result to honour a Stop pressed mid-batch, with no extra DB round-trip.
     const cancelledMidBatch = await saveProgress(
@@ -1631,8 +1833,10 @@ async function handleRequest(req: Request): Promise<Response> {
       // Refresh system prompt so efficiency rules apply to old transcripts.
       messages[0] = { role: "system", content: buildSystem(model, toolList) };
     }
-    const userTurn = (prompt.trim() || AUTO_CONTINUE_PROMPT);
-    messages.push({ role: "user", content: userTurn });
+    const humanPrompt = prompt.trim();
+    messages.push(humanPrompt
+      ? { role: "user", content: humanPrompt }
+      : { role: "user", content: AUTO_CONTINUE_PROMPT, _source: SRC_AUTO_CONTINUE });
 
     await checkpointRun(runId, { status: "running", output: isAutoContinue ? `Continuing… (segment ${continueDepth + 1})` : "Working…" });
 

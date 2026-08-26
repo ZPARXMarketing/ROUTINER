@@ -1551,7 +1551,16 @@ function transcriptTurns(it) {
   const turns = [];
   for (const m of msgs) {
     if (!m || m.role === 'system') continue;
-    if (m.role === 'user') { turns.push({ kind: 'user', content: String(m.content || '') }); continue; }
+    /* A machine-injected turn (auto-continue, repeat-guard) is not something the
+       human said. Both used to render as a plain user bubble, so the transcript
+       showed the reader words they never typed. `_source` names the injector. */
+    if (m.role === 'user') {
+      const src = typeof m._source === 'string' ? m._source : '';
+      turns.push(src
+        ? { kind: 'notice', content: String(m.content || ''), source: src }
+        : { kind: 'user', content: String(m.content || '') });
+      continue;
+    }
     if (m.role === 'tool') { turns.push({ kind: 'toolresult', content: String(m.content || '') }); continue; }
     if (m.role === 'assistant') {
       // Thoughts stay collapsible and separate from the visible answer.
@@ -1590,6 +1599,10 @@ function runPaneHtml(it) {
   const turns = transcriptTurns(it);
   const bubbles = turns.map((t) => {
     if (t.kind === 'user') return `<div class="chatmsg chatmsg--user">${esc(t.content)}</div>`;
+    if (t.kind === 'notice') {
+      const label = t.source === 'repeat-guard' ? 'repeat guard' : t.source === 'auto-continue' ? 'auto-continue' : t.source;
+      return `<details class="transcript__notice"><summary>⟳ ${esc(label)}</summary><pre>${esc(t.content.slice(0, 4000))}</pre></details>`;
+    }
     if (t.kind === 'tool') return `<div class="transcript__tool">⚙ ${esc(t.content)}</div>`;
     if (t.kind === 'toolresult') return `<details class="transcript__res"><summary>tool result</summary><pre>${esc(t.content.slice(0, 4000))}</pre></details>`;
     if (t.kind === 'thought') {
