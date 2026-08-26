@@ -23,7 +23,7 @@ Related code: `supabase/functions/openrouter-agent/index.ts`, `js/app.js` (`agen
   - Kept `text/plain` body path (gateway OPTIONS still broken).
   - `agentPost` attaches `accessToken` from the session; scheduler keeps service-role headers.
 
-- [ ] **Confirm production deploy**
+- [x] **Confirm production deploy**
   - Redeploy `openrouter-agent` so the hard-auth code is live (`supabase functions deploy openrouter-agent`).
   - Smoke: signed-out / no-token POST → 401; signed-in Run-now agent → works; History continue → works; scheduler agent fire → works.
 
