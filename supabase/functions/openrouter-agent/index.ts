@@ -182,6 +182,7 @@ const REPEAT_ARGS_PREVIEW = 400;
 // early and the rest stays available to the run.
 const TOOL_BUDGET_MS: Record<string, number> = {
   // Single REST round-trips against Supabase or GitHub.
+  read_spill: 15_000, set_goal: 15_000,
   read_routines: 15_000, read_notes: 15_000, read_runs: 20_000, read_leads: 15_000,
   write_note: 15_000, write_routine: 15_000,
   gh_read_file: 30_000, gh_read_pr: 30_000, gh_read_issue: 30_000,
@@ -199,6 +200,19 @@ function toolBudgetFor(name: string, remainingMs: number): number {
 }
 /** Below this there is no point starting another file write inside one PR. */
 const GH_MIN_WRITE_MS = 6_000;
+
+// ── Tool-output spill ────────────────────────────────────────────────────────
+// A result larger than this is stored whole in routiner_tool_spills and replaced
+// in the model's context with a head/tail preview plus a spill id it can page
+// with read_spill. Truncation used to be lossy: AGENT_GH_READ_RESULT_CAP allowed
+// 120k chars while AGENT_CONTEXT_TOOL_BUDGET keeps 60k at full size, so one big
+// read was 2x the whole budget and a second read floored the first — sending the
+// model back to re-read a file it had already been handed.
+const SPILL_THRESHOLD = budgetNum("AGENT_SPILL_THRESHOLD", 12_000);
+/** Characters of the original kept inline, split head/tail around the notice. */
+const SPILL_PREVIEW_CHARS = budgetNum("AGENT_SPILL_PREVIEW_CHARS", 4_000);
+/** Max characters one read_spill window may return. */
+const SPILL_WINDOW_CHARS = budgetNum("AGENT_SPILL_WINDOW_CHARS", 40_000);
 
 // ── GitHub (the "code" tool group) ───────────────────────────────────────────
 // Lets a non-Claude instance read the repo, inspect PRs, and — the whole point —
@@ -504,6 +518,11 @@ async function sbGet(path: string): Promise<any[]> {
 
 // Map a tool function name → tool-group id (must match Settings checkboxes).
 function toolGroupOf(name: string): string | null {
+  // read_spill belongs to no group and is always available: a spill can only
+  // exist because a tool the run already had produced it, so paging one back is
+  // not a new capability — and gating it behind a group the run happens not to
+  // have would strand the very output we just told the model to page.
+  if (name === "read_spill" || name === "set_goal") return "*";
   if (name === "read_routines" || name === "read_notes" || name === "read_leads" || name === "read_runs") return "read";
   if (name === "web_research") return "research";
   if (name === "write_note" || name === "find_and_save_leads") return "write";
@@ -606,6 +625,15 @@ type OrOpts = {
   retries?: number;
   /** absolute epoch-ms wall deadline; no retry is started that can't fit */
   deadlineAt?: number;
+  /**
+   * Invoked BEFORE each backoff wait, so a pending retry is durable before the
+   * process sleeps on it. A retry held only in memory disappears if the edge
+   * function is killed mid-backoff — which this deployment does under load —
+   * leaving a row that simply went quiet, indistinguishable from a hang. It
+   * also bumps the run's last-activity stamp, so the scheduler's stale-run
+   * reaper does not mark a legitimately backing-off run as dead.
+   */
+  onRetry?: (info: { attempt: number; retries: number; delayMs: number; error: string; status?: number }) => Promise<void> | void;
 };
 // `status` is the HTTP status OpenRouter answered with. It is the only reliable
 // transient/permanent signal: the body message is provider prose and has already
@@ -661,6 +689,14 @@ async function openrouter(
         ? Math.min(8_000, 2_000 * 2 ** attempt)
         : Math.min(4_000, 750 * 2 ** attempt);
       if (Date.now() + backoff + 3_000 > deadlineAt) break;
+      if (opts.onRetry) {
+        // Durable before the wait, never after: the whole point is to survive
+        // being killed during the sleep. Best-effort — a failed checkpoint must
+        // not abort a retry that would otherwise have succeeded.
+        try {
+          await opts.onRetry({ attempt: attempt + 1, retries, delayMs: backoff, error: r.error || "", status: r.status });
+        } catch { /* checkpoint failure is never a reason to skip the retry */ }
+      }
       await sleep(backoff);
     }
   }
@@ -739,7 +775,23 @@ async function todaySpend(): Promise<number | null> {
 // ── Tools ─────────────────────────────────────────────────────────────────────
 // Build the OpenAI-style tool specs for the enabled tool groups.
 function toolSpecs(enabled: Set<string>): unknown[] {
-  const specs: unknown[] = [];
+  const specs: unknown[] = [
+    { type: "function", function: { name: "read_spill", description: "Read a stored oversized tool result by its spill id. When a result is too large for context you get a head/tail preview plus a spill id — page the rest with this instead of re-running the tool that produced it.",
+      parameters: { type: "object", required: ["spill_id"], properties: {
+        spill_id: { type: "string", description: "the id from the [spill …] line in a truncated result" },
+        start_line: { type: "number", description: "1-based first line to return (default 1)" },
+        max_lines: { type: "number", description: "how many lines (default 400)" },
+      } } } },
+    { type: "function", function: { name: "set_goal", description: "Record what this run is trying to achieve and how far it has got. A long run spans several background segments and the transcript is compacted between them — this is the one place your plan survives intact. Call it once early, then update `done`/`remaining` as you go, and set phase='complete' when finished or 'blocked' when you genuinely cannot proceed.",
+      parameters: { type: "object", required: ["objective"], properties: {
+        objective: { type: "string", description: "the run's goal in one sentence" },
+        done: { type: "array", items: { type: "string" }, description: "what is finished, shortest useful phrasing" },
+        remaining: { type: "array", items: { type: "string" }, description: "what is still left, in order" },
+        phase: { type: "string", enum: ["active", "blocked", "complete"], description: "default active" },
+        blocked_code: { type: "string", description: "required when phase='blocked': short kebab-case cause, e.g. 'needs-human'" },
+        blocked_message: { type: "string", description: "required when phase='blocked': what a human must do" },
+      } } } },
+  ];
   if (enabled.has("read")) {
     specs.push(
       { type: "function", function: { name: "read_routines", description: "List the owner's Routiner routines (title, prompt, status, schedule).",
@@ -827,10 +879,10 @@ function toolSpecs(enabled: Set<string>): unknown[] {
 async function runTool(
   name: string,
   args: Record<string, any>,
-  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string>; timeoutMs?: number; runId?: string | null },
+  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string>; timeoutMs?: number; runId?: string | null; goalRef?: { current: RunGoal | null } },
 ): Promise<string> {
   const group = toolGroupOf(name);
-  if (!group || !ctx.enabled.has(group)) {
+  if (!group || (group !== "*" && !ctx.enabled.has(group))) {
     return `error: tool '${name}' is not enabled for this run.`;
   }
   // Defense in depth: never hit GitHub without a token even if code is enabled.
@@ -848,6 +900,38 @@ async function runTool(
   const owner = ctx.userId ? `user_id=eq.${encodeURIComponent(ctx.userId)}&` : "";
   try {
     switch (name) {
+      case "set_goal": {
+        // The goal lives on the run row, not in the transcript, precisely so
+        // compaction cannot reach it — so there is nothing to persist here
+        // beyond the holder the loop checkpoints.
+        if (!ctx.goalRef) return "error: this run cannot record a goal.";
+        const next = normalizeGoal(args, ctx.goalRef.current);
+        if ("error" in next) return `error: ${next.error}`;
+        ctx.goalRef.current = next;
+        return `goal recorded (${next.phase}). ${renderGoal(next)}`;
+      }
+      case "read_spill": {
+        const id = String(args.spill_id || "").trim();
+        if (!id) return "error: missing spill_id";
+        if (!/^[0-9a-f-]{36}$/i.test(id)) return `error: '${id}' is not a spill id. Use the id from a [spill …] line.`;
+        // Scoped to this run: a spill id from another run is not this model's to
+        // read, and a stale id from an earlier transcript should say so plainly
+        // rather than silently return someone else's tool output.
+        const scope = ctx.runId ? `&run_id=eq.${encodeURIComponent(ctx.runId)}` : "";
+        const rows = await sbGet(`routiner_tool_spills?id=eq.${encodeURIComponent(id)}${scope}&select=content,chars,tool_name&limit=1`);
+        const row = rows?.[0];
+        if (!row) return `error: no spill ${id} for this run. It may belong to a different run, or have been cleaned up — re-run the tool that produced it.`;
+        const startLine = Math.max(1, Math.floor(Number(args.start_line) || 1));
+        const maxLines = Math.max(1, Math.min(Math.floor(Number(args.max_lines) || GH_READ_DEFAULT_LINES), 5_000));
+        const win = sliceLines(String(row.content ?? ""), startLine, maxLines);
+        const body = Array.from(win.body).length > SPILL_WINDOW_CHARS
+          ? Array.from(win.body).slice(0, SPILL_WINDOW_CHARS).join("") + "\n…[window truncated — request fewer lines]"
+          : win.body;
+        const more = win.to < win.total
+          ? `\n\n[lines ${win.from}-${win.to} of ${win.total}. More follows: read_spill with start_line=${win.to + 1}.]`
+          : `\n\n[lines ${win.from}-${win.to} of ${win.total} — end of ${row.tool_name || "result"}.]`;
+        return body + more;
+      }
       case "read_routines": {
         const lim = Math.min(Number(args.limit) || 20, 100);
         const rows = await sbGet(`routiner_routines?${owner}select=id,title,prompt,status,recurrence,scheduled_at,account,model&order=updated_at.desc&limit=${lim}`);
@@ -1180,6 +1264,7 @@ Efficiency rules (critical — you have limited steps per segment):
 - Prefer acting over exploring. A 404 on a read is corrected for you automatically when it's only a casing difference, and otherwise comes back with the real directory listing — read that listing instead of guessing again.
 - Do not re-read a file you already have in the transcript. Call gh_read_file with path "." only when you truly don't know the layout.
 - Large files: gh_read_file supports start_line + max_lines. If a read says "more content after line N", page with start_line=N+1 — do NOT say the file is too large or unreadable.
+- A result ending in "[spill <id> …]" means the FULL text was stored, not lost: you got the head and tail. Page the middle with read_spill({"spill_id":"<id>","start_line":N,"max_lines":M}). Never re-run the original tool to see the rest.
 - To change part of a file, use gh_propose_edit with exact find/replace edits. You do NOT need to have read the whole file, and you must never reproduce a large file just to change a few lines. Copy old_string verbatim from what you read, including indentation, and include enough surrounding lines to make it unique.
 - Use gh_propose_change (whole-file) only for a new file or a total rewrite.
 - If the task mentions an issue number or an issues/ URL, call gh_read_issue to get its contents — do not ask the user to paste it.
@@ -1245,6 +1330,141 @@ function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET):
     spent += toolFloorLength(c);
   }
   return out;
+}
+
+// ── Run goal ─────────────────────────────────────────────────────────────────
+// The objective, carried across segments in a place compaction cannot reach.
+// `messages` is compacted — old tool results are floored to a few hundred
+// characters — so by segment four the model's record of what it already tried is
+// mostly gone, and AUTO_CONTINUE_PROMPT was asking it to "resume from the
+// transcript" it could no longer read.
+
+type GoalPhase = "active" | "blocked" | "complete";
+interface RunGoal {
+  objective: string;
+  done: string[];
+  remaining: string[];
+  phase: GoalPhase;
+  blocked_reason?: { code: string; message: string };
+}
+
+const GOAL_LIST_MAX = 12;
+const GOAL_ITEM_CHARS = 200;
+const GOAL_OBJECTIVE_CHARS = 600;
+
+function cleanList(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .map((x) => String(x ?? "").trim())
+    .filter(Boolean)
+    .slice(0, GOAL_LIST_MAX)
+    .map((s) => (s.length > GOAL_ITEM_CHARS ? s.slice(0, GOAL_ITEM_CHARS) + "…" : s));
+}
+
+/**
+ * Validate a model-authored goal. This IS a model/tool JSON boundary, so every
+ * field is checked rather than trusted: an unknown `phase` silently stored would
+ * make the run's state unreadable to the scheduler and the UI that route on it.
+ */
+function normalizeGoal(input: any, prev: RunGoal | null): RunGoal | { error: string } {
+  const objectiveRaw = String(input?.objective ?? prev?.objective ?? "").trim();
+  if (!objectiveRaw) return { error: "missing objective (state the run's goal in one sentence)" };
+  const phaseRaw = String(input?.phase ?? prev?.phase ?? "active").trim().toLowerCase();
+  if (phaseRaw !== "active" && phaseRaw !== "blocked" && phaseRaw !== "complete") {
+    return { error: `phase must be one of active|blocked|complete (got '${phaseRaw}')` };
+  }
+  const phase = phaseRaw as GoalPhase;
+  const goal: RunGoal = {
+    objective: objectiveRaw.slice(0, GOAL_OBJECTIVE_CHARS),
+    done: cleanList(input?.done ?? prev?.done),
+    remaining: cleanList(input?.remaining ?? prev?.remaining),
+    phase,
+  };
+  if (phase === "blocked") {
+    const code = String(input?.blocked_code ?? prev?.blocked_reason?.code ?? "").trim().toLowerCase();
+    const message = String(input?.blocked_message ?? prev?.blocked_reason?.message ?? "").trim();
+    // A blocked run with no reason is the dead-end this exists to prevent: the
+    // next segment (and the human) would have nothing to act on.
+    if (!code || !message) return { error: "phase 'blocked' requires blocked_code (short kebab-case) and blocked_message (what a human must do)" };
+    goal.blocked_reason = { code: code.slice(0, 60), message: message.slice(0, 400) };
+  }
+  return goal;
+}
+
+/** The goal rendered for the model — short, and never compacted away. */
+function renderGoal(goal: RunGoal | null): string {
+  if (!goal) return "";
+  const lines = [`[goal] ${goal.objective}`, `phase: ${goal.phase}`];
+  if (goal.done.length) lines.push(`done: ${goal.done.map((d) => `\n  ✓ ${d}`).join("")}`);
+  if (goal.remaining.length) lines.push(`remaining: ${goal.remaining.map((d) => `\n  • ${d}`).join("")}`);
+  if (goal.blocked_reason) lines.push(`blocked (${goal.blocked_reason.code}): ${goal.blocked_reason.message}`);
+  return lines.join("\n");
+}
+
+/** Read back a stored goal, ignoring anything that is not a well-formed record. */
+function parseStoredGoal(v: unknown): RunGoal | null {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const g = normalizeGoal(v, null);
+  return "error" in g ? null : g;
+}
+
+// ── Tool-output spill ────────────────────────────────────────────────────────
+
+/** Line-addressed window over spilled text, so read_spill pages like gh_read_file. */
+function sliceLines(text: string, startLine: number, maxLines: number): { body: string; from: number; to: number; total: number } {
+  const lines = text.split("\n");
+  const from = Math.max(1, Math.min(startLine, lines.length));
+  const to = Math.max(from, Math.min(from + maxLines - 1, lines.length));
+  return { body: lines.slice(from - 1, to).join("\n"), from, to, total: lines.length };
+}
+
+/**
+ * Store the full result and build the bounded replacement the model sees.
+ *
+ * Best-effort by contract: if the insert fails there is no spill row to point
+ * at, so the caller keeps its own (capped) inline text. A storage problem must
+ * never turn a successful tool call into an error or lose the result outright —
+ * the whole point is to lose LESS than truncation did.
+ *
+ * @returns the replacement text, or null to keep the original inline.
+ */
+async function spillResult(
+  text: string,
+  toolName: string,
+  args: Record<string, any>,
+  ctx: { userId: string | null; runId?: string | null },
+): Promise<string | null> {
+  const total = Array.from(text).length;
+  if (total <= SPILL_THRESHOLD) return null;
+  let id = "";
+  try {
+    const res = await fetch(rest("routiner_tool_spills"), {
+      method: "POST",
+      headers: { ...H(), Prefer: "return=representation" },
+      body: JSON.stringify({
+        user_id: ctx.userId, run_id: ctx.runId ?? null,
+        tool_name: toolName, args, content: text, chars: total,
+      }),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json().catch(() => null);
+    id = Array.isArray(rows) && rows[0]?.id ? String(rows[0].id) : "";
+  } catch {
+    // Network/REST failure writing a disposable cache. Keeping the inline text
+    // is strictly better than failing the tool call.
+    return null;
+  }
+  if (!id) return null;
+
+  const half = Math.max(1, Math.floor(SPILL_PREVIEW_CHARS / 2));
+  const points = Array.from(text);
+  const head = points.slice(0, half).join("");
+  const tail = points.slice(points.length - half).join("");
+  const lines = text.split("\n").length;
+  return `${head}\n\n…[${total - SPILL_PREVIEW_CHARS} of ${total} chars omitted — the FULL result is stored, not lost]…\n\n${tail}\n\n`
+    + `[spill ${id} — ${total} chars, ${lines} lines. `
+    + `Read any part with read_spill({"spill_id":"${id}","start_line":N,"max_lines":M}). `
+    + `Do NOT re-run ${toolName} to see the rest; page this spill instead.]`;
 }
 
 // ── Repeat-tool chain ────────────────────────────────────────────────────────
@@ -1571,6 +1791,18 @@ function segmentMadeProgress(actions: string[], finalText: string): boolean {
   return true;
 }
 
+// A run the model declared blocked must not auto-continue. The next segment
+// would inherit the same obstacle and burn a segment failing the same way —
+// which is exactly what happened when a spent key was retried for 8h45m. A
+// block is a state with a named cause, so it stops the chain and says why.
+function goalBlockStop(goal: RunGoal | null): string | null {
+  if (!goal || goal.phase !== "blocked" || !goal.blocked_reason) return null;
+  return `⛔ Blocked (${goal.blocked_reason.code}): ${goal.blocked_reason.message}\n\n`
+    + `Objective: ${goal.objective}\n`
+    + "Auto-continue stopped — the next segment would hit the same obstacle. "
+    + "Resolve the cause, then reply here to resume.";
+}
+
 function noProgressStopMessage(streak: number): string {
   return `Stopped: ${streak} consecutive segments made no progress (model timing out or returning nothing). Try a faster model (kimi-k2.7-code, deepseek-chat) or reply to retry.`;
 }
@@ -1589,6 +1821,7 @@ type LoopResult = {
   incomplete: boolean; // true → worth auto-continuing
   openedPr: boolean;
   modelUsed: string;   // may differ from the requested model after a fallback
+  goal: RunGoal | null;
 };
 
 // Run the bounded tool-use loop over `messages` (mutated in place).
@@ -1597,6 +1830,7 @@ async function runAgentLoop(opts: {
   runId?: string | null;
   depth?: number;
   runStartedAt?: string | null;
+  goal?: RunGoal | null;
   ctx: { userId: string | null; account: string | null; triggerKey: string | null; enabled: Set<string> };
 }): Promise<LoopResult> {
   const { key, model, tools, messages, ctx } = opts;
@@ -1611,6 +1845,8 @@ async function runAgentLoop(opts: {
   // configured one is failing transiently. Reported back so History is honest.
   let activeModel = model;
   let fellBack = false;
+  // Mutated by the set_goal tool, checkpointed with every other bit of progress.
+  const goalRef: { current: RunGoal | null } = { current: opts.goal ?? null };
   const started = Date.now();
   const hardStop = started + DEADLINE_MS;
   const remaining = () => Math.max(0, hardStop - Date.now());
@@ -1633,6 +1869,7 @@ async function runAgentLoop(opts: {
       status,
       output: `${note}${recap}`.slice(0, OUTPUT_CAP),
       messages,
+      ...(goalRef.current ? { goal: goalRef.current } : {}),
     });
     return cancelled;
   };
@@ -1642,11 +1879,16 @@ async function runAgentLoop(opts: {
   {
     const runStart = opts.runStartedAt ? Date.parse(opts.runStartedAt) : NaN;
     const elapsed = Number.isFinite(runStart) ? Math.max(0, started - runStart) : 0;
-    messages.push({
-      role: "user",
-      content: segmentOrientation(opts.depth ?? 0, elapsed, DEADLINE_MS),
-      _source: SRC_ORIENTATION,
-    });
+    // The goal rides the same injected turn. It is re-stated every segment on
+    // purpose: it is the one part of the run's intent that compaction never
+    // touches, so re-reading it costs a few hundred tokens and replaces an
+    // archaeology exercise over floored tool results.
+    const carried = renderGoal(goalRef.current);
+    const body = carried
+      ? `${segmentOrientation(opts.depth ?? 0, elapsed, DEADLINE_MS)}\n\n${carried}\n\nUpdate this with set_goal as you make progress.`
+      : `${segmentOrientation(opts.depth ?? 0, elapsed, DEADLINE_MS)}\n\n`
+        + "No goal recorded yet. Call set_goal early with the objective and your plan — it is the only part of your intent that survives into the next segment.";
+    messages.push({ role: "user", content: body, _source: SRC_ORIENTATION });
   }
 
   for (let i = 0; i < stepBudget; i++) {
@@ -1666,6 +1908,12 @@ async function runAgentLoop(opts: {
       timeoutMs: budget,
       retries: MODEL_RETRIES,
       deadlineAt: hardStop,
+      onRetry: async ({ attempt, retries, delayMs, error }) => {
+        await saveProgress(
+          "running",
+          `Retrying step ${steps} in ${Math.round(delayMs / 1000)}s (attempt ${attempt}/${retries}) after: ${error.slice(0, 160)}`,
+        );
+      },
     });
     cost += Number(r.usage?.cost) || 0;
     await logUsage(activeModel, r.usage, ctx.account, ctx.triggerKey, r.ok, r.error ?? null);
@@ -1731,13 +1979,23 @@ async function runAgentLoop(opts: {
       try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
       const raw = await runTool(name, args, {
         userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled, runId,
-        timeoutMs: toolBudget,
+        timeoutMs: toolBudget, goalRef,
       });
-      // File reads get a much higher cap; other tools stay small for context.
+      // Spill before truncating: store the whole thing and hand the model a
+      // preview plus a locator, so an oversized result becomes a fetch rather
+      // than a loss. read_spill is excluded — spilling a spill read would loop.
+      let result = raw;
+      if (name !== "read_spill") {
+        const spilled = await spillResult(raw, name, args, { userId: ctx.userId, runId });
+        if (spilled !== null) result = spilled;
+      }
+      // Fallback cap for anything not spilled (a spill insert can fail, and it
+      // must never fail the tool call). File reads keep the higher ceiling.
       const cap = name === "gh_read_file" ? GH_READ_RESULT_CAP : TOOL_RESULT_CAP;
-      const result = raw.length > cap
-        ? raw.slice(0, cap) + `\n\n…[truncated at ${cap} chars of ${raw.length}. For files, re-call gh_read_file with start_line/max_lines to page.]`
-        : raw;
+      if (result.length > cap) {
+        result = result.slice(0, cap)
+          + `\n\n…[truncated at ${cap} chars of ${result.length}. For files, re-call gh_read_file with start_line/max_lines to page.]`;
+      }
       const line = `${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`;
       actions.push(line);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
@@ -1795,7 +2053,7 @@ async function runAgentLoop(opts: {
     incomplete = false;
   }
 
-  return { finalText, actions, cost, steps, incomplete, openedPr, modelUsed: activeModel };
+  return { finalText, actions, cost, steps, incomplete, openedPr, modelUsed: activeModel, goal: goalRef.current };
 }
 
 async function insertRunningRun(row: Record<string, unknown>): Promise<string | null> {
@@ -1854,7 +2112,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
     let row: any = null;
     try {
-      const rows = await sbGet(`routiner_runs?id=eq.${encodeURIComponent(runId)}&select=id,user_id,routine_id,title,status,output,messages,model,account,trigger_key,tools,started_at&limit=1`);
+      const rows = await sbGet(`routiner_runs?id=eq.${encodeURIComponent(runId)}&select=id,user_id,routine_id,title,status,output,messages,model,account,trigger_key,tools,started_at,goal&limit=1`);
       row = rows?.[0] || null;
     } catch (e) { return json({ ok: false, error: `Could not load the run: ${(e as Error).message}` }, 502); }
     if (!row) return json({ ok: false, error: "Run not found." }, 404);
@@ -1929,10 +2187,10 @@ async function handleRequest(req: Request): Promise<Response> {
 
     const loop = await runAgentLoop({
       key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId,
-      depth: continueDepth, runStartedAt: row.started_at ?? null,
+      depth: continueDepth, runStartedAt: row.started_at ?? null, goal: parseStoredGoal(row.goal),
       ctx: { userId, account, triggerKey, enabled },
     });
-    let { finalText, actions, cost, steps, incomplete, openedPr, modelUsed } = loop;
+    let { finalText, actions, cost, steps, incomplete, openedPr, modelUsed, goal } = loop;
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
 
     // Progress streak: human follow-ups reset; auto-continue carries noProgressIn.
@@ -1943,6 +2201,11 @@ async function handleRequest(req: Request): Promise<Response> {
 
     let continuing = false;
     let noProgressStop = false;
+    const blockStop = goalBlockStop(goal);
+    if (blockStop) {
+      finalText = blockStop;
+      incomplete = false;
+    }
     if (!wasCancelled && incomplete && !isHardError(finalText)) {
       if (nextNoProgress >= MAX_NO_PROGRESS) {
         noProgressStop = true;
@@ -1958,13 +2221,13 @@ async function handleRequest(req: Request): Promise<Response> {
 
     const status = wasCancelled
       ? "cancelled"
-      : (isHardError(finalText) || noProgressStop || exhausted) ? "error" : (continuing ? "running" : "success");
+      : (isHardError(finalText) || noProgressStop || exhausted || blockStop) ? "error" : (continuing ? "running" : "success");
     const note = continuing
       ? `${finalText}\n\n_Still working in the background (auto-continue ${continueDepth + 1}/${MAX_AUTO_CONTINUES})…_`
       : finalText;
     const output = `${note}${recap}`.slice(0, OUTPUT_CAP);
 
-    await checkpointRun(runId, { status, output, messages, model: modelUsed });
+    await checkpointRun(runId, { status, output, messages, model: modelUsed, ...(goal ? { goal } : {}) });
 
     return json({
       ok: true, runId, output, steps, cost: Number(cost.toFixed(6)), model: modelUsed, keySource,
@@ -2037,7 +2300,7 @@ async function handleRequest(req: Request): Promise<Response> {
     depth: 0, runStartedAt: null,
     ctx: { userId, account, triggerKey, enabled },
   });
-  let { finalText, actions, cost, steps, incomplete, openedPr, modelUsed } = loop;
+  let { finalText, actions, cost, steps, incomplete, openedPr, modelUsed, goal } = loop;
 
   const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
 
@@ -2047,6 +2310,11 @@ async function handleRequest(req: Request): Promise<Response> {
 
   let continuing = false;
   let noProgressStop = false;
+  const blockStop = goalBlockStop(goal);
+  if (blockStop) {
+    finalText = blockStop;
+    incomplete = false;
+  }
   if (newRunId && !wasCancelled && incomplete && !isHardError(finalText)) {
     if (nextNoProgress >= MAX_NO_PROGRESS) {
       noProgressStop = true;
@@ -2060,14 +2328,14 @@ async function handleRequest(req: Request): Promise<Response> {
 
   const status = wasCancelled
     ? "cancelled"
-    : (isHardError(finalText) || noProgressStop || exhausted) ? "error" : (continuing ? "running" : "success");
+    : (isHardError(finalText) || noProgressStop || exhausted || blockStop) ? "error" : (continuing ? "running" : "success");
   const note = continuing
     ? `${finalText}\n\n_Still working in the background (auto-continue 1/${MAX_AUTO_CONTINUES})…_`
     : finalText;
   const output = `${note}${recap}`.slice(0, OUTPUT_CAP);
 
   if (newRunId) {
-    await checkpointRun(newRunId, { status, output, messages, model: modelUsed });
+    await checkpointRun(newRunId, { status, output, messages, model: modelUsed, ...(goal ? { goal } : {}) });
   } else if (userId) {
     // Fallback: no early id (insert failed) — try one final insert.
     newRunId = await insertRunningRun({

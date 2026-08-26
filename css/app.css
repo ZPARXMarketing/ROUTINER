@@ -945,6 +945,31 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   word-break: break-word;
   color: var(--text-mid);
 }
+/* The run's objective, pinned above the transcript. Not a chat bubble: it is
+   current state, not something anyone said, and it is the one part of a run
+   that never gets compacted away. */
+.hx__goal {
+  align-self: stretch;
+  border: 1px solid var(--hairline);
+  border-left: 3px solid var(--text-low);
+  border-radius: var(--r-md);
+  background: var(--bg-elevated);
+  padding: var(--sp-3) var(--sp-4);
+  font-size: 13px;
+}
+.hx__goal--blocked { border-left-color: var(--danger, #FF4D5E); }
+.hx__goal--complete { border-left-color: var(--success, #22c55e); }
+.hx__goal-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.hx__goal-label {
+  font-family: var(--font-mono); font-size: 11px;
+  text-transform: uppercase; letter-spacing: .08em; color: var(--text-low);
+}
+.hx__goal-obj { margin: 0; color: var(--text-high); font-weight: 500; }
+.hx__goal-blocked { margin: var(--sp-2) 0 0; color: var(--text-mid); }
+.hx__goal-list { margin: var(--sp-2) 0 0; padding-left: var(--sp-3); list-style: none; }
+.hx__goal-list li { color: var(--text-mid); line-height: 1.5; }
+.hx__goal-list--done li { color: var(--text-low); }
+
 /* Machine-injected turns (auto-continue, repeat guard). Deliberately NOT a user
    bubble: the human did not say this, and rendering it as though they had made
    the transcript misleading about who drove the run. */

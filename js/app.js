@@ -353,6 +353,9 @@ async function loadAllOnce() {
     // checkpoint); started_at is when it began. Null on rows written before the
     // column existed — those simply show no duration.
     startedAt: x.started_at || null,
+    // The run's objective + progress, kept off the transcript so compaction
+    // can't reach it. Null for Claude-trigger, legacy and non-agent rows.
+    goal: x.goal || null,
   }));
   await dbLoadNotes();
   render();
@@ -1578,6 +1581,36 @@ function transcriptTurns(it) {
   return turns;
 }
 
+/* The run's objective and progress, pinned above the transcript.
+   A long run is mostly tool noise, so "what was this even trying to do, and how
+   far did it get" was a question you could only answer by reading the whole
+   thread backwards. The agent maintains this via set_goal; it lives on the run
+   row rather than in `messages`, so unlike the transcript it is never
+   compacted. Rows without one (Claude-trigger, legacy, non-agent) show nothing. */
+function runGoalCard(it) {
+  const g = it && it.goal;
+  if (!g || typeof g !== 'object' || !g.objective) return '';
+  const list = (items, mark) => (Array.isArray(items) ? items : [])
+    .filter(Boolean)
+    .map((s) => `<li>${mark} ${esc(String(s))}</li>`).join('');
+  const done = list(g.done, '✓');
+  const remaining = list(g.remaining, '•');
+  const phase = String(g.phase || 'active');
+  const blocked = g.blocked_reason && g.blocked_reason.message
+    ? `<p class="hx__goal-blocked"><strong>Blocked${g.blocked_reason.code ? ` (${esc(String(g.blocked_reason.code))})` : ''}:</strong> ${esc(String(g.blocked_reason.message))}</p>`
+    : '';
+  return `<section class="hx__goal hx__goal--${esc(phase)}">
+      <header class="hx__goal-head">
+        <span class="hx__goal-label">Goal</span>
+        <span class="chip chip--${phase === 'complete' ? 'success' : phase === 'blocked' ? 'error' : 'running'}">${esc(phase)}</span>
+      </header>
+      <p class="hx__goal-obj">${esc(String(g.objective))}</p>
+      ${blocked}
+      ${done ? `<ul class="hx__goal-list hx__goal-list--done">${done}</ul>` : ''}
+      ${remaining ? `<ul class="hx__goal-list">${remaining}</ul>` : ''}
+    </section>`;
+}
+
 /* Header stamp: when the run started and how long it ran — "09:12 · took 4m".
    The tooltip spells out both ends for anyone who wants the exact times. */
 function runTimingChip(it) {
@@ -1642,6 +1675,7 @@ function runPaneHtml(it) {
     </div>
     <div class="hx__thread" id="hx-thread">
       <div class="hx__thread-inner">
+        ${runGoalCard(it)}
         ${bubbles}
         ${runBusy || busy ? '<div class="chatmsg chatmsg--bot chatmsg--busy"><span class="hist__spin" aria-hidden="true"></span> Working…</div>' : ''}
       </div>

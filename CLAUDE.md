@@ -141,6 +141,9 @@ After deploy, these optional secrets tune the agent path:
 | `AGENT_CONTEXT_TOOL_BUDGET` | `60000` | Total chars of tool output kept at full size in the model's context. Older results are floored at 400 chars — **head *and* tail**, not head-only |
 | `AGENT_REPEAT_THRESHOLDS` | `3,5,8` | Consecutive identical tool calls that trigger an advisory nudge. `off` disables. Must be distinct integers ≥ 2 |
 | `AGENT_REPEAT_EXCLUDE` | *(empty)* | Comma-separated tool-name patterns (`*` wildcards) that are **transparent** to the repeat chain — they neither count nor reset it |
+| `AGENT_SPILL_THRESHOLD` | `12000` | Results larger than this are stored whole in `routiner_tool_spills` and replaced with a preview + spill id |
+| `AGENT_SPILL_PREVIEW_CHARS` | `4000` | Characters kept inline (split head/tail) when a result is spilled |
+| `AGENT_SPILL_WINDOW_CHARS` | `40000` | Max characters one `read_spill` window returns |
 
 Per-tool time budgets are declared in code (`TOOL_BUDGET_MS`), not by env: a
 tool's ceiling is a property of what it does, and the loop already caps it at
@@ -222,6 +225,47 @@ threshold before the reaper fires.
 > renders as a collapsed notice, never a user bubble. It is stripped in
 > `compactMessages` before the request: it is ours, not OpenAI's, and an unknown
 > message field is a 400 on the strict providers.
+
+> **Oversized tool output is spilled, not truncated.** Two knobs were in direct
+> contradiction: `AGENT_GH_READ_RESULT_CAP` let one `gh_read_file` return 120k
+> chars while `AGENT_CONTEXT_TOOL_BUDGET` keeps 60k of tool output at full size —
+> so a single large read was **2× the entire full-fidelity budget**, and reading
+> a second file guaranteed the first was floored. The model then re-read the file
+> it had already been handed, which is the loop the repeat guard exists to catch:
+> truncation was *manufacturing* the loop. Now a result over
+> `AGENT_SPILL_THRESHOLD` is stored whole in `routiner_tool_spills` and the
+> context gets a head/tail preview plus a spill id, paged with **`read_spill`**.
+> Three properties matter: the notice explicitly says the text was *stored, not
+> lost* and forbids re-running the tool (a truncation notice that doesn't reads
+> as a dead end); a failed insert falls back to the old inline cap, because a
+> storage blip must never fail a successful tool call; and `read_spill` is
+> **ungrouped** — always offered — since a spill only exists because a tool the
+> run already had produced it, and gating it would strand the very output we just
+> told the model to page. Spills are scoped to their run and cascade-delete with
+> it; losing one costs a re-read, never work.
+
+> **A run has a goal, and it lives off the transcript.** `messages` is compacted
+> between segments, so by segment four the model's record of its own plan is
+> mostly gone — and `AUTO_CONTINUE_PROMPT` was telling it to "resume the task
+> from the transcript", i.e. to reconstruct its plan from the part we deleted.
+> **`set_goal`** writes `{objective, done[], remaining[], phase, blocked_reason}`
+> to `routiner_runs.goal`, which nothing compacts; it is re-stated in the
+> orientation turn every segment and shown above the transcript in History.
+> `phase` is `active | blocked | complete`, and **`blocked` is a state, not
+> prose**: a blocked run stops the auto-continue chain and files as `error`,
+> because the next segment would inherit the same obstacle and burn a segment
+> failing identically — which is exactly what a spent key retried for 8h45m
+> across 45 messages did. `blocked` requires both a kebab-case `blocked_code` and
+> a human-actionable `blocked_message`; a block with no stated cause is refused,
+> since that is the dead-end the whole mechanism exists to prevent.
+
+> **A pending retry is durable before the wait, never after.** The retry backoff
+> in `openrouter()` was in-memory, so an edge function killed mid-sleep — which
+> this deployment does under load — lost the retry with no record, leaving a row
+> that simply went quiet and was indistinguishable from a hang. `onRetry` fires
+> **before** each backoff and checkpoints the run, which also bumps `fired_at` so
+> the scheduler's stale-run reaper does not mark a legitimately backing-off run
+> as dead. A failing checkpoint never aborts a retry that would have succeeded.
 
 > **The context floor keeps a tail, and slices by code point.** For every GitHub
 > tool here the answer tends to sit at the *end* — `gh_read_pr`'s per-file
@@ -405,6 +449,12 @@ for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
 - `SCHEDULER_REAP_RUN_MIN` *(optional, default 10)* — minutes of silence before
   the scheduler reaper marks a stuck `running` row as `error` (resumable).
 
+**Migrations this path needs:** `0015_tool_output_spill.sql` (the spill table)
+and `0016_run_goal.sql` (`routiner_runs.goal`). Apply both before deploying the
+agent function. Neither is load-bearing for a run to *finish* — without them
+spills fall back to the old inline truncation and `set_goal` writes are dropped
+at checkpoint — but you lose exactly the two things they add.
+
 Edge functions **auto-deploy from `main`** via
 [`.github/workflows/deploy-edge-functions.yml`](.github/workflows/deploy-edge-functions.yml)
 when `supabase/functions/**` changes (after a PR merges). Manual run:
@@ -433,6 +483,8 @@ worth naming because each one was individually blocking:
 
 | Piece | Tool / knob | Without it |
 |-------|-------------|-----------|
+| **Remember** the plan | `set_goal` (`routiner_runs.goal`) | Between segments the transcript is compacted, so a long run forgot what it was doing — and `AUTO_CONTINUE_PROMPT` asked it to resume from the part that had been floored |
+| **Keep** what it read | spill + `read_spill` | A 120k-char file read was 2× the whole context budget, so the next read floored it and the model re-read the same file |
 | **See** what went wrong | `read_runs` (in the `read` group) | An agent asked "why do runs fail?" can only guess — it cannot see History at all. One literally reported *"I can't see raw execution History logs from these tools."* `read_runs` excludes the caller's own run row: a diagnosis run checkpoints its actions to `output` as it goes, so without that filter it reads itself and its own recap crowds out the real failures. |
 | **Read** the ask | `gh_read_issue` | Runs died asking the human to paste the issue body |
 | **Change** code | `gh_propose_edit` | Whole-file rewrites are impossible on real source files |
@@ -536,7 +588,13 @@ were returning Birmingham and Chattanooga businesses). Verify with
   optional auto-routing table (`task_type → complexity → model`) edited in
   Settings and read by **both** the app and the scheduler; null = built-in
   default (`js/model-router.js`).
-- **`routiner_runs`** — run log (one row per fire). Two timestamps that mean
+- **`routiner_tool_spills`** — oversized tool results, stored whole so the
+  model's context can carry a preview + locator instead of a truncated blob.
+  RLS per user; cascade-deleted with the run. Disposable: losing a row costs a
+  re-read, never work.
+- **`routiner_runs`** — run log (one row per fire). Also carries `goal`
+  (`{objective, done[], remaining[], phase, blocked_reason}`), the one part of a
+  run's intent that compaction never touches. Two timestamps that mean
   different things: `started_at` is when the run began and never moves;
   `fired_at` is bumped at every agent checkpoint, so it is the run's *last
   activity*. History reads the pair as "started 09:12 · took 41m" (rows written
