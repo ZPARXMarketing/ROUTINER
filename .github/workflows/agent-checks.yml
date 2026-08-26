@@ -1,0 +1,68 @@
+# Reliability gates for changes to the agent loop and its scripts.
+#
+# This is the "verify" leg of the self-repair loop. An OpenRouter agent can read
+# its own failures and open a PR fixing one, but until this existed nothing
+# checked a self-authored change before a human eyeballed it — so review was the
+# only gate, and AGENT_ALLOW_MERGE could never responsibly be turned on.
+#
+# Every suite here runs with no network, no Deno and no API key: they load the
+# edge functions under a stubbed Deno global and exercise the pure helpers that
+# decide whether a run finishes or dies. Importing each function is also a syntax
+# check on the whole file, which is what catches an agent's malformed edit.
+
+name: Agent checks
+
+on:
+  pull_request:
+    paths:
+      - 'supabase/functions/**'
+      - 'scripts/**'
+      - '.github/workflows/agent-checks.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/functions/**'
+      - 'scripts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --experimental-strip-types needs a Node with type stripping; 22 has it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Agent reliability tests
+        run: node --experimental-strip-types scripts/test-agent.mjs
+
+      - name: Scheduler tests
+        run: node --experimental-strip-types scripts/test-scheduler.mjs
+
+      - name: Lead-enrichment tests
+        run: node --experimental-strip-types scripts/test-lead-enrichment.mjs
+
+      # Every edge function must at least parse. A tool-loop test cannot catch a
+      # syntax error in a function it does not import, and a broken function is
+      # otherwise only discovered at deploy time — after the PR has merged.
+      # All six functions parse cleanly under Node type-stripping today, so a
+      # failure here is a real parse error, not a Deno-vs-Node false positive.
+      - name: Every edge function parses
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in supabase/functions/*/index.ts; do
+            if node --experimental-strip-types --check "$f"; then
+              echo "  ok   $f"
+            else
+              echo "  FAIL $f does not parse"
+              fail=1
+            fi
+          done
+          exit $fail

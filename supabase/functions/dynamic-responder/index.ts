@@ -126,7 +126,16 @@ Deno.serve(async (req: Request) => {
   // an unconfigured (dev/local) proxy keeps working exactly as before.
   const gate = Deno.env.get("RESPONDER_SECRET");
   if (gate && callerSecret(req) !== gate) {
-    return json({ ok: false, error: "Unauthorized — missing or invalid responder secret." }, 401);
+    // Name the fix. A bare "unauthorized" sent a scheduled model-shootout run to
+    // its grave reporting only "the proxy returned 401 for every call" — true,
+    // and useless, because nothing in it says the gate is ON and deliberate.
+    return json({
+      ok: false,
+      error: "Unauthorized — this proxy is gated (its RESPONDER_SECRET edge secret is set), "
+        + "and this call carried no matching secret. Send it as `x-responder-secret: <secret>` "
+        + "(scripts/glm.mjs forwards $RESPONDER_SECRET automatically). "
+        + "If you did not expect a gate, the secret was set on the function without callers being updated.",
+    }, 401);
   }
 
   const key = Deno.env.get("OPENROUTER_API_KEY");

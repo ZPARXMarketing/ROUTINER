@@ -144,6 +144,9 @@ After deploy, these optional secrets tune the agent path:
 | `AGENT_SPILL_THRESHOLD` | `12000` | Results larger than this are stored whole in `routiner_tool_spills` and replaced with a preview + spill id |
 | `AGENT_SPILL_PREVIEW_CHARS` | `4000` | Characters kept inline (split head/tail) when a result is spilled |
 | `AGENT_SPILL_WINDOW_CHARS` | `40000` | Max characters one `read_spill` window returns |
+| `SCHEDULER_KEY_ALERT_USD` | `1` | Board-note warning fires when the OpenRouter key's `limit_remaining` drops to or below this |
+| `SCHEDULER_KEY_ALERT_COOLDOWN_H` | `24` | Hours between repeat key-balance notes |
+| `SCHEDULER_KEY_CHECK_EVERY_MIN` | `15` | Probe the balance only on minutes divisible by this (the scheduler itself wakes every minute) |
 
 Per-tool time budgets are declared in code (`TOOL_BUDGET_MS`), not by env: a
 tool's ceiling is a property of what it does, and the loop already caps it at
@@ -258,6 +261,38 @@ threshold before the reaper fires.
 > across 45 messages did. `blocked` requires both a kebab-case `blocked_code` and
 > a human-actionable `blocked_message`; a block with no stated cause is refused,
 > since that is the dead-end the whole mechanism exists to prevent.
+
+> **The key dying is the biggest outage this system has had, and it was
+> silent.** The OpenRouter key hit its cap on 2026-08-04; every agent run failed
+> and *nobody noticed for three weeks* — run volume went from ~26/week to two,
+> because nothing watched the balance and the usage meter only helps a human who
+> thinks to open it. The number is authoritative and one call away
+> (`limit_remaining` on `GET /api/v1/key`), so the scheduler now checks it and
+> writes an **`active` Board note** the first time it goes low. Three properties
+> the tests pin: a key with **no cap configured never alarms** (it cannot run
+> out this way, and crying wolf every 15 minutes trains you to ignore it); an
+> **unreachable or garbled probe is silent**, because an OpenRouter blip must
+> not manufacture a scare note about a healthy key; and the note carries a
+> `[key-balance]` marker used for its own cooldown lookup, so a spent key files
+> one note a day rather than 1,440. Delete the note to re-arm the alarm early.
+
+> **A goal the model sets once and forgets is worse than no goal.** The first
+> live run after shipping `set_goal` filed `success` while its own goal still
+> read `phase: active, done: []` — set at step one, never touched again. On one
+> segment that is untidy; across segments the next orientation turn reads
+> "nothing done yet" and invites the run to redo finished work, which is exactly
+> what the goal exists to prevent. Two fixes, because trusting the model to
+> keep it current is what failed: `reconcileGoal` flips an `active` goal to
+> `complete` when the run itself ends in `success` (the run's outcome is the
+> authority, and `done`/`remaining` are never invented), and a segment after the
+> first that inherits a goal with an empty `done` gets told so explicitly.
+
+> **A 401 must name the gate.** A scheduled model-shootout run died reporting
+> only *"dynamic-responder proxy returned 401 for every call"* — accurate and
+> useless, because nothing in it said the gate was **on and deliberate**
+> (`RESPONDER_SECRET` is set as an edge secret). The proxy now says so, names
+> the `x-responder-secret` header, and notes that `scripts/glm.mjs` forwards
+> `$RESPONDER_SECRET` — so the next caller to hit it can fix itself.
 
 > **A pending retry is durable before the wait, never after.** The retry backoff
 > in `openrouter()` was in-memory, so an edge function killed mid-sleep — which
@@ -489,7 +524,7 @@ worth naming because each one was individually blocking:
 | **Read** the ask | `gh_read_issue` | Runs died asking the human to paste the issue body |
 | **Change** code | `gh_propose_edit` | Whole-file rewrites are impossible on real source files |
 | **Survive** flakiness | `AGENT_MODEL_RETRIES`, `AGENT_FALLBACK_MODEL` | One `Provider returned error` ended the whole run |
-| **Verify** the fix | `scripts/test-agent.mjs` | Nothing checked that a self-authored change actually works |
+| **Verify** the fix | `scripts/test-agent.mjs` + the **Agent checks** workflow | Nothing checked that a self-authored change actually works — and until CI ran on agent PRs, review was the only gate, so `AGENT_ALLOW_MERGE` could never responsibly be turned on |
 
 `node --experimental-strip-types scripts/test-agent.mjs` runs the reliability
 tests with no network and no Deno, so an agent (or CI, or you) can check a change

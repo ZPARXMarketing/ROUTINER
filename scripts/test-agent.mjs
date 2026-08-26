@@ -24,7 +24,8 @@ export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudg
          repeatKey, repeatChainCount, repeatReminder, isHumanTurn, headTail,
          toolBudgetFor, segmentOrientation, TOOL_BUDGET_MS,
          sliceLines, spillResult, toolGroupOf, toolSpecs,
-         normalizeGoal, renderGoal, parseStoredGoal, goalBlockStop, openrouter };
+         normalizeGoal, renderGoal, parseStoredGoal, goalBlockStop, openrouter,
+         reconcileGoal };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -353,6 +354,18 @@ eq("…below the blocker, not above it", withSaid.indexOf("Blocked") < withSaid.
 eq("a budget stop is not appended",
   m.goalBlockStop(blocked, "Stopped: hit the time budget before a final answer."),
   m.goalBlockStop(blocked, ""));
+
+// The first live run filed `success` while its own goal still read
+// `phase: active, done: []` — the model set it once and never touched it again.
+// One segment makes that untidy; across segments the next orientation turn reads
+// "nothing done yet" and invites the run to redo finished work.
+eq("a success completes an active goal", m.reconcileGoal(prev, "success").phase, "complete");
+eq("…without inventing progress", m.reconcileGoal(prev, "success").done, prev.done);
+eq("an error leaves the goal alone", m.reconcileGoal(prev, "error").phase, "active");
+eq("a blocked goal is never overwritten by success", m.reconcileGoal(blocked, "success").phase, "blocked");
+eq("a complete goal stays complete",
+  m.reconcileGoal({ ...prev, phase: "complete" }, "success").phase, "complete");
+eq("no goal stays no goal", m.reconcileGoal(null, "success"), null);
 
 console.log("\n— tool-output spill —");
 // AGENT_GH_READ_RESULT_CAP (120k) vs AGENT_CONTEXT_TOOL_BUDGET (60k) meant one
