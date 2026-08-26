@@ -44,6 +44,10 @@ create table if not exists public.routiner_runs (
   account     text,                         -- account id (to resolve the same key on continue)
   trigger_key text,                         -- trigger/instance within the account
   tools       jsonb,                        -- enabled tool groups, e.g. ["read","research","write"]
+  -- The run's objective, carried across segments. `messages` gets compacted —
+  -- old tool results are floored — so intent needs somewhere that isn't the
+  -- transcript. {objective, done[], remaining[], phase, blocked_reason} (0016).
+  goal        jsonb,
   -- Two stamps, and they mean different things: started_at is when the run began
   -- and never moves; fired_at is bumped at every checkpoint, so it is the run's
   -- LAST activity. History reads the pair as "started … took …".
@@ -95,7 +99,23 @@ create table if not exists public.routiner_openrouter_usage (
   error             text                                 -- error message when ok=false
 );
 
+-- Oversized tool output, stored whole so the model's context can carry a
+-- preview + locator instead of a truncated blob (see 0015). Disposable: losing
+-- a row costs a re-read, never work.
+create table if not exists public.routiner_tool_spills (
+  id         uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  user_id    uuid references auth.users(id) on delete cascade,
+  run_id     uuid references public.routiner_runs(id) on delete cascade,
+  tool_name  text not null default '',
+  args       jsonb,                             -- the call that produced it
+  content    text not null default '',          -- the FULL tool result, unmodified
+  chars      integer not null default 0         -- code-point length at write time
+);
+
 create index if not exists routiner_routines_user_idx on public.routiner_routines(user_id);
+create index if not exists routiner_tool_spills_run_idx  on public.routiner_tool_spills(run_id, created_at desc);
+create index if not exists routiner_tool_spills_user_idx on public.routiner_tool_spills(user_id);
 create index if not exists routiner_runs_user_idx     on public.routiner_runs(user_id);
 create index if not exists routiner_runs_started_idx  on public.routiner_runs(started_at desc);
 create index if not exists routiner_notes_user_idx    on public.routiner_notes(user_id);
@@ -107,6 +127,7 @@ alter table public.routiner_routines enable row level security;
 alter table public.routiner_runs     enable row level security;
 alter table public.routiner_settings enable row level security;
 alter table public.routiner_notes    enable row level security;
+alter table public.routiner_tool_spills enable row level security;
 -- No policy on routiner_openrouter_usage → service-role-only (edge functions).
 alter table public.routiner_openrouter_usage enable row level security;
 
@@ -116,6 +137,10 @@ create policy "own routines" on public.routiner_routines
 
 drop policy if exists "own runs" on public.routiner_runs;
 create policy "own runs" on public.routiner_runs
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+drop policy if exists "own spills" on public.routiner_tool_spills;
+create policy "own spills" on public.routiner_tool_spills
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 
 drop policy if exists "own settings" on public.routiner_settings;

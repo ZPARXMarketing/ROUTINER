@@ -20,7 +20,11 @@ src += `
 export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudgetStop,
          normalizeAgentBranch, deniedWritePath, segmentMadeProgress, resolveReasoning,
          parseReasoningEffort, exhaustedMessage, detectOpenedPr,
-         looksLikeKeyLimit, isKeyExhausted };
+         looksLikeKeyLimit, isKeyExhausted,
+         repeatKey, repeatChainCount, repeatReminder, isHumanTurn, headTail,
+         toolBudgetFor, segmentOrientation, TOOL_BUDGET_MS,
+         sliceLines, spillResult, toolGroupOf, toolSpecs,
+         normalizeGoal, renderGoal, parseStoredGoal, goalBlockStop, openrouter };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -145,13 +149,306 @@ const msgs = [
 ];
 const out = m.compactMessages(msgs, 60_000);
 const toolLens = out.filter((x) => x.role === "tool").map((x) => x.content.length);
-eq("newest kept full, older floored", toolLens, [425, 425, 50_000]);
+const FLOORED = 400 + "\n…[truncated for context]…\n".length;
+eq("newest kept full, older floored", toolLens, [FLOORED, FLOORED, 50_000]);
 eq("total tool chars under control", toolLens.reduce((a, b) => a + b, 0) <= 61_000, true);
 eq("input not mutated", msgs[1].content.length, 50_000);
 eq("non-tool untouched", out[0].content, "sys");
 const small = [{ role: "tool", content: "tiny" }, { role: "tool", content: big(70_000) }];
 eq("small results never truncated", m.compactMessages(small, 10)[0].content, "tiny");
-eq("zero budget floors big ones", m.compactMessages(small, 0)[1].content.length, 425);
+eq("zero budget floors big ones", m.compactMessages(small, 0)[1].content.length, FLOORED);
+
+// The floor keeps a TAIL, not just a head. For every GitHub tool here the answer
+// tends to sit at the end (gh_read_pr patches, a trailing error line), and
+// head-only flooring discarded exactly that — sending the model back to re-read
+// the same file, which is the loop the repeat guard below then has to catch.
+const marked = `HEAD${"m".repeat(5_000)}TAIL`;
+const floored = m.compactMessages([{ role: "tool", content: marked }], 0)[0].content;
+eq("floor keeps the head", floored.startsWith("HEAD"), true);
+eq("floor keeps the tail", floored.endsWith("TAIL"), true);
+
+// Slicing by UTF-16 unit splits a surrogate pair and emits a lone surrogate,
+// which then rides into a jsonb column and a JSON request body as invalid text.
+const emoji = "🙂".repeat(5_000);
+const cut = m.compactMessages([{ role: "tool", content: emoji }], 0)[0].content;
+eq("no lone surrogate survives truncation", /[\uD800-\uDFFF]/.test(cut.replace(/🙂/g, "")), false);
+eq("head/tail are whole emoji", cut.startsWith("🙂") && cut.endsWith("🙂"), true);
+
+// `_source` is ours, not OpenAI's — it must never reach a provider.
+const tagged = [{ role: "user", content: "go", _source: "auto-continue" }];
+eq("_source stripped from the request", "_source" in m.compactMessages(tagged, 100)[0], false);
+eq("_source kept on the stored message", tagged[0]._source, "auto-continue");
+
+console.log("\n— repeat-tool guard (loop hygiene) —");
+// segmentMadeProgress only asks "did ANY tool run" — so twelve identical reads
+// scored full progress and burned the whole step budget. These pin the chain.
+const call = (name, args) => ({
+  role: "assistant",
+  tool_calls: [{ id: "x", function: { name, arguments: JSON.stringify(args) } }],
+});
+const res = () => ({ role: "tool", tool_call_id: "x", content: "ok" });
+const chainOf = (...turns) => m.repeatChainCount(turns.flat());
+
+eq("key ignores argument order",
+  m.repeatKey("gh_read_file", '{"a":1,"b":2}') === m.repeatKey("gh_read_file", '{"b":2,"a":1}'), true);
+eq("key separates different tools",
+  m.repeatKey("gh_read_file", "{}") === m.repeatKey("gh_list_prs", "{}"), false);
+
+eq("one call is a chain of 1",
+  chainOf([call("gh_read_file", { path: "a" }), res()]).count, 1);
+eq("three identical calls count 3", chainOf(
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "a" }), res()],
+).count, 3);
+eq("a different argument resets", chainOf(
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "b" }), res()],
+).count, 1);
+eq("a human turn resets the chain", chainOf(
+  [call("gh_read_file", { path: "a" }), res()],
+  [{ role: "user", content: "actually, do this instead" }],
+  [call("gh_read_file", { path: "a" }), res()],
+).count, 1);
+// The auto-continue prompt is a machine turn: a run stuck on one call across a
+// segment boundary is exactly the case this guard exists for, so it must NOT
+// launder the chain the way a genuine human interjection does.
+eq("an auto-continue prompt does NOT reset", chainOf(
+  [call("gh_read_file", { path: "a" }), res()],
+  [call("gh_read_file", { path: "a" }), res()],
+  [{ role: "user", content: "[auto-continue] …", _source: "auto-continue" }],
+  [call("gh_read_file", { path: "a" }), res()],
+).count, 3);
+eq("isHumanTurn: bare user turn", m.isHumanTurn({ role: "user", content: "hi" }), true);
+eq("isHumanTurn: injected turn", m.isHumanTurn({ role: "user", content: "hi", _source: "auto-continue" }), false);
+
+const threeSame = [
+  call("gh_read_file", { path: "a" }), res(),
+  call("gh_read_file", { path: "a" }), res(),
+  call("gh_read_file", { path: "a" }), res(),
+];
+eq("no nudge below the first threshold",
+  m.repeatReminder(threeSame.slice(0, 4)), null);
+const nudge3 = m.repeatReminder(threeSame);
+eq("first threshold nudges", !!nudge3, true);
+eq("first threshold is the gentle form", nudge3.text.includes("consecutive_calls"), false);
+const five = [...threeSame, call("gh_read_file", { path: "a" }), res(), call("gh_read_file", { path: "a" }), res()];
+const nudge5 = m.repeatReminder(five);
+eq("later threshold is the detailed form", nudge5.text.includes("consecutive_calls: 5"), true);
+eq("detailed form names the tool", nudge5.tool, "gh_read_file");
+
+// The preview cap bounds the REMINDER; the chain key always compares full args,
+// so a looping whole-file gh_propose_change payload cannot ride into the request.
+const fat = (n) => [call("gh_propose_change", { body: "z".repeat(20_000) }), res()];
+const fatNudge = m.repeatReminder([...fat(), ...fat(), ...fat(), ...fat(), ...fat()]);
+eq("huge arguments are previewed, not quoted whole", fatNudge.text.length < 2_000, true);
+eq("preview says how much it dropped", /\+\d+ more chars/.test(fatNudge.text), true);
+
+console.log("\n— durable retry (checkpoint before the wait) —");
+// A retry held only in memory disappears if the edge function is killed during
+// the backoff — which this deployment does under load — leaving a row that just
+// went quiet, indistinguishable from a hang. It also has to bump last-activity
+// or the scheduler's stale-run reaper marks a backing-off run dead.
+{
+  const real = globalThis.fetch;
+  const events = [];
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    // Fail transiently twice, then succeed.
+    if (calls <= 2) return { ok: false, status: 503, json: async () => ({ error: { message: "Provider returned error" } }) };
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "done" } }], usage: {} }) };
+  };
+  const r = await m.openrouter("sk-test", "z-ai/glm-4.7", [{ role: "user", content: "hi" }], {
+    retries: 2, timeoutMs: 5_000,
+    onRetry: (info) => { events.push({ ...info, at: "before-sleep" }); },
+  });
+  globalThis.fetch = real;
+  eq("the call eventually succeeds", r.ok, true);
+  eq("one checkpoint per backoff", events.length, 2);
+  eq("attempts are numbered from 1", events.map((e) => e.attempt), [1, 2]);
+  eq("the retry ceiling is reported", events[0].retries, 2);
+  eq("the delay is stated", events[0].delayMs > 0, true);
+  eq("the cause is carried", /Provider returned error/.test(events[0].error), true);
+  eq("a 503 is reported as such", events[0].status, 503);
+}
+// A checkpoint failure must never abort a retry that would have succeeded.
+{
+  const real = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    if (calls === 1) return { ok: false, status: 503, json: async () => ({ error: { message: "flaky" } }) };
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ok" } }], usage: {} }) };
+  };
+  const r = await m.openrouter("sk-test", "z-ai/glm-4.7", [{ role: "user", content: "hi" }], {
+    retries: 1, timeoutMs: 5_000,
+    onRetry: () => { throw new Error("checkpoint died"); },
+  });
+  globalThis.fetch = real;
+  eq("a thrown checkpoint does not kill the retry", r.ok, true);
+}
+// A permanent failure must not checkpoint a retry it is never going to make.
+{
+  const real = globalThis.fetch;
+  const events = [];
+  globalThis.fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: { message: "No auth credentials found" } }) });
+  const r = await m.openrouter("sk-test", "z-ai/glm-4.7", [{ role: "user", content: "hi" }], {
+    retries: 2, timeoutMs: 5_000, onRetry: (i) => { events.push(i); },
+  });
+  globalThis.fetch = real;
+  eq("a permanent error still fails fast", r.ok, false);
+  eq("…and announces no retry", events.length, 0);
+}
+
+console.log("\n— run goal (survives compaction) —");
+// `messages` is compacted between segments — old tool results are floored — so
+// by segment four the model's record of its own plan is mostly gone, and
+// AUTO_CONTINUE_PROMPT was asking it to resume from the part we deleted.
+const G = (o, prev = null) => m.normalizeGoal(o, prev);
+eq("an objective is required", "error" in G({}), true);
+eq("phase defaults to active", G({ objective: "fix #57" }).phase, "active");
+eq("an unknown phase is rejected", "error" in G({ objective: "x", phase: "paused" }), true);
+eq("lists are cleaned of blanks",
+  G({ objective: "x", done: ["a", "", "  ", "b"] }).done, ["a", "b"]);
+eq("lists are capped", G({ objective: "x", remaining: Array(50).fill("s") }).remaining.length, 12);
+// A blocked run with no stated cause is the dead-end this exists to prevent:
+// the next segment and the human would both have nothing to act on.
+eq("blocked demands a code and a message",
+  "error" in G({ objective: "x", phase: "blocked" }), true);
+eq("blocked with only a code is still refused",
+  "error" in G({ objective: "x", phase: "blocked", blocked_code: "needs-human" }), true);
+const blocked = G({ objective: "fix #57", phase: "blocked", blocked_code: "Needs-Human", blocked_message: "PR needs a maintainer" });
+eq("a full block is accepted", blocked.phase, "blocked");
+eq("the code is normalized", blocked.blocked_reason.code, "needs-human");
+
+// Partial updates keep what the previous segment established.
+const prev = G({ objective: "fix #57", done: ["read the issue"], remaining: ["open a PR"] });
+eq("an update inherits the objective", G({ done: ["read", "edited"] }, prev).objective, "fix #57");
+eq("an update replaces the list it names", G({ done: ["read", "edited"] }, prev).done, ["read", "edited"]);
+eq("…and keeps the one it doesn't", G({ done: ["read"] }, prev).remaining, ["open a PR"]);
+
+eq("renders the objective", /\[goal\] fix #57/.test(m.renderGoal(prev)), true);
+eq("renders progress", /✓ read the issue/.test(m.renderGoal(prev)), true);
+eq("renders nothing for no goal", m.renderGoal(null), "");
+eq("a stored goal round-trips", m.parseStoredGoal(JSON.parse(JSON.stringify(prev))).objective, "fix #57");
+eq("garbage in the column is ignored", m.parseStoredGoal({ nonsense: 1 }), null);
+eq("a null column is ignored", m.parseStoredGoal(null), null);
+
+// The point of making "blocked" a state rather than prose: the chain stops.
+// A spent key retried for 8h45m across 45 messages is what happens otherwise.
+eq("a blocked goal stops the chain", typeof m.goalBlockStop(blocked), "string");
+eq("…and names the cause", /needs-human/.test(m.goalBlockStop(blocked)), true);
+eq("…and says why it stopped", /same obstacle/.test(m.goalBlockStop(blocked)), true);
+eq("an active goal does not stop it", m.goalBlockStop(prev), null);
+eq("no goal does not stop it", m.goalBlockStop(null), null);
+// The block notice leads, but what the model said has to survive: it usually
+// holds the detail a human needs to clear the block, and a stop that silently
+// replaces it makes the run look like it produced nothing.
+const withSaid = m.goalBlockStop(blocked, "I could not merge; the branch needs an approving review.");
+eq("the model's own words are kept", /needs an approving review/.test(withSaid), true);
+eq("…below the blocker, not above it", withSaid.indexOf("Blocked") < withSaid.indexOf("approving"), true);
+// A budget-stop string is boilerplate, not a finding — appending it is noise.
+eq("a budget stop is not appended",
+  m.goalBlockStop(blocked, "Stopped: hit the time budget before a final answer."),
+  m.goalBlockStop(blocked, ""));
+
+console.log("\n— tool-output spill —");
+// AGENT_GH_READ_RESULT_CAP (120k) vs AGENT_CONTEXT_TOOL_BUDGET (60k) meant one
+// large read was 2x the whole full-fidelity budget, so a second read floored the
+// first and the model went back to re-read a file it had already been handed.
+eq("sliceLines: a window in the middle",
+  m.sliceLines("a\nb\nc\nd\ne", 2, 2), { body: "b\nc", from: 2, to: 3, total: 5 });
+eq("sliceLines: clamps past the end",
+  m.sliceLines("a\nb\nc", 2, 99), { body: "b\nc", from: 2, to: 3, total: 3 });
+eq("sliceLines: a start past the end still returns the last line",
+  m.sliceLines("a\nb\nc", 99, 5), { body: "c", from: 3, to: 3, total: 3 });
+
+const withInsert = async (fn, { ok = true, id = "11111111-1111-4111-8111-111111111111" } = {}) => {
+  const real = globalThis.fetch;
+  let sent = null;
+  globalThis.fetch = async (_u, init) => {
+    sent = JSON.parse(init.body);
+    return { ok, json: async () => (ok ? [{ id }] : null) };
+  };
+  try { return { out: await fn(), sent }; } finally { globalThis.fetch = real; }
+};
+
+const smallText = "x".repeat(100);
+eq("a small result is never spilled",
+  (await withInsert(() => m.spillResult(smallText, "gh_read_file", {}, { userId: "u", runId: "r" }))).out, null);
+
+const bigText = Array.from({ length: 4000 }, (_, i) => `line ${i}`).join("\n");
+const { out: replaced, sent } = await withInsert(
+  () => m.spillResult(bigText, "gh_read_file", { path: "js/app.js" }, { userId: "u", runId: "r" }));
+eq("a large result is replaced", typeof replaced === "string", true);
+eq("the FULL text is what gets stored", sent.content, bigText);
+eq("…and its length is recorded", sent.chars, Array.from(bigText).length);
+eq("the replacement names the spill id", replaced.includes("11111111-1111-4111-8111-111111111111"), true);
+eq("the replacement keeps the head", replaced.startsWith("line 0"), true);
+eq("the replacement keeps the tail", /line 3999\b/.test(replaced), true);
+eq("the replacement is far smaller than the original", replaced.length < bigText.length / 2, true);
+// The model's standing instruction is "don't re-read a file you already have",
+// so a truncated result that does not say the rest is retrievable reads as a
+// dead end — which is exactly what sent agents back to re-run the same call.
+eq("it says the text was stored, not lost", /not lost/.test(replaced), true);
+eq("it names the retrieval tool", /read_spill/.test(replaced), true);
+eq("it forbids re-running the tool", /Do NOT re-run gh_read_file/.test(replaced), true);
+
+// A storage failure must never fail the tool call — losing LESS than truncation
+// did is the whole point, so the caller keeps its own inline text.
+eq("a failed insert falls back to inline",
+  (await withInsert(() => m.spillResult(bigText, "gh_read_file", {}, { userId: "u", runId: "r" }), { ok: false })).out, null);
+eq("an insert returning no id falls back too",
+  (await withInsert(() => m.spillResult(bigText, "gh_read_file", {}, { userId: "u", runId: "r" }), { id: "" })).out, null);
+{
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("network down"); };
+  eq("a thrown insert falls back too",
+    await m.spillResult(bigText, "gh_read_file", {}, { userId: "u", runId: "r" }), null);
+  globalThis.fetch = real;
+}
+
+// read_spill must be reachable regardless of which groups the run enabled: a
+// spill only exists because a tool the run already had produced it, and gating
+// it would strand the very output we just told the model to page.
+eq("read_spill belongs to no group", m.toolGroupOf("read_spill"), "*");
+const specNames = (en) => m.toolSpecs(new Set(en)).map((s) => s.function.name);
+eq("offered with no groups at all", specNames([]).includes("read_spill"), true);
+eq("offered alongside code tools", specNames(["code"]).includes("read_spill"), true);
+eq("a run with no groups gets only the ungrouped tools",
+  specNames([]).sort(), ["read_spill", "set_goal"]);
+
+console.log("\n— per-tool time budgets —");
+// Every tool used to get the WHOLE remaining wall, so one slow call could eat
+// the segment and leave nothing to summarize with.
+eq("a declared budget caps a generous remainder",
+  m.toolBudgetFor("gh_read_file", 90_000), 30_000);
+eq("the remainder caps a declared budget",
+  m.toolBudgetFor("gh_propose_edit", 9_000), 9_000);
+eq("an unknown tool falls back to the call timeout",
+  m.toolBudgetFor("some_future_tool", 999_000), 50_000);
+eq("never negative", m.toolBudgetFor("gh_read_file", -5), 0);
+// A multi-request tool must be allowed more than a single round-trip, or the
+// read→branch→write→PR chain cannot fit inside its own budget.
+eq("multi-request tools out-budget single reads",
+  m.TOOL_BUDGET_MS.gh_propose_edit > m.TOOL_BUDGET_MS.gh_read_file, true);
+
+console.log("\n— segment orientation —");
+const orient0 = m.segmentOrientation(0, 0, 100_000);
+eq("names the segment", /Segment 1 of at most 6/.test(orient0), true);
+eq("states the working time", /about 100s/.test(orient0), true);
+eq("early segments mention the hand-off", /next segment/.test(orient0), true);
+eq("no elapsed claim on a fresh run", /so far in this run/.test(orient0), false);
+const orientLast = m.segmentOrientation(5, 8 * 60_000, 100_000);
+eq("the last segment says so", /LAST segment/.test(orientLast), true);
+eq("…and does not promise a next one", /carries to the next segment/.test(orientLast), false);
+eq("reports elapsed once there is some", /8m so far in this run/.test(orientLast), true);
+// It is injected, so it must never read as a human turn — otherwise it would
+// reset the repeat chain at the start of every single segment.
+eq("orientation never resets the repeat chain",
+  m.isHumanTurn({ role: "user", content: orient0, _source: "orientation" }), false);
 
 console.log("\n— applyEdits (gh_propose_edit core) —");
 const file = "line one\nline two\nline three\n";
