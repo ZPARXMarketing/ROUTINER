@@ -343,6 +343,16 @@ eq("…and names the cause", /needs-human/.test(m.goalBlockStop(blocked)), true)
 eq("…and says why it stopped", /same obstacle/.test(m.goalBlockStop(blocked)), true);
 eq("an active goal does not stop it", m.goalBlockStop(prev), null);
 eq("no goal does not stop it", m.goalBlockStop(null), null);
+// The block notice leads, but what the model said has to survive: it usually
+// holds the detail a human needs to clear the block, and a stop that silently
+// replaces it makes the run look like it produced nothing.
+const withSaid = m.goalBlockStop(blocked, "I could not merge; the branch needs an approving review.");
+eq("the model's own words are kept", /needs an approving review/.test(withSaid), true);
+eq("…below the blocker, not above it", withSaid.indexOf("Blocked") < withSaid.indexOf("approving"), true);
+// A budget-stop string is boilerplate, not a finding — appending it is noise.
+eq("a budget stop is not appended",
+  m.goalBlockStop(blocked, "Stopped: hit the time budget before a final answer."),
+  m.goalBlockStop(blocked, ""));
 
 console.log("\n— tool-output spill —");
 // AGENT_GH_READ_RESULT_CAP (120k) vs AGENT_CONTEXT_TOOL_BUDGET (60k) meant one

@@ -213,6 +213,16 @@ const SPILL_THRESHOLD = budgetNum("AGENT_SPILL_THRESHOLD", 12_000);
 const SPILL_PREVIEW_CHARS = budgetNum("AGENT_SPILL_PREVIEW_CHARS", 4_000);
 /** Max characters one read_spill window may return. */
 const SPILL_WINDOW_CHARS = budgetNum("AGENT_SPILL_WINDOW_CHARS", 40_000);
+/**
+ * Ceiling on the spill write itself. The insert carries the entire tool result
+ * (up to GH_READ_RESULT_CAP), so it is the largest request this function makes
+ * — and it sits inside the tool loop, where a stall costs the whole segment.
+ * A spill is a cache: waiting past this is strictly worse than falling back to
+ * the inline cap, which is what a timeout here does.
+ */
+const SPILL_WRITE_TIMEOUT_MS = 10_000;
+/** Ceiling on one checkpoint write; see checkpointRun for why it is bounded. */
+const CHECKPOINT_TIMEOUT_MS = 15_000;
 
 // ── GitHub (the "code" tool group) ───────────────────────────────────────────
 // Lets a non-Claude instance read the repo, inspect PRs, and — the whole point —
@@ -917,7 +927,11 @@ async function runTool(
         // Scoped to this run: a spill id from another run is not this model's to
         // read, and a stale id from an earlier transcript should say so plainly
         // rather than silently return someone else's tool output.
-        const scope = ctx.runId ? `&run_id=eq.${encodeURIComponent(ctx.runId)}` : "";
+        // Scope by BOTH owner and run where we have them. A spill id only ever
+        // reaches the model through its own context, but an id-only lookup is a
+        // wider query than this tool ever needs.
+        const scope = (ctx.runId ? `&run_id=eq.${encodeURIComponent(ctx.runId)}` : "")
+          + (ctx.userId ? `&user_id=eq.${encodeURIComponent(ctx.userId)}` : "");
         const rows = await sbGet(`routiner_tool_spills?id=eq.${encodeURIComponent(id)}${scope}&select=content,chars,tool_name&limit=1`);
         const row = rows?.[0];
         if (!row) return `error: no spill ${id} for this run. It may belong to a different run, or have been cleaned up — re-run the tool that produced it.`;
@@ -1445,6 +1459,7 @@ async function spillResult(
         user_id: ctx.userId, run_id: ctx.runId ?? null,
         tool_name: toolName, args, content: text, chars: total,
       }),
+      signal: AbortSignal.timeout(SPILL_WRITE_TIMEOUT_MS),
     });
     if (!res.ok) return null;
     const rows = await res.json().catch(() => null);
@@ -1714,6 +1729,11 @@ async function checkpointRun(
     const res = await fetch(rest(filter), {
       method: "PATCH", headers: { ...H(), Prefer: "return=representation" },
       body: JSON.stringify({ ...patch, fired_at: new Date().toISOString() }),
+      // A checkpoint carries the whole transcript and runs after every tool
+      // batch — and one now runs before each model retry, where a stall would
+      // swallow the retry itself. The function already fails open on error, so
+      // a bounded write degrades to exactly that instead of costing a segment.
+      signal: AbortSignal.timeout(CHECKPOINT_TIMEOUT_MS),
     });
     if (isCancelPatch) return { cancelled: true };
     // Fail open on any transport/HTTP error — don't stop a live run on a blip;
@@ -1795,12 +1815,17 @@ function segmentMadeProgress(actions: string[], finalText: string): boolean {
 // would inherit the same obstacle and burn a segment failing the same way —
 // which is exactly what happened when a spent key was retried for 8h45m. A
 // block is a state with a named cause, so it stops the chain and says why.
-function goalBlockStop(goal: RunGoal | null): string | null {
+function goalBlockStop(goal: RunGoal | null, finalText = ""): string | null {
   if (!goal || goal.phase !== "blocked" || !goal.blocked_reason) return null;
-  return `⛔ Blocked (${goal.blocked_reason.code}): ${goal.blocked_reason.message}\n\n`
+  const notice = `⛔ Blocked (${goal.blocked_reason.code}): ${goal.blocked_reason.message}\n\n`
     + `Objective: ${goal.objective}\n`
     + "Auto-continue stopped — the next segment would hit the same obstacle. "
     + "Resolve the cause, then reply here to resume.";
+  // Lead with the blocker, but keep what the model said underneath: it usually
+  // holds the detail a human needs to clear the block, and a stop notice that
+  // silently replaces it makes the run look like it produced nothing.
+  const said = (finalText || "").trim();
+  return said && !isBudgetStop(said) ? `${notice}\n\n---\n\n${said}` : notice;
 }
 
 function noProgressStopMessage(streak: number): string {
@@ -2201,7 +2226,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
     let continuing = false;
     let noProgressStop = false;
-    const blockStop = goalBlockStop(goal);
+    const blockStop = goalBlockStop(goal, finalText);
     if (blockStop) {
       finalText = blockStop;
       incomplete = false;
@@ -2310,7 +2335,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
   let continuing = false;
   let noProgressStop = false;
-  const blockStop = goalBlockStop(goal);
+  const blockStop = goalBlockStop(goal, finalText);
   if (blockStop) {
     finalText = blockStop;
     incomplete = false;
