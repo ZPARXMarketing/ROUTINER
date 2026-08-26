@@ -1600,7 +1600,7 @@ function runPaneHtml(it) {
   const bubbles = turns.map((t) => {
     if (t.kind === 'user') return `<div class="chatmsg chatmsg--user">${esc(t.content)}</div>`;
     if (t.kind === 'notice') {
-      const label = t.source === 'repeat-guard' ? 'repeat guard' : t.source === 'auto-continue' ? 'auto-continue' : t.source;
+      const label = { 'repeat-guard': 'repeat guard', 'auto-continue': 'auto-continue', orientation: 'orientation' }[t.source] || t.source;
       return `<details class="transcript__notice"><summary>⟳ ${esc(label)}</summary><pre>${esc(t.content.slice(0, 4000))}</pre></details>`;
     }
     if (t.kind === 'tool') return `<div class="transcript__tool">⚙ ${esc(t.content)}</div>`;

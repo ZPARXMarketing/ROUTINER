@@ -21,7 +21,8 @@ export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudg
          normalizeAgentBranch, deniedWritePath, segmentMadeProgress, resolveReasoning,
          parseReasoningEffort, exhaustedMessage, detectOpenedPr,
          looksLikeKeyLimit, isKeyExhausted,
-         repeatKey, repeatChainCount, repeatReminder, isHumanTurn, headTail };
+         repeatKey, repeatChainCount, repeatReminder, isHumanTurn, headTail,
+         toolBudgetFor, segmentOrientation, TOOL_BUDGET_MS };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -241,6 +242,36 @@ const fat = (n) => [call("gh_propose_change", { body: "z".repeat(20_000) }), res
 const fatNudge = m.repeatReminder([...fat(), ...fat(), ...fat(), ...fat(), ...fat()]);
 eq("huge arguments are previewed, not quoted whole", fatNudge.text.length < 2_000, true);
 eq("preview says how much it dropped", /\+\d+ more chars/.test(fatNudge.text), true);
+
+console.log("\n— per-tool time budgets —");
+// Every tool used to get the WHOLE remaining wall, so one slow call could eat
+// the segment and leave nothing to summarize with.
+eq("a declared budget caps a generous remainder",
+  m.toolBudgetFor("gh_read_file", 90_000), 30_000);
+eq("the remainder caps a declared budget",
+  m.toolBudgetFor("gh_propose_edit", 9_000), 9_000);
+eq("an unknown tool falls back to the call timeout",
+  m.toolBudgetFor("some_future_tool", 999_000), 50_000);
+eq("never negative", m.toolBudgetFor("gh_read_file", -5), 0);
+// A multi-request tool must be allowed more than a single round-trip, or the
+// read→branch→write→PR chain cannot fit inside its own budget.
+eq("multi-request tools out-budget single reads",
+  m.TOOL_BUDGET_MS.gh_propose_edit > m.TOOL_BUDGET_MS.gh_read_file, true);
+
+console.log("\n— segment orientation —");
+const orient0 = m.segmentOrientation(0, 0, 100_000);
+eq("names the segment", /Segment 1 of at most 6/.test(orient0), true);
+eq("states the working time", /about 100s/.test(orient0), true);
+eq("early segments mention the hand-off", /next segment/.test(orient0), true);
+eq("no elapsed claim on a fresh run", /so far in this run/.test(orient0), false);
+const orientLast = m.segmentOrientation(5, 8 * 60_000, 100_000);
+eq("the last segment says so", /LAST segment/.test(orientLast), true);
+eq("…and does not promise a next one", /carries to the next segment/.test(orientLast), false);
+eq("reports elapsed once there is some", /8m so far in this run/.test(orientLast), true);
+// It is injected, so it must never read as a human turn — otherwise it would
+// reset the repeat chain at the start of every single segment.
+eq("orientation never resets the repeat chain",
+  m.isHumanTurn({ role: "user", content: orient0, _source: "orientation" }), false);
 
 console.log("\n— applyEdits (gh_propose_edit core) —");
 const file = "line one\nline two\nline three\n";

@@ -141,6 +141,10 @@ After deploy, these optional secrets tune the agent path:
 | `AGENT_CONTEXT_TOOL_BUDGET` | `60000` | Total chars of tool output kept at full size in the model's context. Older results are floored at 400 chars — **head *and* tail**, not head-only |
 | `AGENT_REPEAT_THRESHOLDS` | `3,5,8` | Consecutive identical tool calls that trigger an advisory nudge. `off` disables. Must be distinct integers ≥ 2 |
 | `AGENT_REPEAT_EXCLUDE` | *(empty)* | Comma-separated tool-name patterns (`*` wildcards) that are **transparent** to the repeat chain — they neither count nor reset it |
+
+Per-tool time budgets are declared in code (`TOOL_BUDGET_MS`), not by env: a
+tool's ceiling is a property of what it does, and the loop already caps it at
+the time actually left.
 | `AGENT_MAX_STEPS` | `5` | Tool-loop steps per edge invocation (non-code) |
 | `AGENT_CODE_MAX_STEPS` | `12` | Tool-loop steps when the `code` tool group is enabled |
 | `AGENT_MAX_NO_PROGRESS` | `2` | Consecutive auto-continue segments with no tools/text before the chain stops with `error` |
@@ -187,6 +191,27 @@ threshold before the reaper fires.
 > fresh edge invocation and in-memory state would reset at exactly the boundary a
 > stuck run is most likely to cross. A *human* reply resets the chain; the
 > injected `[auto-continue]` prompt does not.
+
+> **One deadline per tool call, not one per HTTP request.** `gh()` clamped each
+> request at `CALL_TIMEOUT_MS`, which bounded no total — and the tools that
+> overrun are the multi-request ones: `gh_propose_edit` makes 4 + 2×files
+> sequential GitHub calls, so ten files could spend 24 × 50s and eat a whole
+> segment the model then had to auto-continue out of. Each tool now declares a
+> ceiling in `TOOL_BUDGET_MS` and its sub-calls draw down one shared deadline,
+> capped at the time actually left. Two details worth keeping: `gh()` refuses
+> outright when the budget is spent (the old `Math.max(3_000, …)` floor bought
+> one more request the tool had no time to use), and running dry mid-write
+> reports exactly which files landed on which branch, because the branch already
+> exists by then and the next call would otherwise 422 with no explanation.
+
+> **The model is told where it is in the run.** A run spans up to six edge
+> invocations across hours, and the model had no idea which one it was in or how
+> much time was left — so it explored as leisurely on the last segment as the
+> first, with `AUTO_CONTINUE_PROMPT` telling it to hurry and no numbers behind
+> the instruction. `segmentOrientation` injects one labelled line per segment
+> ("Segment 4 of at most 6 … this is the LAST segment"). Like every injected
+> turn it carries `_source`, so it renders as a notice and — importantly — does
+> not reset the repeat chain at the start of every segment.
 
 > **A turn the machine injected is not a turn the human typed.** Both were a bare
 > `role:"user"`, so History rendered every `[auto-continue]` prompt as if the
@@ -624,9 +649,11 @@ triggers runs it truly in parallel.
   the visual viewport, and pins the pane there in pixels if the laid-out height
   disagrees by more than 1px. Measured space is engine-independent, so the pane
   is scrollable even if some future engine mis-resolves the CSS. It writes
-  nothing when the CSS is working (asserted in the tests, so it can't quietly
-  become load-bearing). If you touch this layout, run `round4` — it sabotages
-  the chain on purpose and checks the guard still rescues it.
+  nothing when the CSS is working (so it can't quietly become load-bearing).
+  **No automated test covers this today** — the `round4` suite this file used to
+  point at is not in `scripts/`. If you touch the height chain, verify the pane
+  scrolls by hand on a narrow viewport, and treat restoring that coverage as
+  worthwhile: the failure mode is silent, and it has recurred twice.
 - **History is a Claude-Code-shaped workspace, not a list of cards.** A left rail
   (`#hx-rail`) lists every run — searchable, filterable to failures — and the
   right pane (`#hx-main`) holds the selected run's whole exchange *flat against
@@ -669,7 +696,9 @@ triggers runs it truly in parallel.
   flex item in `#hx-list` every row shrank to a fraction of its content and the
   whole list rendered as clipped slivers. It only showed up with a long list,
   and "the list scrolls" stayed true throughout, which is why the first tests
-  missed it: `squash` now asserts row height against content height at 197 runs. The rail still closes via ☰, the
+  missed it — and why nothing guards it now: the `squash` case that asserted row
+  height against content height at 197 runs is no longer in `scripts/`. Check a
+  long list by hand until it is back. The rail still closes via ☰, the
   scrim, Escape, or a swipe starting on its header.
 - **Run now on an agent instance lands in Chat** (`openRunInChat`) with the new
   run selected and the reply box focused, rather than leaving the reader to go
