@@ -2020,6 +2020,19 @@ async function runAgentLoop(opts: {
     const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
     if (!toolCalls.length || openedPr) {
       finalText = (msg.content || "").toString().trim() || (openedPr ? `Opened a pull request: ${prUrl}` : "");
+      // An ok:true response with neither content nor tool calls is the model
+      // returning nothing — the same class of failure as a transient error,
+      // but it arrives unflagged. Accepting it ends the segment empty, which
+      // counts as no-progress; two in a row kill the run. Fall back once,
+      // exactly as the error path above does, before giving up on the model.
+      if (!finalText && !openedPr && !fellBack && FALLBACK_MODEL &&
+          FALLBACK_MODEL !== activeModel && allowedModels().has(FALLBACK_MODEL) &&
+          callBudget() >= MIN_MODEL_CALL_MS) {
+        fellBack = true;
+        actions.push(`model fallback: ${activeModel} → ${FALLBACK_MODEL} after empty completion`);
+        activeModel = FALLBACK_MODEL;
+        continue; // costs one step; far cheaper than losing the run
+      }
       messages.push(assistantTurn({ ...msg, content: msg.content || finalText }));
       incomplete = false;
       break;
