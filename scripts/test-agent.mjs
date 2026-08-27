@@ -149,15 +149,39 @@ const msgs = [
   { role: "tool", content: big(50_000) }, // newest
 ];
 const out = m.compactMessages(msgs, 60_000);
-const toolLens = out.filter((x) => x.role === "tool").map((x) => x.content.length);
-const FLOORED = 400 + "\n…[truncated for context]…\n".length;
-eq("newest kept full, older floored", toolLens, [FLOORED, FLOORED, 50_000]);
+const toolResults = out.filter((x) => x.role === "tool");
+const toolLens = toolResults.map((x) => x.content.length);
+eq("newest kept full", toolLens[2], 50_000);
+eq("older two floored", toolLens[0] < 600 && toolLens[1] < 600, true);
 eq("total tool chars under control", toolLens.reduce((a, b) => a + b, 0) <= 61_000, true);
 eq("input not mutated", msgs[1].content.length, 50_000);
 eq("non-tool untouched", out[0].content, "sys");
 const small = [{ role: "tool", content: "tiny" }, { role: "tool", content: big(70_000) }];
 eq("small results never truncated", m.compactMessages(small, 10)[0].content, "tiny");
-eq("zero budget floors big ones", m.compactMessages(small, 0)[1].content.length, FLOORED);
+eq("zero budget floors big ones", m.compactMessages(small, 0)[1].content.length < 600, true);
+
+// An unmeasured "…[truncated]…" leaves the model unable to tell fifty lost
+// characters from fifty thousand, so it cannot judge whether recovering them is
+// worth a step — and the cheapest way to find out is to re-run the tool, which
+// is the loop the repeat guard then has to catch.
+const quantified = m.compactMessages([{ role: "tool", content: big(50_000) }], 0)[0].content;
+eq("floor marker states what was dropped", /49600 of 50000 chars/.test(quantified), true);
+eq("floor marker states the total line count", /1 line total/.test(quantified), true);
+const multiline = m.compactMessages([{ role: "tool", content: `${big(5_000)}\n${big(5_000)}` }], 0)[0].content;
+eq("floor marker pluralizes lines", /2 lines total/.test(multiline), true);
+// The marker grew when it started carrying counts, so the flat 400 the budget
+// used to charge for a floored result now under-states what it really costs.
+// Every floored result must be charged what it actually occupies.
+const BUDGET = 12_000;
+const many = Array.from({ length: 12 }, () => ({ role: "tool", content: big(5_000) }));
+const kept = m.compactMessages(many, BUDGET).filter((x) => x.role === "tool");
+const fullSize = kept.filter((x) => x.content.length === 5_000);
+eq("the newest results fit the budget in full", fullSize.length, 2);
+eq("the newest results are the ones kept", kept.slice(-2).every((x) => x.content.length === 5_000), true);
+eq("a floored result is charged more than the bare 400-char floor",
+   kept[0].content.length > 400, true);
+eq("full-size results never exceed the budget",
+   fullSize.reduce((a, x) => a + x.content.length, 0) <= BUDGET, true);
 
 // The floor keeps a TAIL, not just a head. For every GitHub tool here the answer
 // tends to sit at the end (gh_read_pr patches, a trailing error line), and
@@ -493,6 +517,91 @@ eq("dollar patterns are literal", m.applyEdits("const a = 1;\n", [
 eq("dollar patterns literal in replace_all", m.applyEdits("a\na\n", [
   { old_string: "a", new_string: "$&$1", replace_all: true },
 ], "f").content, "$&$1\n$&$1\n");
+
+console.log("\n— applyEdits cascading strictness (whitespace / Unicode drift) —");
+// A model that read the file through its own tokenizer emits an em-dash where
+// the source has a hyphen, a curly apostrophe where it has a straight one, LF
+// where the file has CRLF, or loses a trailing space. Demanding a byte-exact
+// match failed every one of those and cost a step plus a re-read.
+const fuzzSrc = "const a = 'x'; // half-open\nconst b = 2;   \n\tif (b) run();\n";
+
+// Pass 1 stays exact: an exact match must never be reinterpreted.
+const exact = m.applyEdits(fuzzSrc, [{ old_string: "const b = 2;", new_string: "const b = 3;" }], "f");
+eq("exact match still wins", exact.content.includes("const b = 3;"), true);
+eq("exact match reports no note", exact.notes, undefined);
+
+// Pass 2 — Unicode punctuation the model substituted for ASCII.
+const smart = m.applyEdits(fuzzSrc, [{ old_string: "const a = \u2018x\u2019; // half\u2010open", new_string: "const a = 'y';" }], "f");
+eq("curly quotes and a Unicode hyphen match", smart.content.includes("const a = 'y';"), true);
+eq("a tolerant match is reported", smart.notes.length, 1);
+eq("the note names the normalization", /Unicode punctuation/.test(smart.notes[0]), true);
+
+// A CRLF file against an LF needle is the same class of drift.
+const crlf = m.applyEdits("one\r\ntwo\r\nthree\r\n", [{ old_string: "one\ntwo", new_string: "ONE" }], "f");
+eq("CRLF file matches an LF old_string", crlf.content, "ONE\r\nthree\r\n");
+
+// Pass 3 — the file has trailing whitespace the model did not copy.
+const trailing = m.applyEdits(fuzzSrc, [{ old_string: "const b = 2;\n", new_string: "const b = 9;\n" }], "f");
+eq("trailing whitespace is ignored", trailing.content.includes("const b = 9;"), true);
+eq("trailing-whitespace match is reported", /trailing whitespace/.test(trailing.notes[0]), true);
+
+// Pass 4 — indentation drift, and it replaces WHOLE lines so the model's own
+// indentation lands verbatim. Splicing inside the line would keep the file's
+// indent and add the model's on top, silently mis-indenting Python or YAML.
+const indent = m.applyEdits(fuzzSrc, [{ old_string: "  if (b) run();", new_string: "\tif (b) walk();" }], "f");
+eq("indentation drift matches", indent.content.includes("walk()"), true);
+eq("whole-line replacement keeps exactly one indent", indent.content.includes("\tif (b) walk();"), true);
+eq("the file's own indentation is gone", indent.content.includes("  \tif"), false);
+eq("indentation match is reported", /indentation/.test(indent.notes[0]), true);
+
+// Indentation tolerance is whole-lines-only: a mid-line needle must not reach
+// pass 4, because its match could not be spliced back without guessing.
+eq("a mid-line needle does not get indentation tolerance",
+   !!m.applyEdits("  foo(bar) + baz\n", [{ old_string: "foo(bar)  +  baz", new_string: "q" }], "f").error, true);
+
+// Strictness cascades: the first pass that hits wins, so a needle that matches
+// exactly in one place must not be widened to a looser match elsewhere.
+const both = "value = 1;\nvalue  =  1;\n";
+eq("the strictest matching pass wins",
+   m.applyEdits(both, [{ old_string: "value = 1;", new_string: "V" }], "f").content, "V\nvalue  =  1;\n");
+
+// Ambiguity is still refused, and now says which pass found the duplicates.
+const dup = m.applyEdits("a = 1;   \na = 1;\t\n", [{ old_string: "a = 1;\n", new_string: "b\n" }], "f");
+eq("ambiguity found by a tolerant pass still errors", !!dup.error, true);
+eq("the error names the pass", /trailing whitespace/.test(dup.error), true);
+
+// The dead end this replaced: "must match EXACTLY — copy it verbatim" sent the
+// model to re-type text that was never going to match. Say so instead.
+const miss = m.applyEdits(fuzzSrc, [{ old_string: "no such text at all", new_string: "x" }], "f");
+eq("a genuine miss says re-typing will not help", /will not help/.test(miss.error), true);
+eq("a genuine miss quotes what was looked for", /no such text at all/.test(miss.error), true);
+
+// replace_all under a tolerant pass hits every occurrence, not just the first.
+const all = m.applyEdits("x \u2013 1\nx \u2014 1\n", [{ old_string: "x - 1", new_string: "ok", replace_all: true }], "f");
+eq("replace_all spans tolerant matches", all.content, "ok\nok\n");
+
+// Splicing by span must stay literal: "$&" in new_string is not a pattern.
+eq("dollar patterns literal under a tolerant match",
+   m.applyEdits("a \u2013 b\n", [{ old_string: "a - b", new_string: "$&$1" }], "f").content, "$&$1\n");
+
+// A needle that normalizes to nothing has no match to offer; it must not become
+// an empty-string match that hits at every offset.
+eq("a whitespace-only needle never matches everywhere",
+   !!m.applyEdits(fuzzSrc, [{ old_string: "\u200B \u00A0", new_string: "x" }], "f").error, true);
+
+// The tolerant passes walk whole files, so their whitespace scan has to be
+// linear. Rescanning each run from every character is quadratic, and one long
+// stretch of spaces — a minified asset, a padded fixture — would hang the tool
+// loop instead of failing an edit. This finishes instantly when linear and
+// takes minutes when not.
+// The trailing spaces after real() are what force the run past the exact and
+// punctuation passes and into the whitespace scan this is testing.
+const padded = `${" ".repeat(100_000)}\nreal();   \n`;
+const t0 = Date.now();
+const paddedOut = m.applyEdits(padded, [{ old_string: "real();\n", new_string: "fake();\n" }], "f");
+eq("the whitespace scan is the pass under test", /trailing whitespace/.test(paddedOut.notes[0]), true);
+eq("a huge whitespace run does not hang the matcher", Date.now() - t0 < 3_000, true);
+eq("and the edit still applies", paddedOut.content.endsWith("\nfake();\n"), true);
 
 console.log("\n— status classification —");
 eq("budget stop detected", m.isBudgetStop("Stopped after the maximum number of tool steps without a final answer."), true);
