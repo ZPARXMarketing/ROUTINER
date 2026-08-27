@@ -348,39 +348,299 @@ async function resolveCasePath(
   }
 }
 
-// Apply literal find/replace edits to a file's text. Returns an error string
-// instead of throwing so the model gets an actionable message back as a tool
-// result (and can fix its own edit) rather than the run dying.
+// ── Edit matching ────────────────────────────────────────────────────────────
+// gh_propose_edit used to demand a byte-exact, globally unique substring and
+// hard-fail otherwise ("must match the file EXACTLY … re-read the file"). Every
+// failure cost the model a step and usually a re-read of a file it already had
+// — and the drift was almost never semantic. A model that read the file through
+// its own tokenizer emits an em-dash where the source has a hyphen, a curly
+// apostrophe where the source has a straight one, LF where the file has CRLF,
+// or loses a trailing space. So matching cascades: each pass normalizes away one
+// more class of drift and the FIRST pass that hits wins, which keeps an exact
+// match exact and only reaches for tolerance when nothing stricter matched.
+//
+//   1 exact          byte-for-byte
+//   2 punctuation    Unicode dashes/quotes/spaces → ASCII, CRLF → LF, zero-width dropped
+//   3 trailing ws    …plus trailing spaces/tabs on every line ignored
+//   4 indentation    …plus leading spaces/tabs ignored — whole lines only
+//
+// Pass 4 is deliberately the last and the narrowest: with indentation ignored the
+// matched text can only be reconstructed line-wise, so it requires the match to
+// cover whole lines and then replaces those whole lines, new_string's own
+// indentation and all. That is the only splice that cannot silently produce a
+// mis-indented file, which in Python or YAML would be a real bug rather than a
+// failed edit. Every non-exact match is reported to the model and written into
+// the PR body, because a reviewer needs to know the server matched something the
+// model did not literally write.
+
+/** Which normalization a match needed. Order is strictness, strictest first. */
+type MatchPass = "exact" | "punctuation" | "trailing-whitespace" | "indentation";
+
+const MATCH_PASSES: MatchPass[] = ["exact", "punctuation", "trailing-whitespace", "indentation"];
+
+const PASS_LABEL: Record<MatchPass, string> = {
+  "exact": "exact",
+  "punctuation": "after normalizing Unicode punctuation/line endings",
+  "trailing-whitespace": "after ignoring trailing whitespace",
+  "indentation": "after ignoring indentation (whole lines replaced)",
+};
+
+/**
+ * Fold one source character to its ASCII equivalent for matching purposes.
+ * Returns "" to drop the character entirely.
+ *
+ * @param ch one code point from the source text
+ * @returns the replacement text, "" to drop it, or the character unchanged
+ */
+function foldPunctuation(ch: string): string {
+  switch (ch) {
+    // Hyphens, dashes and the minus sign a model reflows into "—" or "–".
+    case "‐": case "‑": case "‒": case "–":
+    case "—": case "―": case "⁃": case "−":
+      return "-";
+    // Single quotes, including the prime and modifier letter apostrophe that
+    // "smart quotes" substitution produces.
+    case "‘": case "’": case "‚": case "‛":
+    case "′": case "ʼ": case "´":
+      return "'";
+    case "“": case "”": case "„": case "‟": case "″":
+      return '"';
+    // Non-breaking and typographic spaces, which are invisible in a diff — and
+    // therefore written as escapes here, where a literal would be invisible too.
+    case "\u00A0": case "\u1680": case "\u2000": case "\u2001": case "\u2002":
+    case "\u2003": case "\u2004": case "\u2005": case "\u2006": case "\u2007":
+    case "\u2008": case "\u2009": case "\u200A": case "\u202F": case "\u205F":
+    case "\u3000":
+      return " ";
+    // Zero-width and BOM: present in the file or in the model's copy, never both.
+    case "\u200B": case "\u200C": case "\u200D": case "\uFEFF":
+      return "";
+    // CR is dropped rather than mapped, so a CRLF file matches an LF needle.
+    case "\r":
+      return "";
+    default:
+      return ch;
+  }
+}
+
+/**
+ * A normalized view of some text plus, for every code unit of that view, the
+ * span of the ORIGINAL text that produced it. A match found in `text` maps back
+ * to `[starts[a], ends[b - 1])` in the original, which is what makes a tolerant
+ * match safe to splice: the replacement lands on real original coordinates, and
+ * characters dropped in the middle of the span are consumed with it.
+ */
+interface MatchView {
+  text: string;
+  starts: number[];
+  ends: number[];
+}
+
+/** True for a space or tab — the only whitespace indentation is made of. */
+function isHorizontalSpace(ch: string): boolean {
+  return ch === " " || ch === "\t";
+}
+
+/**
+ * Build the punctuation-folded view of `src`.
+ *
+ * @param src original text
+ * @returns the folded text and its per-code-unit map back to `src`
+ */
+function foldedView(src: string): MatchView {
+  let text = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let i = 0;
+  for (const ch of src) {
+    const folded = foldPunctuation(ch);
+    for (let k = 0; k < folded.length; k++) { starts.push(i); ends.push(i + ch.length); }
+    text += folded;
+    i += ch.length;
+  }
+  return { text, starts, ends };
+}
+
+/**
+ * Drop leading and/or trailing horizontal whitespace from every line of a view,
+ * carrying the original-coordinate map through unchanged.
+ *
+ * @param view a view to filter
+ * @param dropLeading drop spaces/tabs that start a line
+ * @param dropTrailing drop spaces/tabs that end a line
+ * @returns the filtered view
+ */
+function dropLineWhitespace(view: MatchView, dropLeading: boolean, dropTrailing: boolean): MatchView {
+  const { text } = view;
+  const keep = new Array<boolean>(text.length).fill(true);
+  // Two linear scans, each carrying "am I still inside the run" forward from the
+  // previous character. Rescanning the run from every character instead would be
+  // quadratic, and these run over whole files: one 100k-character stretch of
+  // spaces — a minified asset, a padded fixture — would hang the tool loop.
+  if (dropLeading) {
+    let inRun = true;
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === "\n") { inRun = true; continue; }
+      if (!inRun) continue;
+      if (isHorizontalSpace(text[i])) keep[i] = false;
+      else inRun = false;
+    }
+  }
+  if (dropTrailing) {
+    let inRun = true;
+    for (let i = text.length - 1; i >= 0; i--) {
+      if (text[i] === "\n") { inRun = true; continue; }
+      if (!inRun) continue;
+      if (isHorizontalSpace(text[i])) keep[i] = false;
+      else inRun = false;
+    }
+  }
+  let out = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    if (!keep[i]) continue;
+    out += text[i];
+    starts.push(view.starts[i]);
+    ends.push(view.ends[i]);
+  }
+  return { text: out, starts, ends };
+}
+
+/**
+ * Build the matching view for one pass.
+ *
+ * @param src original text
+ * @param pass which normalization to apply
+ * @returns the view, or null for `exact` (which needs no view)
+ */
+function viewFor(src: string, pass: MatchPass): MatchView | null {
+  if (pass === "exact") return null;
+  const folded = foldedView(src);
+  if (pass === "punctuation") return folded;
+  if (pass === "trailing-whitespace") return dropLineWhitespace(folded, false, true);
+  return dropLineWhitespace(folded, true, true);
+}
+
+/** Every non-overlapping occurrence of `needle` in `hay`, as start offsets. */
+function allOccurrences(hay: string, needle: string): number[] {
+  const at: number[] = [];
+  let from = 0;
+  for (;;) {
+    const i = hay.indexOf(needle, from);
+    if (i < 0) return at;
+    at.push(i);
+    from = i + needle.length;
+  }
+}
+
+/** Extend `[start, end)` outward to whole lines of `text`. */
+function toWholeLines(text: string, start: number, end: number): { start: number; end: number } {
+  let s = start;
+  while (s > 0 && text[s - 1] !== "\n") s--;
+  let e = end;
+  while (e < text.length && text[e] !== "\n") e++;
+  return { start: s, end: e };
+}
+
+/**
+ * Find every place `oldStr` occurs in `text` under one normalization pass,
+ * expressed as spans of `text` itself.
+ *
+ * @param text the file text to search
+ * @param oldStr the model's search text
+ * @param pass which normalization to match under
+ * @returns non-overlapping spans in original coordinates, ascending
+ */
+function findSpans(text: string, oldStr: string, pass: MatchPass): Array<{ start: number; end: number }> {
+  if (pass === "exact") {
+    return allOccurrences(text, oldStr).map((i) => ({ start: i, end: i + oldStr.length }));
+  }
+  const hay = viewFor(text, pass)!;
+  const needle = viewFor(oldStr, pass)!;
+  // Tolerance exists to absorb drift AROUND real content. A needle with no
+  // non-whitespace character is nothing but drift: normalization can empty it
+  // (an empty needle matches at every offset), or fold "\u200B \u00A0" down to
+  // two ordinary spaces and hit the first pair of spaces in the file. Only the
+  // exact pass, which is unambiguous, may match one.
+  if (!/\S/.test(needle.text)) return [];
+  const spans: Array<{ start: number; end: number }> = [];
+  for (const at of allOccurrences(hay.text, needle.text)) {
+    const end = at + needle.text.length;
+    if (pass === "indentation") {
+      // With indentation gone the match is only reconstructable line-wise, so
+      // require it to sit on line boundaries in the normalized view.
+      const atLineStart = at === 0 || hay.text[at - 1] === "\n";
+      const atLineEnd = end === hay.text.length || hay.text[end] === "\n";
+      if (!atLineStart || !atLineEnd) continue;
+      spans.push(toWholeLines(text, hay.starts[at], hay.ends[end - 1]));
+    } else {
+      spans.push({ start: hay.starts[at], end: hay.ends[end - 1] });
+    }
+  }
+  return spans;
+}
+
+/**
+ * Apply find/replace edits to a file's text, matching with cascading strictness.
+ *
+ * Returns an error string instead of throwing so the model gets an actionable
+ * message back as a tool result (and can fix its own edit) rather than the run
+ * dying.
+ *
+ * @param text current file contents
+ * @param edits the model's edits, applied in order
+ * @param path the file's path, for error messages
+ * @returns the new content, or an error; `notes` records any non-exact match
+ */
 function applyEdits(
   text: string,
   edits: Array<{ old_string?: unknown; new_string?: unknown; replace_all?: unknown }>,
   path: string,
-): { content?: string; error?: string } {
+): { content?: string; error?: string; notes?: string[] } {
   let out = text;
+  const notes: string[] = [];
   for (let i = 0; i < edits.length; i++) {
     const e = edits[i] || {};
     const oldStr = String(e.old_string ?? "");
     const newStr = String(e.new_string ?? "");
+    const replaceAll = e.replace_all === true;
     if (!oldStr) return { error: `edit ${i + 1} for '${path}' has an empty old_string.` };
     if (oldStr === newStr) return { error: `edit ${i + 1} for '${path}' is a no-op (old_string === new_string).` };
-    const parts = out.split(oldStr);
-    const hits = parts.length - 1;
-    if (hits === 0) {
+
+    let spans: Array<{ start: number; end: number }> = [];
+    let matched: MatchPass | null = null;
+    for (const pass of MATCH_PASSES) {
+      const found = findSpans(out, oldStr, pass);
+      if (found.length) { spans = found; matched = pass; break; }
+    }
+    if (!matched) {
+      const first = oldStr.split("\n")[0].slice(0, 120);
       return {
-        error: `edit ${i + 1} for '${path}': old_string not found. It must match the file EXACTLY, including indentation and line breaks. Re-read the file and copy the text verbatim.`,
+        error: `edit ${i + 1} for '${path}': old_string not found, including after ignoring `
+          + `whitespace, indentation, line endings and Unicode punctuation — so re-typing it the same way will not help. `
+          + `First line looked for: ${JSON.stringify(first)}. Re-read '${path}' with gh_read_file and copy the current text.`,
       };
     }
-    if (hits > 1 && e.replace_all !== true) {
+    if (spans.length > 1 && !replaceAll) {
       return {
-        error: `edit ${i + 1} for '${path}': old_string matches ${hits} times. Include more surrounding lines to make it unique, or pass replace_all: true.`,
+        error: `edit ${i + 1} for '${path}': old_string matches ${spans.length} times (${PASS_LABEL[matched]}). `
+          + `Include more surrounding lines to make it unique, or pass replace_all: true.`,
       };
     }
-    // Join the split parts rather than String.replace: replace() would treat
-    // "$&", "$1" etc. in new_string as substitution patterns and silently
-    // mangle any code containing a dollar sign (template literals, jQuery, …).
-    out = e.replace_all === true ? parts.join(newStr) : parts[0] + newStr + parts[1];
+    if (matched !== "exact") {
+      notes.push(`edit ${i + 1} for '${path}' matched ${PASS_LABEL[matched]}, not literally.`);
+    }
+    // Splice by span rather than String.replace: replace() would treat "$&",
+    // "$1" etc. in new_string as substitution patterns and silently mangle any
+    // code containing a dollar sign (template literals, jQuery, …). Applying
+    // last-to-first keeps the earlier spans' offsets valid.
+    const targets = replaceAll ? spans : spans.slice(0, 1);
+    for (let s = targets.length - 1; s >= 0; s--) {
+      out = out.slice(0, targets[s].start) + newStr + out.slice(targets[s].end);
+    }
   }
-  return { content: out };
+  return { content: out, ...(notes.length ? { notes } : {}) };
 }
 
 // Branch → write files → open PR. Shared by gh_propose_change (model supplies
@@ -391,6 +651,7 @@ async function openPrWithFiles(
   args: Record<string, any>,
   files: Array<{ path: string; content: string }>,
   deadlineAt: number,
+  notes: string[] = [],
 ): Promise<string> {
   // This makes 4 + 2×files sequential GitHub calls. Clamping each one at
   // CALL_TIMEOUT_MS bounded no total: ten files could spend 24 × 50s. They all
@@ -444,11 +705,23 @@ async function openPrWithFiles(
     if (!put.ok) return `error: write ${f.path} → ${put.status}: ${String(put.data?.message || "").slice(0, 160)}`;
     written.push(f.path);
   }
+  // A tolerant edit match is a fact about the diff, so it belongs in the PR body
+  // where the reviewer reads it — not only in a tool result the run discards.
+  const shownNotes = notes.slice(0, 20);
+  const noteBlock = notes.length
+    ? `\n\n**Edits matched with normalization** (the server matched text the model did not write literally):\n`
+      + shownNotes.map((n) => `- ${n}`).join("\n")
+      + (notes.length > shownNotes.length ? `\n- …and ${notes.length - shownNotes.length} more` : "")
+    : "";
   const pr = await gh("POST", `/repos/${repo}/pulls`, {
-    title, head: branch, base, body: `${String(args.body || "")}\n\n— proposed by a Routiner OpenRouter agent`.trim(),
+    title, head: branch, base,
+    body: `${String(args.body || "")}${noteBlock}\n\n— proposed by a Routiner OpenRouter agent`.trim(),
   }, tLeft());
   if (!pr.ok) return `error: open PR → ${pr.status}: ${String(pr.data?.message || "").slice(0, 200)}`;
-  return `opened PR #${pr.data.number}: ${pr.data.html_url} (branch ${branch} → ${base}, ${files.length} file(s))`;
+  return `opened PR #${pr.data.number}: ${pr.data.html_url} (branch ${branch} → ${base}, ${files.length} file(s))`
+    + (notes.length
+      ? `\nnote: ${notes.length} edit(s) matched with normalization, not literally — the PR body lists them. Check the diff before merging.`
+      : "");
 }
 
 const cors = {
@@ -938,8 +1211,10 @@ async function runTool(
         const startLine = Math.max(1, Math.floor(Number(args.start_line) || 1));
         const maxLines = Math.max(1, Math.min(Math.floor(Number(args.max_lines) || GH_READ_DEFAULT_LINES), 5_000));
         const win = sliceLines(String(row.content ?? ""), startLine, maxLines);
-        const body = Array.from(win.body).length > SPILL_WINDOW_CHARS
-          ? Array.from(win.body).slice(0, SPILL_WINDOW_CHARS).join("") + "\n…[window truncated — request fewer lines]"
+        const bodyPoints = Array.from(win.body).length;
+        const body = bodyPoints > SPILL_WINDOW_CHARS
+          ? Array.from(win.body).slice(0, SPILL_WINDOW_CHARS).join("")
+            + `\n…[${bodyPoints - SPILL_WINDOW_CHARS} of ${bodyPoints} chars of this window not shown — re-call read_spill with a smaller max_lines, or a later start_line to continue]`
           : win.body;
         const more = win.to < win.total
           ? `\n\n[lines ${win.from}-${win.to} of ${win.total}. More follows: read_spill with start_line=${win.to + 1}.]`
@@ -1159,6 +1434,7 @@ async function runTool(
           return `error: too many files (${byPath.size}); max is ${GH_MAX_FILES} per PR. Split the work.`;
         }
         const files: Array<{ path: string; content: string }> = [];
+        const matchNotes: string[] = [];
         for (const [p, edits] of byPath) {
           const deny = deniedWritePath(p);
           if (deny) return `error: blocked path '${p}': ${deny}`;
@@ -1177,9 +1453,10 @@ async function runTool(
           }
           const applied = applyEdits(text, edits, p);
           if (applied.error) return `error: ${applied.error}`;
+          if (applied.notes) matchNotes.push(...applied.notes);
           files.push({ path: p, content: applied.content! });
         }
-        return await openPrWithFiles(repo!, args, files, toolDeadline);
+        return await openPrWithFiles(repo!, args, files, toolDeadline, matchNotes);
       }
       case "gh_read_issue": {
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
@@ -1304,21 +1581,36 @@ Do not claim to have done something a tool did not confirm.`;
 // sent it back to re-read the same file — the repeat loop the guard below
 // watches for. Splitting the same 400 chars costs nothing extra.
 const TOOL_FLOOR_CHARS = 400;
-const TOOL_FLOOR_MARKER = "\n…[truncated for context]…\n";
 const TOOL_FLOOR_HEAD = 280;
 const TOOL_FLOOR_TAIL = TOOL_FLOOR_CHARS - TOOL_FLOOR_HEAD;
 
-// Slice by Unicode code point, never by UTF-16 unit: `"…".slice(0, n)` can cut
-// a surrogate pair in half and emit a lone surrogate, which then rides into a
-// jsonb column and a JSON request body as invalid text.
-function headTail(text: string, head: number, tail: number): string {
+/**
+ * Keep a head and a tail of `text`, replacing the middle with a marker that
+ * says how much went.
+ *
+ * The marker is quantitative on purpose. An unmeasured "…[truncated]…" leaves
+ * the model unable to tell fifty lost characters from fifty thousand, so it
+ * cannot judge whether recovering them is worth a step — and the cheapest way
+ * to find out is to re-run the tool, which is the loop the repeat guard then
+ * has to catch. Truncation was manufacturing the loop.
+ *
+ * Slicing is by Unicode code point, never by UTF-16 unit: `"…".slice(0, n)` can
+ * cut a surrogate pair in half and emit a lone surrogate, which then rides into
+ * a jsonb column and a JSON request body as invalid text.
+ *
+ * @param text the full text
+ * @param head code points to keep from the start
+ * @param tail code points to keep from the end
+ * @param fate what happened to the middle, stated to the model
+ * @returns `text` unchanged when it already fits, otherwise head + marker + tail
+ */
+function headTail(text: string, head: number, tail: number, fate = "dropped to save context"): string {
   const points = Array.from(text);
   if (points.length <= head + tail) return text;
-  return points.slice(0, head).join("") + TOOL_FLOOR_MARKER + points.slice(points.length - tail).join("");
-}
-
-function toolFloorLength(text: string): number {
-  return Math.min(Array.from(text).length, TOOL_FLOOR_CHARS);
+  const omitted = points.length - head - tail;
+  const lines = text.split("\n").length;
+  const marker = `\n…[${omitted} of ${points.length} chars ${fate}; ${lines} line${lines === 1 ? "" : "s"} total]…\n`;
+  return points.slice(0, head).join("") + marker + points.slice(points.length - tail).join("");
 }
 
 function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET): any[] {
@@ -1340,8 +1632,12 @@ function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET):
     const len = Array.from(c).length;
     if (len <= TOOL_FLOOR_CHARS) { spent += len; continue; }
     if (spent + len <= cap) { spent += len; continue; }
-    out[i] = { ...m, content: headTail(c, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL) };
-    spent += toolFloorLength(c);
+    // Charge what the floored text actually costs, marker included — the marker
+    // grew when it started carrying counts, and an under-count here would let
+    // the budget drift above CONTEXT_TOOL_BUDGET.
+    const flooredContent = headTail(c, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL);
+    out[i] = { ...m, content: flooredContent };
+    spent += Array.from(flooredContent).length;
   }
   return out;
 }
@@ -2051,9 +2347,14 @@ async function runAgentLoop(opts: {
       // Fallback cap for anything not spilled (a spill insert can fail, and it
       // must never fail the tool call). File reads keep the higher ceiling.
       const cap = name === "gh_read_file" ? GH_READ_RESULT_CAP : TOOL_RESULT_CAP;
-      if (result.length > cap) {
-        result = result.slice(0, cap)
-          + `\n\n…[truncated at ${cap} chars of ${result.length}. For files, re-call gh_read_file with start_line/max_lines to page.]`;
+      if (Array.from(result).length > cap) {
+        // Head AND tail, by code point, for the same two reasons the compaction
+        // floor keeps both: for these tools the answer often sits at the end (an
+        // error line appended after a successful-looking preamble, the last
+        // entries of a listing), and a UTF-16 slice can emit a lone surrogate.
+        const head = Math.floor(cap * 0.7);
+        result = headTail(result, head, cap - head, "dropped — the spill write failed, so this text is gone")
+          + `\n[For files, re-call gh_read_file with start_line/max_lines to page.]`;
       }
       const line = `${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`;
       actions.push(line);

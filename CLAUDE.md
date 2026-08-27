@@ -312,6 +312,18 @@ threshold before the reaper fires.
 > and emits a lone surrogate, which then rides into a jsonb column and a JSON
 > request body as invalid text.
 
+> **A truncation marker states how much it took.** `…[truncated for context]…`
+> left the model unable to tell fifty lost characters from fifty thousand, so it
+> could not judge whether recovering them was worth a step — and the cheapest
+> way to find out is to re-run the tool, which is the loop the repeat guard then
+> has to catch. Truncation was *manufacturing* the loop it is supposed to be
+> defending against. Every marker now carries the numbers: chars dropped, chars
+> total, lines total. Two smaller consequences worth keeping: the compaction
+> budget charges a floored result what it **actually** occupies, marker included,
+> since the flat 400 it used to charge now under-states the cost; and the
+> fallback cap that catches a failed spill keeps a head **and** a tail sliced by
+> code point, for the same two reasons the compaction floor does.
+
 > **Classify retries on the HTTP status, never on the provider's prose.** For
 > five days every agent run died on `Key limit exceeded (total limit)`, which
 > reads like an exhausted key — so the retry classifier listed it as permanent
@@ -455,8 +467,33 @@ for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
 > give up ("I don't have a way to get the full file content"). `gh_propose_edit`
 > takes `{ path, old_string, new_string }` edits; the edge function reads the
 > current file, applies them server-side, and commits the result. `old_string`
-> must match exactly and be unique (or pass `replace_all`), and a bad edit comes
-> back as an actionable tool error the model can correct rather than a dead run.
+> must be unique (or pass `replace_all`), and a bad edit comes back as an
+> actionable tool error the model can correct rather than a dead run.
+
+> **Edit matching cascades; it does not demand bytes.** Requiring a byte-exact
+> `old_string` failed on drift that was never semantic — a model that read the
+> file through its own tokenizer emits an em-dash for a hyphen, a curly
+> apostrophe for a straight one, LF against a CRLF file, or drops a trailing
+> space — and the error told it to "match the file EXACTLY … copy the text
+> verbatim", which is advice that cannot work when the copy is already faithful.
+> Four passes now run in order and the **first one that hits wins**: exact →
+> Unicode punctuation and line endings folded → trailing whitespace ignored →
+> indentation ignored. Strictness first is the load-bearing part: an exact match
+> is never reinterpreted, and tolerance is only reached for once nothing
+> stricter matched. Three properties the tests pin: the indentation pass matches
+> **whole lines only** and replaces whole lines, because splicing inside a line
+> would keep the file's indent and add the model's on top — a silent
+> mis-indentation in Python or YAML is a real bug where a failed edit is only a
+> lost step; a needle with **no non-whitespace character** is refused by every
+> tolerant pass, since normalization can empty it (matching at every offset) or
+> fold `\u200B \u00A0` into two ordinary spaces and hit the first pair in the
+> file; and the whitespace scan is **linear**, because rescanning each run from
+> every character is quadratic and one 100k-character stretch of spaces — a
+> minified asset, a padded fixture — hung the tool loop rather than failing an
+> edit. Every non-exact match is reported in the tool result **and written into
+> the PR body**, so the reviewer knows the server matched text the model did not
+> literally write. Verify with `node --experimental-strip-types
+> scripts/test-agent.mjs`.
 
 **Setup (one-time, human — Supabase → Edge Functions → secrets):**
 
