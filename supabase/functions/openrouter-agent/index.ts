@@ -2237,10 +2237,16 @@ async function handleRequest(req: Request): Promise<Response> {
       // Refresh system prompt so efficiency rules apply to old transcripts.
       messages[0] = { role: "system", content: buildSystem(model, toolList) };
     }
+    // The auto-continue POST carries AUTO_CONTINUE_PROMPT in its own `prompt`
+    // field, so "is the prompt empty?" can never tell a machine nudge from a
+    // human reply — it labelled neither, and isHumanTurn then read every
+    // segment boundary as a human interjection, resetting the repeat chain at
+    // exactly the boundary it exists to survive. The body's autoContinue flag
+    // is the only authority on who is speaking.
     const humanPrompt = prompt.trim();
-    messages.push(humanPrompt
-      ? { role: "user", content: humanPrompt }
-      : { role: "user", content: AUTO_CONTINUE_PROMPT, _source: SRC_AUTO_CONTINUE });
+    messages.push(isAutoContinue
+      ? { role: "user", content: humanPrompt || AUTO_CONTINUE_PROMPT, _source: SRC_AUTO_CONTINUE }
+      : { role: "user", content: humanPrompt });
 
     await checkpointRun(runId, { status: "running", output: isAutoContinue ? `Continuing… (segment ${continueDepth + 1})` : "Working…" });
 
