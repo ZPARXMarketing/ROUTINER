@@ -247,6 +247,24 @@ threshold before the reaper fires.
 > told the model to page. Spills are scoped to their run and cascade-delete with
 > it; losing one costs a re-read, never work.
 
+> **The model can pause a run; it could only ever end one.** Replying with text
+> finishes the whole run, so a segment always stopped wherever the step budget
+> happened to fall — mid-read, mid-edit, with the next segment paying to work out
+> where it was. **`end_segment`** is the deliberate hand-off: it ends this
+> segment and lets the auto-continue chain start the next one from the goal. It
+> is ungrouped, since the ability to pause cannot depend on which tool groups a
+> run happens to have. Four refusals guard the same thing — that something is
+> left to resume, and a segment left to resume it in: **no goal** (handing off
+> amnesia; the next orientation would read "no goal recorded yet" and start
+> over); a **complete or blocked** goal (one owes a summary, the other stops the
+> chain by design); the **last segment**, where `incomplete` files the run as
+> out-of-segments rather than pausing it; and a segment that **ran no tools**, or
+> **left `done` exactly as it found it** — either hands the next segment its own
+> starting position, so it repeats this one. That last refusal is the "set the
+> goal once and never touch it again" failure caught at the one moment the goal
+> has to be current. A batch that opened a PR ignores the hand-off: that path
+> owes the reader a summary and the next iteration is already set up to write one.
+
 > **A run has a goal, and it lives off the transcript.** `messages` is compacted
 > between segments, so by segment four the model's record of its own plan is
 > mostly gone — and `AUTO_CONTINUE_PROMPT` was telling it to "resume the task
@@ -311,6 +329,17 @@ threshold before the reaper fires.
 > Slicing is by Unicode code point: `String.slice` cuts a surrogate pair in half
 > and emits a lone surrogate, which then rides into a jsonb column and a JSON
 > request body as invalid text.
+
+> **A spill locator must survive the floor that made it necessary.** A spilled
+> result is a preview plus a locator, and the locator is the only route back to
+> the stored text. It sits on the last line — and the compaction floor keeps 120
+> characters of tail, far less than the locator is long. So flooring a spilled
+> result destroyed the id and stranded exactly the text whose notice had just
+> promised it was *stored, not lost*, leaving the model one way back: re-run the
+> tool. Spilling exists to prevent that loop, and flooring was quietly restoring
+> it. The floor now splits the locator off, floors only the preview, and
+> re-attaches a compact locator — which is itself a valid locator, because a
+> result floored in one segment is floored again in the next.
 
 > **A truncation marker states how much it took.** `…[truncated for context]…`
 > left the model unable to tell fifty lost characters from fifty thousand, so it

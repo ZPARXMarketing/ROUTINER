@@ -25,7 +25,8 @@ export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudg
          toolBudgetFor, segmentOrientation, TOOL_BUDGET_MS,
          sliceLines, spillResult, toolGroupOf, toolSpecs,
          normalizeGoal, renderGoal, parseStoredGoal, goalBlockStop, openrouter,
-         reconcileGoal };
+         reconcileGoal, handoffRefusal, splitSpillLocator, shortSpillLocator,
+         MAX_AUTO_CONTINUES };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -463,7 +464,7 @@ const specNames = (en) => m.toolSpecs(new Set(en)).map((s) => s.function.name);
 eq("offered with no groups at all", specNames([]).includes("read_spill"), true);
 eq("offered alongside code tools", specNames(["code"]).includes("read_spill"), true);
 eq("a run with no groups gets only the ungrouped tools",
-  specNames([]).sort(), ["read_spill", "set_goal"]);
+  specNames([]).sort(), ["end_segment", "read_spill", "set_goal"]);
 
 console.log("\n— per-tool time budgets —");
 // Every tool used to get the WHOLE remaining wall, so one slow call could eat
@@ -602,6 +603,83 @@ const paddedOut = m.applyEdits(padded, [{ old_string: "real();\n", new_string: "
 eq("the whitespace scan is the pass under test", /trailing whitespace/.test(paddedOut.notes[0]), true);
 eq("a huge whitespace run does not hang the matcher", Date.now() - t0 < 3_000, true);
 eq("and the edit still applies", paddedOut.content.endsWith("\nfake();\n"), true);
+
+console.log("\n— spill locator survives compaction —");
+// A spilled result is a preview plus a locator, and the locator is the ONLY
+// route back to the stored text. It sits on the last line; the floor keeps 120
+// chars of tail. Flooring therefore destroyed the id and stranded the very text
+// the notice had just promised was "stored, not lost" — leaving re-running the
+// tool as the model's only way back, which is the loop spilling exists to stop.
+const SPILL_ID = "0123abcd-45ef-6789-abcd-ef0123456789";
+const spilled = `${"p".repeat(6_000)}\n\n[spill ${SPILL_ID} — 90000 chars, 1200 lines. `
+  + `Read any part with read_spill({"spill_id":"${SPILL_ID}","start_line":N,"max_lines":M}). `
+  + `Do NOT re-run gh_read_file to see the rest; page this spill instead.]`;
+const flooredSpill = m.compactMessages([{ role: "tool", content: spilled }], 0)[0].content;
+eq("the floored result still names the spill id", flooredSpill.includes(SPILL_ID), true);
+eq("…and still says how to read it", /read_spill/.test(flooredSpill), true);
+eq("…and still forbids re-running the tool", /do NOT re-run/i.test(flooredSpill), true);
+eq("the preview itself is still floored", flooredSpill.length < 1_000, true);
+// Only a real locator is treated as one. A result whose last line merely starts
+// the same way must be floored normally, not have text invented for it.
+const lookalike = `${"q".repeat(6_000)}\n[spill something else entirely]`;
+eq("a lookalike last line is not read as a locator", m.splitSpillLocator(lookalike), null);
+eq("a result with no locator is unaffected",
+   m.splitSpillLocator(`${"q".repeat(100)}\nplain tail`), null);
+// Flooring is not once-only: a result floored in one segment is floored again in
+// the next, so the compact locator must itself read as a locator.
+const twice = m.compactMessages(
+  [{ role: "tool", content: m.compactMessages([{ role: "tool", content: spilled }], 0)[0].content }],
+  0,
+)[0].content;
+eq("re-flooring a floored result keeps the id", twice.includes(SPILL_ID), true);
+eq("splitSpillLocator returns the id and the body",
+   m.splitSpillLocator(`body text\n${m.shortSpillLocator(SPILL_ID)}`),
+   { id: SPILL_ID, body: "body text" });
+
+console.log("\n— end_segment (deliberate hand-off) —");
+// Replying with text ends the WHOLE run, so without this the model could not
+// pause: a segment always stopped wherever the step budget happened to fall.
+// Every refusal guards the same thing — that something is left to resume, and a
+// segment left to resume it in.
+const activeGoal = (done = ["read the issue"]) => ({
+  objective: "fix #57", done, remaining: ["open a PR"], phase: "active",
+});
+eq("a clean hand-off is allowed",
+   m.handoffRefusal(activeGoal(["a", "b"]), 0, 3, 1), null);
+// Handing off with no goal hands off amnesia: the next segment's orientation
+// would read "no goal recorded yet" and it would start over.
+eq("no goal is refused", /set_goal first/.test(m.handoffRefusal(null, 0, 3, 0)), true);
+eq("a complete goal is refused",
+   /final summary/.test(m.handoffRefusal({ ...activeGoal(), phase: "complete" }, 0, 3, 0)), true);
+// A blocked run stops the chain by design; handing off would restart it.
+eq("a blocked goal is refused",
+   /blocked run stops/.test(m.handoffRefusal({ ...activeGoal(), phase: "blocked" }, 0, 3, 0)), true);
+// There is no next segment to hand off TO, and `incomplete` on the last one
+// files the run as out-of-segments rather than pausing it.
+eq("the last segment is refused",
+   /last segment/.test(m.handoffRefusal(activeGoal(["a"]), m.MAX_AUTO_CONTINUES, 3, 0)), true);
+eq("…and one before it is not",
+   m.handoffRefusal(activeGoal(["a"]), m.MAX_AUTO_CONTINUES - 1, 3, 0), null);
+// Otherwise a model could open every segment with end_segment and burn the whole
+// chain, each segment scoring "progress" for the single call it made — the
+// no-progress guard's blind spot, reached by a new route.
+eq("an empty segment cannot hand off",
+   /has not done anything yet/.test(m.handoffRefusal(activeGoal(["a"]), 0, 0, 0)), true);
+// A segment that ran tools but left `done` untouched hands the next one its own
+// starting position, so the next segment repeats it — the "set the goal once and
+// never touch it again" failure with a hand-off attached.
+eq("a hand-off that did not move the goal is refused",
+   /has not changed this segment/.test(m.handoffRefusal(activeGoal(["a"]), 1, 4, 1)), true);
+eq("…and says to call set_goal first",
+   /Call set_goal/.test(m.handoffRefusal(activeGoal(["a"]), 1, 4, 1)), true);
+eq("moving the goal forward allows it",
+   m.handoffRefusal(activeGoal(["a", "b"]), 1, 4, 1), null);
+// It is always offered: a run cannot be given the ability to pause by a group it
+// happens not to have enabled.
+eq("end_segment belongs to no group", m.toolGroupOf("end_segment"), "*");
+eq("offered with no groups at all",
+   m.toolSpecs(new Set()).some((t) => t.function.name === "end_segment"), true);
+eq("it declares a time budget", m.TOOL_BUDGET_MS.end_segment > 0, true);
 
 console.log("\n— status classification —");
 eq("budget stop detected", m.isBudgetStop("Stopped after the maximum number of tool steps without a final answer."), true);

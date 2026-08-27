@@ -182,7 +182,7 @@ const REPEAT_ARGS_PREVIEW = 400;
 // early and the rest stays available to the run.
 const TOOL_BUDGET_MS: Record<string, number> = {
   // Single REST round-trips against Supabase or GitHub.
-  read_spill: 15_000, set_goal: 15_000,
+  read_spill: 15_000, set_goal: 15_000, end_segment: 5_000,
   read_routines: 15_000, read_notes: 15_000, read_runs: 20_000, read_leads: 15_000,
   write_note: 15_000, write_routine: 15_000,
   gh_read_file: 30_000, gh_read_pr: 30_000, gh_read_issue: 30_000,
@@ -805,7 +805,7 @@ function toolGroupOf(name: string): string | null {
   // exist because a tool the run already had produced it, so paging one back is
   // not a new capability — and gating it behind a group the run happens not to
   // have would strand the very output we just told the model to page.
-  if (name === "read_spill" || name === "set_goal") return "*";
+  if (name === "read_spill" || name === "set_goal" || name === "end_segment") return "*";
   if (name === "read_routines" || name === "read_notes" || name === "read_leads" || name === "read_runs") return "read";
   if (name === "web_research") return "research";
   if (name === "write_note" || name === "find_and_save_leads") return "write";
@@ -1074,6 +1074,10 @@ function toolSpecs(enabled: Set<string>): unknown[] {
         blocked_code: { type: "string", description: "required when phase='blocked': short kebab-case cause, e.g. 'needs-human'" },
         blocked_message: { type: "string", description: "required when phase='blocked': what a human must do" },
       } } } },
+    { type: "function", function: { name: "end_segment", description: "Hand off to the next background segment at a clean stopping point, instead of being cut off mid-task when this segment's step budget runs out. Replying with text ends the WHOLE run, so this is the only way to pause. Call it once you have finished a coherent piece of work and the next piece would not fit — never as a way to avoid work. Requires a current goal: the next segment starts from it.",
+      parameters: { type: "object", properties: {
+        note: { type: "string", description: "one line on where you stopped, for the run log" },
+      } } } },
   ];
   if (enabled.has("read")) {
     specs.push(
@@ -1162,7 +1166,15 @@ function toolSpecs(enabled: Set<string>): unknown[] {
 async function runTool(
   name: string,
   args: Record<string, any>,
-  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string>; timeoutMs?: number; runId?: string | null; goalRef?: { current: RunGoal | null } },
+  ctx: {
+    userId: string | null; key: string; account: string | null; triggerKey: string | null;
+    enabled: Set<string>; timeoutMs?: number; runId?: string | null;
+    goalRef?: { current: RunGoal | null };
+    handoffRef?: { current: string | null };
+    segmentDepth?: number;
+    toolsRunThisSegment?: number;
+    doneAtSegmentStart?: number;
+  },
 ): Promise<string> {
   const group = toolGroupOf(name);
   if (!group || (group !== "*" && !ctx.enabled.has(group))) {
@@ -1192,6 +1204,21 @@ async function runTool(
         if ("error" in next) return `error: ${next.error}`;
         ctx.goalRef.current = next;
         return `goal recorded (${next.phase}). ${renderGoal(next)}`;
+      }
+      case "end_segment": {
+        // Every refusal below is a guard against the same failure: a segment
+        // handed off with nothing for the next one to resume from, or no next
+        // one to resume at all. The tool reports why rather than half-doing it.
+        if (!ctx.handoffRef) return "error: this run cannot hand off to another segment.";
+        const why = handoffRefusal(
+          ctx.goalRef?.current ?? null,
+          ctx.segmentDepth ?? 0,
+          ctx.toolsRunThisSegment ?? 0,
+          ctx.doneAtSegmentStart ?? 0,
+        );
+        if (why) return `error: ${why}`;
+        ctx.handoffRef.current = String(args.note || "").trim().slice(0, 400) || "handed off at a clean stopping point";
+        return "segment ended; the next segment resumes from your goal.";
       }
       case "read_spill": {
         const id = String(args.spill_id || "").trim();
@@ -1635,7 +1662,12 @@ function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET):
     // Charge what the floored text actually costs, marker included — the marker
     // grew when it started carrying counts, and an under-count here would let
     // the budget drift above CONTEXT_TOOL_BUDGET.
-    const flooredContent = headTail(c, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL);
+    // Floor the preview but never the locator: without it the spilled text is
+    // unreachable and re-running the tool is the model's only way back to it.
+    const spill = splitSpillLocator(c);
+    const flooredContent = spill
+      ? `${headTail(spill.body, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL)}\n${shortSpillLocator(spill.id)}`
+      : headTail(c, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL);
     out[i] = { ...m, content: flooredContent };
     spent += Array.from(flooredContent).length;
   }
@@ -1776,6 +1808,38 @@ async function spillResult(
     + `[spill ${id} — ${total} chars, ${lines} lines. `
     + `Read any part with read_spill({"spill_id":"${id}","start_line":N,"max_lines":M}). `
     + `Do NOT re-run ${toolName} to see the rest; page this spill instead.]`;
+}
+
+// ── Keeping a spill reachable through compaction ─────────────────────────────
+// A spilled result is a preview plus a locator, and the locator is the only
+// thing that makes the stored text reachable. It sits on the last line, and the
+// compaction floor keeps 120 characters of tail — far less than the locator is
+// long — so flooring a spilled result silently destroyed the id and stranded
+// the very text the spill notice had just promised was "stored, not lost". The
+// model's only route back to it was to re-run the tool: exactly the loop
+// spilling exists to prevent. The floor now re-attaches a compact locator.
+
+const SPILL_LOCATOR_PREFIX = "[spill ";
+
+/** The compact locator kept when a spilled result is floored. */
+function shortSpillLocator(id: string): string {
+  return `${SPILL_LOCATOR_PREFIX}${id} — the full result is stored, not lost. `
+    + `Page it with read_spill({"spill_id":"${id}"}); do NOT re-run the tool.]`;
+}
+
+/**
+ * Split a tool result into its body and the spill id its trailing locator names.
+ *
+ * @param content a stored tool result
+ * @returns the id and the body without the locator line, or null when there is no locator
+ */
+function splitSpillLocator(content: string): { id: string; body: string } | null {
+  const nl = content.lastIndexOf("\n");
+  const last = nl < 0 ? content : content.slice(nl + 1);
+  if (!last.startsWith(SPILL_LOCATOR_PREFIX) || !last.endsWith("]")) return null;
+  const m = /^\[spill ([0-9a-f-]{36})\b/i.exec(last);
+  if (!m) return null;
+  return { id: m[1], body: nl < 0 ? "" : content.slice(0, nl).trimEnd() };
 }
 
 // ── Repeat-tool chain ────────────────────────────────────────────────────────
@@ -2125,6 +2189,57 @@ function segmentMadeProgress(actions: string[], finalText: string): boolean {
  * Only the terminal transition is inferred. `done`/`remaining` are the model's
  * to describe and are never invented here.
  */
+/**
+ * Why a deliberate segment hand-off must be refused, or null to allow it.
+ *
+ * The model cannot pause on its own otherwise — replying with text ends the
+ * whole run — so a segment always ended wherever the step budget happened to
+ * fall, mid-task. `end_segment` lets it stop somewhere it chose. All three
+ * refusals guard the same thing: that there is something to resume, and a
+ * segment left to resume in.
+ *
+ * @param goal the run's current goal
+ * @param depth this segment's auto-continue depth
+ * @param toolsRun tool calls made this segment BEFORE this one
+ * @returns the reason to refuse, or null
+ */
+function handoffRefusal(goal: RunGoal | null, depth: number, toolsRun: number, doneAtStart: number): string | null {
+  // Handing off with no goal hands off amnesia: the next segment's orientation
+  // would read "no goal recorded yet" and it would start over.
+  if (!goal) {
+    return "no goal recorded — call set_goal first, or the next segment has nothing to resume from.";
+  }
+  if (goal.phase !== "active") {
+    return `the goal is '${goal.phase}', so there is nothing to hand off. `
+      + (goal.phase === "complete"
+        ? "Reply with your final summary instead."
+        : "A blocked run stops rather than continuing; say what a human must do.");
+  }
+  // No next segment exists, so this would file the run as out-of-segments rather
+  // than pausing it. Finishing badly here is still better than that.
+  if (depth >= MAX_AUTO_CONTINUES) {
+    return "this is the last segment — there is no next one to hand off to. "
+      + "Finish what you can and reply with a summary of where things stand.";
+  }
+  // Without this a model could open every segment with end_segment and burn the
+  // whole chain doing nothing, each segment scoring "progress" for the one tool
+  // call it made — the no-progress guard's blind spot, reached by a new route.
+  if (toolsRun < 1) {
+    return "this segment has not done anything yet. Do some work first; "
+      + "handing off an empty segment just spends one.";
+  }
+  // The goal is the entire hand-off. A segment that ran tools but left `done`
+  // exactly as it found it is handing the next one the same starting position
+  // it had, so the next segment repeats this one — which is the "set the goal
+  // once and never touch it again" failure, now with a hand-off attached to it.
+  if (goal.done.length <= doneAtStart) {
+    return "the goal's `done` list has not changed this segment, so the next one "
+      + "would resume from where this one started and repeat it. Call set_goal to "
+      + "record what you finished, then end_segment.";
+  }
+  return null;
+}
+
 function reconcileGoal(goal: RunGoal | null, status: string): RunGoal | null {
   if (!goal) return null;
   if (status === "success" && goal.phase === "active") {
@@ -2190,6 +2305,11 @@ async function runAgentLoop(opts: {
   let fellBack = false;
   // Mutated by the set_goal tool, checkpointed with every other bit of progress.
   const goalRef: { current: RunGoal | null } = { current: opts.goal ?? null };
+  // Set by the end_segment tool when the model chooses to hand off here.
+  const handoffRef: { current: string | null } = { current: null };
+  // How much the goal already claimed done when this segment began, so a
+  // hand-off can require that the segment actually moved it forward.
+  const doneAtSegmentStart = goalRef.current?.done.length ?? 0;
   const started = Date.now();
   const hardStop = started + DEADLINE_MS;
   const remaining = () => Math.max(0, hardStop - Date.now());
@@ -2334,7 +2454,11 @@ async function runAgentLoop(opts: {
       try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
       const raw = await runTool(name, args, {
         userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled, runId,
-        timeoutMs: toolBudget, goalRef,
+        timeoutMs: toolBudget, goalRef, handoffRef, doneAtSegmentStart,
+        segmentDepth: opts.depth ?? 0,
+        // Tool calls already made this segment. end_segment reads this to refuse
+        // a hand-off from a segment that has not done anything yet.
+        toolsRunThisSegment: actions.length,
       });
       // Spill before truncating: store the whole thing and hand the model a
       // preview plus a locator, so an oversized result becomes a fetch rather
@@ -2361,6 +2485,20 @@ async function runAgentLoop(opts: {
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       const pr = detectOpenedPr(name, result);
       if (pr.opened) { openedPr = true; prUrl = pr.url; }
+    }
+    // A deliberate hand-off ends the segment here rather than at whatever step
+    // the budget ran out on. `incomplete` is what schedules the next segment, so
+    // this is a pause, not a finish — the guards in handoffRefusal have already
+    // established that a next segment exists and has a goal to resume from.
+    // …except when this batch opened a PR. That path owes the reader a summary
+    // and the next iteration is already set up to write one with tools off;
+    // pausing instead would carry a finished piece of work into another segment
+    // that no longer knows it happened.
+    if (handoffRef.current && !openedPr) {
+      finalText = `Handed off to the next segment: ${handoffRef.current}`;
+      incomplete = true;
+      await saveProgress("running", finalText);
+      break;
     }
     // Advisory only, and after the results so the model sees what it just got
     // back before being told to stop asking for it again.
