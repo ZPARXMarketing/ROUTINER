@@ -245,6 +245,14 @@ eq("an auto-continue prompt does NOT reset", chainOf(
   [{ role: "user", content: "[auto-continue] …", _source: "auto-continue" }],
   [call("gh_read_file", { path: "a" }), res()],
 ).count, 3);
+// The live 4-segment CALL-2 run exposed this: scheduleAutoContinue POSTs
+// AUTO_CONTINUE_PROMPT in the body's own `prompt` field, so deciding the label
+// from "is the prompt empty?" labelled NOTHING — all three of that run's
+// [auto-continue] turns stored with no _source, and isHumanTurn read each
+// segment boundary as a human interjection, resetting the chain at exactly the
+// boundary deriving-from-transcript exists to survive.
+eq("an auto-continue turn is never a human turn, even carrying its prompt text",
+  m.isHumanTurn({ role: "user", content: "[auto-continue] Resume the task…", _source: "auto-continue" }), false);
 eq("isHumanTurn: bare user turn", m.isHumanTurn({ role: "user", content: "hi" }), true);
 eq("isHumanTurn: injected turn", m.isHumanTurn({ role: "user", content: "hi", _source: "auto-continue" }), false);
 
