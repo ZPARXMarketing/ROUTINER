@@ -182,7 +182,7 @@ const REPEAT_ARGS_PREVIEW = 400;
 // early and the rest stays available to the run.
 const TOOL_BUDGET_MS: Record<string, number> = {
   // Single REST round-trips against Supabase or GitHub.
-  read_spill: 15_000, set_goal: 15_000,
+  read_spill: 15_000, set_goal: 15_000, end_segment: 5_000,
   read_routines: 15_000, read_notes: 15_000, read_runs: 20_000, read_leads: 15_000,
   write_note: 15_000, write_routine: 15_000,
   gh_read_file: 30_000, gh_read_pr: 30_000, gh_read_issue: 30_000,
@@ -348,39 +348,299 @@ async function resolveCasePath(
   }
 }
 
-// Apply literal find/replace edits to a file's text. Returns an error string
-// instead of throwing so the model gets an actionable message back as a tool
-// result (and can fix its own edit) rather than the run dying.
+// ── Edit matching ────────────────────────────────────────────────────────────
+// gh_propose_edit used to demand a byte-exact, globally unique substring and
+// hard-fail otherwise ("must match the file EXACTLY … re-read the file"). Every
+// failure cost the model a step and usually a re-read of a file it already had
+// — and the drift was almost never semantic. A model that read the file through
+// its own tokenizer emits an em-dash where the source has a hyphen, a curly
+// apostrophe where the source has a straight one, LF where the file has CRLF,
+// or loses a trailing space. So matching cascades: each pass normalizes away one
+// more class of drift and the FIRST pass that hits wins, which keeps an exact
+// match exact and only reaches for tolerance when nothing stricter matched.
+//
+//   1 exact          byte-for-byte
+//   2 punctuation    Unicode dashes/quotes/spaces → ASCII, CRLF → LF, zero-width dropped
+//   3 trailing ws    …plus trailing spaces/tabs on every line ignored
+//   4 indentation    …plus leading spaces/tabs ignored — whole lines only
+//
+// Pass 4 is deliberately the last and the narrowest: with indentation ignored the
+// matched text can only be reconstructed line-wise, so it requires the match to
+// cover whole lines and then replaces those whole lines, new_string's own
+// indentation and all. That is the only splice that cannot silently produce a
+// mis-indented file, which in Python or YAML would be a real bug rather than a
+// failed edit. Every non-exact match is reported to the model and written into
+// the PR body, because a reviewer needs to know the server matched something the
+// model did not literally write.
+
+/** Which normalization a match needed. Order is strictness, strictest first. */
+type MatchPass = "exact" | "punctuation" | "trailing-whitespace" | "indentation";
+
+const MATCH_PASSES: MatchPass[] = ["exact", "punctuation", "trailing-whitespace", "indentation"];
+
+const PASS_LABEL: Record<MatchPass, string> = {
+  "exact": "exact",
+  "punctuation": "after normalizing Unicode punctuation/line endings",
+  "trailing-whitespace": "after ignoring trailing whitespace",
+  "indentation": "after ignoring indentation (whole lines replaced)",
+};
+
+/**
+ * Fold one source character to its ASCII equivalent for matching purposes.
+ * Returns "" to drop the character entirely.
+ *
+ * @param ch one code point from the source text
+ * @returns the replacement text, "" to drop it, or the character unchanged
+ */
+function foldPunctuation(ch: string): string {
+  switch (ch) {
+    // Hyphens, dashes and the minus sign a model reflows into "—" or "–".
+    case "‐": case "‑": case "‒": case "–":
+    case "—": case "―": case "⁃": case "−":
+      return "-";
+    // Single quotes, including the prime and modifier letter apostrophe that
+    // "smart quotes" substitution produces.
+    case "‘": case "’": case "‚": case "‛":
+    case "′": case "ʼ": case "´":
+      return "'";
+    case "“": case "”": case "„": case "‟": case "″":
+      return '"';
+    // Non-breaking and typographic spaces, which are invisible in a diff — and
+    // therefore written as escapes here, where a literal would be invisible too.
+    case "\u00A0": case "\u1680": case "\u2000": case "\u2001": case "\u2002":
+    case "\u2003": case "\u2004": case "\u2005": case "\u2006": case "\u2007":
+    case "\u2008": case "\u2009": case "\u200A": case "\u202F": case "\u205F":
+    case "\u3000":
+      return " ";
+    // Zero-width and BOM: present in the file or in the model's copy, never both.
+    case "\u200B": case "\u200C": case "\u200D": case "\uFEFF":
+      return "";
+    // CR is dropped rather than mapped, so a CRLF file matches an LF needle.
+    case "\r":
+      return "";
+    default:
+      return ch;
+  }
+}
+
+/**
+ * A normalized view of some text plus, for every code unit of that view, the
+ * span of the ORIGINAL text that produced it. A match found in `text` maps back
+ * to `[starts[a], ends[b - 1])` in the original, which is what makes a tolerant
+ * match safe to splice: the replacement lands on real original coordinates, and
+ * characters dropped in the middle of the span are consumed with it.
+ */
+interface MatchView {
+  text: string;
+  starts: number[];
+  ends: number[];
+}
+
+/** True for a space or tab — the only whitespace indentation is made of. */
+function isHorizontalSpace(ch: string): boolean {
+  return ch === " " || ch === "\t";
+}
+
+/**
+ * Build the punctuation-folded view of `src`.
+ *
+ * @param src original text
+ * @returns the folded text and its per-code-unit map back to `src`
+ */
+function foldedView(src: string): MatchView {
+  let text = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let i = 0;
+  for (const ch of src) {
+    const folded = foldPunctuation(ch);
+    for (let k = 0; k < folded.length; k++) { starts.push(i); ends.push(i + ch.length); }
+    text += folded;
+    i += ch.length;
+  }
+  return { text, starts, ends };
+}
+
+/**
+ * Drop leading and/or trailing horizontal whitespace from every line of a view,
+ * carrying the original-coordinate map through unchanged.
+ *
+ * @param view a view to filter
+ * @param dropLeading drop spaces/tabs that start a line
+ * @param dropTrailing drop spaces/tabs that end a line
+ * @returns the filtered view
+ */
+function dropLineWhitespace(view: MatchView, dropLeading: boolean, dropTrailing: boolean): MatchView {
+  const { text } = view;
+  const keep = new Array<boolean>(text.length).fill(true);
+  // Two linear scans, each carrying "am I still inside the run" forward from the
+  // previous character. Rescanning the run from every character instead would be
+  // quadratic, and these run over whole files: one 100k-character stretch of
+  // spaces — a minified asset, a padded fixture — would hang the tool loop.
+  if (dropLeading) {
+    let inRun = true;
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === "\n") { inRun = true; continue; }
+      if (!inRun) continue;
+      if (isHorizontalSpace(text[i])) keep[i] = false;
+      else inRun = false;
+    }
+  }
+  if (dropTrailing) {
+    let inRun = true;
+    for (let i = text.length - 1; i >= 0; i--) {
+      if (text[i] === "\n") { inRun = true; continue; }
+      if (!inRun) continue;
+      if (isHorizontalSpace(text[i])) keep[i] = false;
+      else inRun = false;
+    }
+  }
+  let out = "";
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    if (!keep[i]) continue;
+    out += text[i];
+    starts.push(view.starts[i]);
+    ends.push(view.ends[i]);
+  }
+  return { text: out, starts, ends };
+}
+
+/**
+ * Build the matching view for one pass.
+ *
+ * @param src original text
+ * @param pass which normalization to apply
+ * @returns the view, or null for `exact` (which needs no view)
+ */
+function viewFor(src: string, pass: MatchPass): MatchView | null {
+  if (pass === "exact") return null;
+  const folded = foldedView(src);
+  if (pass === "punctuation") return folded;
+  if (pass === "trailing-whitespace") return dropLineWhitespace(folded, false, true);
+  return dropLineWhitespace(folded, true, true);
+}
+
+/** Every non-overlapping occurrence of `needle` in `hay`, as start offsets. */
+function allOccurrences(hay: string, needle: string): number[] {
+  const at: number[] = [];
+  let from = 0;
+  for (;;) {
+    const i = hay.indexOf(needle, from);
+    if (i < 0) return at;
+    at.push(i);
+    from = i + needle.length;
+  }
+}
+
+/** Extend `[start, end)` outward to whole lines of `text`. */
+function toWholeLines(text: string, start: number, end: number): { start: number; end: number } {
+  let s = start;
+  while (s > 0 && text[s - 1] !== "\n") s--;
+  let e = end;
+  while (e < text.length && text[e] !== "\n") e++;
+  return { start: s, end: e };
+}
+
+/**
+ * Find every place `oldStr` occurs in `text` under one normalization pass,
+ * expressed as spans of `text` itself.
+ *
+ * @param text the file text to search
+ * @param oldStr the model's search text
+ * @param pass which normalization to match under
+ * @returns non-overlapping spans in original coordinates, ascending
+ */
+function findSpans(text: string, oldStr: string, pass: MatchPass): Array<{ start: number; end: number }> {
+  if (pass === "exact") {
+    return allOccurrences(text, oldStr).map((i) => ({ start: i, end: i + oldStr.length }));
+  }
+  const hay = viewFor(text, pass)!;
+  const needle = viewFor(oldStr, pass)!;
+  // Tolerance exists to absorb drift AROUND real content. A needle with no
+  // non-whitespace character is nothing but drift: normalization can empty it
+  // (an empty needle matches at every offset), or fold "\u200B \u00A0" down to
+  // two ordinary spaces and hit the first pair of spaces in the file. Only the
+  // exact pass, which is unambiguous, may match one.
+  if (!/\S/.test(needle.text)) return [];
+  const spans: Array<{ start: number; end: number }> = [];
+  for (const at of allOccurrences(hay.text, needle.text)) {
+    const end = at + needle.text.length;
+    if (pass === "indentation") {
+      // With indentation gone the match is only reconstructable line-wise, so
+      // require it to sit on line boundaries in the normalized view.
+      const atLineStart = at === 0 || hay.text[at - 1] === "\n";
+      const atLineEnd = end === hay.text.length || hay.text[end] === "\n";
+      if (!atLineStart || !atLineEnd) continue;
+      spans.push(toWholeLines(text, hay.starts[at], hay.ends[end - 1]));
+    } else {
+      spans.push({ start: hay.starts[at], end: hay.ends[end - 1] });
+    }
+  }
+  return spans;
+}
+
+/**
+ * Apply find/replace edits to a file's text, matching with cascading strictness.
+ *
+ * Returns an error string instead of throwing so the model gets an actionable
+ * message back as a tool result (and can fix its own edit) rather than the run
+ * dying.
+ *
+ * @param text current file contents
+ * @param edits the model's edits, applied in order
+ * @param path the file's path, for error messages
+ * @returns the new content, or an error; `notes` records any non-exact match
+ */
 function applyEdits(
   text: string,
   edits: Array<{ old_string?: unknown; new_string?: unknown; replace_all?: unknown }>,
   path: string,
-): { content?: string; error?: string } {
+): { content?: string; error?: string; notes?: string[] } {
   let out = text;
+  const notes: string[] = [];
   for (let i = 0; i < edits.length; i++) {
     const e = edits[i] || {};
     const oldStr = String(e.old_string ?? "");
     const newStr = String(e.new_string ?? "");
+    const replaceAll = e.replace_all === true;
     if (!oldStr) return { error: `edit ${i + 1} for '${path}' has an empty old_string.` };
     if (oldStr === newStr) return { error: `edit ${i + 1} for '${path}' is a no-op (old_string === new_string).` };
-    const parts = out.split(oldStr);
-    const hits = parts.length - 1;
-    if (hits === 0) {
+
+    let spans: Array<{ start: number; end: number }> = [];
+    let matched: MatchPass | null = null;
+    for (const pass of MATCH_PASSES) {
+      const found = findSpans(out, oldStr, pass);
+      if (found.length) { spans = found; matched = pass; break; }
+    }
+    if (!matched) {
+      const first = oldStr.split("\n")[0].slice(0, 120);
       return {
-        error: `edit ${i + 1} for '${path}': old_string not found. It must match the file EXACTLY, including indentation and line breaks. Re-read the file and copy the text verbatim.`,
+        error: `edit ${i + 1} for '${path}': old_string not found, including after ignoring `
+          + `whitespace, indentation, line endings and Unicode punctuation — so re-typing it the same way will not help. `
+          + `First line looked for: ${JSON.stringify(first)}. Re-read '${path}' with gh_read_file and copy the current text.`,
       };
     }
-    if (hits > 1 && e.replace_all !== true) {
+    if (spans.length > 1 && !replaceAll) {
       return {
-        error: `edit ${i + 1} for '${path}': old_string matches ${hits} times. Include more surrounding lines to make it unique, or pass replace_all: true.`,
+        error: `edit ${i + 1} for '${path}': old_string matches ${spans.length} times (${PASS_LABEL[matched]}). `
+          + `Include more surrounding lines to make it unique, or pass replace_all: true.`,
       };
     }
-    // Join the split parts rather than String.replace: replace() would treat
-    // "$&", "$1" etc. in new_string as substitution patterns and silently
-    // mangle any code containing a dollar sign (template literals, jQuery, …).
-    out = e.replace_all === true ? parts.join(newStr) : parts[0] + newStr + parts[1];
+    if (matched !== "exact") {
+      notes.push(`edit ${i + 1} for '${path}' matched ${PASS_LABEL[matched]}, not literally.`);
+    }
+    // Splice by span rather than String.replace: replace() would treat "$&",
+    // "$1" etc. in new_string as substitution patterns and silently mangle any
+    // code containing a dollar sign (template literals, jQuery, …). Applying
+    // last-to-first keeps the earlier spans' offsets valid.
+    const targets = replaceAll ? spans : spans.slice(0, 1);
+    for (let s = targets.length - 1; s >= 0; s--) {
+      out = out.slice(0, targets[s].start) + newStr + out.slice(targets[s].end);
+    }
   }
-  return { content: out };
+  return { content: out, ...(notes.length ? { notes } : {}) };
 }
 
 // Branch → write files → open PR. Shared by gh_propose_change (model supplies
@@ -391,6 +651,7 @@ async function openPrWithFiles(
   args: Record<string, any>,
   files: Array<{ path: string; content: string }>,
   deadlineAt: number,
+  notes: string[] = [],
 ): Promise<string> {
   // This makes 4 + 2×files sequential GitHub calls. Clamping each one at
   // CALL_TIMEOUT_MS bounded no total: ten files could spend 24 × 50s. They all
@@ -444,11 +705,23 @@ async function openPrWithFiles(
     if (!put.ok) return `error: write ${f.path} → ${put.status}: ${String(put.data?.message || "").slice(0, 160)}`;
     written.push(f.path);
   }
+  // A tolerant edit match is a fact about the diff, so it belongs in the PR body
+  // where the reviewer reads it — not only in a tool result the run discards.
+  const shownNotes = notes.slice(0, 20);
+  const noteBlock = notes.length
+    ? `\n\n**Edits matched with normalization** (the server matched text the model did not write literally):\n`
+      + shownNotes.map((n) => `- ${n}`).join("\n")
+      + (notes.length > shownNotes.length ? `\n- …and ${notes.length - shownNotes.length} more` : "")
+    : "";
   const pr = await gh("POST", `/repos/${repo}/pulls`, {
-    title, head: branch, base, body: `${String(args.body || "")}\n\n— proposed by a Routiner OpenRouter agent`.trim(),
+    title, head: branch, base,
+    body: `${String(args.body || "")}${noteBlock}\n\n— proposed by a Routiner OpenRouter agent`.trim(),
   }, tLeft());
   if (!pr.ok) return `error: open PR → ${pr.status}: ${String(pr.data?.message || "").slice(0, 200)}`;
-  return `opened PR #${pr.data.number}: ${pr.data.html_url} (branch ${branch} → ${base}, ${files.length} file(s))`;
+  return `opened PR #${pr.data.number}: ${pr.data.html_url} (branch ${branch} → ${base}, ${files.length} file(s))`
+    + (notes.length
+      ? `\nnote: ${notes.length} edit(s) matched with normalization, not literally — the PR body lists them. Check the diff before merging.`
+      : "");
 }
 
 const cors = {
@@ -532,7 +805,7 @@ function toolGroupOf(name: string): string | null {
   // exist because a tool the run already had produced it, so paging one back is
   // not a new capability — and gating it behind a group the run happens not to
   // have would strand the very output we just told the model to page.
-  if (name === "read_spill" || name === "set_goal") return "*";
+  if (name === "read_spill" || name === "set_goal" || name === "end_segment") return "*";
   if (name === "read_routines" || name === "read_notes" || name === "read_leads" || name === "read_runs") return "read";
   if (name === "web_research") return "research";
   if (name === "write_note" || name === "find_and_save_leads") return "write";
@@ -801,6 +1074,10 @@ function toolSpecs(enabled: Set<string>): unknown[] {
         blocked_code: { type: "string", description: "required when phase='blocked': short kebab-case cause, e.g. 'needs-human'" },
         blocked_message: { type: "string", description: "required when phase='blocked': what a human must do" },
       } } } },
+    { type: "function", function: { name: "end_segment", description: "Hand off to the next background segment at a clean stopping point, instead of being cut off mid-task when this segment's step budget runs out. Replying with text ends the WHOLE run, so this is the only way to pause. Call it once you have finished a coherent piece of work and the next piece would not fit — never as a way to avoid work. Requires a current goal: the next segment starts from it.",
+      parameters: { type: "object", properties: {
+        note: { type: "string", description: "one line on where you stopped, for the run log" },
+      } } } },
   ];
   if (enabled.has("read")) {
     specs.push(
@@ -889,7 +1166,15 @@ function toolSpecs(enabled: Set<string>): unknown[] {
 async function runTool(
   name: string,
   args: Record<string, any>,
-  ctx: { userId: string | null; key: string; account: string | null; triggerKey: string | null; enabled: Set<string>; timeoutMs?: number; runId?: string | null; goalRef?: { current: RunGoal | null } },
+  ctx: {
+    userId: string | null; key: string; account: string | null; triggerKey: string | null;
+    enabled: Set<string>; timeoutMs?: number; runId?: string | null;
+    goalRef?: { current: RunGoal | null };
+    handoffRef?: { current: string | null };
+    segmentDepth?: number;
+    toolsRunThisSegment?: number;
+    doneAtSegmentStart?: number;
+  },
 ): Promise<string> {
   const group = toolGroupOf(name);
   if (!group || (group !== "*" && !ctx.enabled.has(group))) {
@@ -920,6 +1205,21 @@ async function runTool(
         ctx.goalRef.current = next;
         return `goal recorded (${next.phase}). ${renderGoal(next)}`;
       }
+      case "end_segment": {
+        // Every refusal below is a guard against the same failure: a segment
+        // handed off with nothing for the next one to resume from, or no next
+        // one to resume at all. The tool reports why rather than half-doing it.
+        if (!ctx.handoffRef) return "error: this run cannot hand off to another segment.";
+        const why = handoffRefusal(
+          ctx.goalRef?.current ?? null,
+          ctx.segmentDepth ?? 0,
+          ctx.toolsRunThisSegment ?? 0,
+          ctx.doneAtSegmentStart ?? 0,
+        );
+        if (why) return `error: ${why}`;
+        ctx.handoffRef.current = String(args.note || "").trim().slice(0, 400) || "handed off at a clean stopping point";
+        return "segment ended; the next segment resumes from your goal.";
+      }
       case "read_spill": {
         const id = String(args.spill_id || "").trim();
         if (!id) return "error: missing spill_id";
@@ -938,8 +1238,10 @@ async function runTool(
         const startLine = Math.max(1, Math.floor(Number(args.start_line) || 1));
         const maxLines = Math.max(1, Math.min(Math.floor(Number(args.max_lines) || GH_READ_DEFAULT_LINES), 5_000));
         const win = sliceLines(String(row.content ?? ""), startLine, maxLines);
-        const body = Array.from(win.body).length > SPILL_WINDOW_CHARS
-          ? Array.from(win.body).slice(0, SPILL_WINDOW_CHARS).join("") + "\n…[window truncated — request fewer lines]"
+        const bodyPoints = Array.from(win.body).length;
+        const body = bodyPoints > SPILL_WINDOW_CHARS
+          ? Array.from(win.body).slice(0, SPILL_WINDOW_CHARS).join("")
+            + `\n…[${bodyPoints - SPILL_WINDOW_CHARS} of ${bodyPoints} chars of this window not shown — re-call read_spill with a smaller max_lines, or a later start_line to continue]`
           : win.body;
         const more = win.to < win.total
           ? `\n\n[lines ${win.from}-${win.to} of ${win.total}. More follows: read_spill with start_line=${win.to + 1}.]`
@@ -1159,6 +1461,7 @@ async function runTool(
           return `error: too many files (${byPath.size}); max is ${GH_MAX_FILES} per PR. Split the work.`;
         }
         const files: Array<{ path: string; content: string }> = [];
+        const matchNotes: string[] = [];
         for (const [p, edits] of byPath) {
           const deny = deniedWritePath(p);
           if (deny) return `error: blocked path '${p}': ${deny}`;
@@ -1177,9 +1480,10 @@ async function runTool(
           }
           const applied = applyEdits(text, edits, p);
           if (applied.error) return `error: ${applied.error}`;
+          if (applied.notes) matchNotes.push(...applied.notes);
           files.push({ path: p, content: applied.content! });
         }
-        return await openPrWithFiles(repo!, args, files, toolDeadline);
+        return await openPrWithFiles(repo!, args, files, toolDeadline, matchNotes);
       }
       case "gh_read_issue": {
         if (!GH_TOKEN()) return "error: no GITHUB_TOKEN configured on the deployment.";
@@ -1304,21 +1608,36 @@ Do not claim to have done something a tool did not confirm.`;
 // sent it back to re-read the same file — the repeat loop the guard below
 // watches for. Splitting the same 400 chars costs nothing extra.
 const TOOL_FLOOR_CHARS = 400;
-const TOOL_FLOOR_MARKER = "\n…[truncated for context]…\n";
 const TOOL_FLOOR_HEAD = 280;
 const TOOL_FLOOR_TAIL = TOOL_FLOOR_CHARS - TOOL_FLOOR_HEAD;
 
-// Slice by Unicode code point, never by UTF-16 unit: `"…".slice(0, n)` can cut
-// a surrogate pair in half and emit a lone surrogate, which then rides into a
-// jsonb column and a JSON request body as invalid text.
-function headTail(text: string, head: number, tail: number): string {
+/**
+ * Keep a head and a tail of `text`, replacing the middle with a marker that
+ * says how much went.
+ *
+ * The marker is quantitative on purpose. An unmeasured "…[truncated]…" leaves
+ * the model unable to tell fifty lost characters from fifty thousand, so it
+ * cannot judge whether recovering them is worth a step — and the cheapest way
+ * to find out is to re-run the tool, which is the loop the repeat guard then
+ * has to catch. Truncation was manufacturing the loop.
+ *
+ * Slicing is by Unicode code point, never by UTF-16 unit: `"…".slice(0, n)` can
+ * cut a surrogate pair in half and emit a lone surrogate, which then rides into
+ * a jsonb column and a JSON request body as invalid text.
+ *
+ * @param text the full text
+ * @param head code points to keep from the start
+ * @param tail code points to keep from the end
+ * @param fate what happened to the middle, stated to the model
+ * @returns `text` unchanged when it already fits, otherwise head + marker + tail
+ */
+function headTail(text: string, head: number, tail: number, fate = "dropped to save context"): string {
   const points = Array.from(text);
   if (points.length <= head + tail) return text;
-  return points.slice(0, head).join("") + TOOL_FLOOR_MARKER + points.slice(points.length - tail).join("");
-}
-
-function toolFloorLength(text: string): number {
-  return Math.min(Array.from(text).length, TOOL_FLOOR_CHARS);
+  const omitted = points.length - head - tail;
+  const lines = text.split("\n").length;
+  const marker = `\n…[${omitted} of ${points.length} chars ${fate}; ${lines} line${lines === 1 ? "" : "s"} total]…\n`;
+  return points.slice(0, head).join("") + marker + points.slice(points.length - tail).join("");
 }
 
 function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET): any[] {
@@ -1340,8 +1659,17 @@ function compactMessages(messages: any[], budget: number = CONTEXT_TOOL_BUDGET):
     const len = Array.from(c).length;
     if (len <= TOOL_FLOOR_CHARS) { spent += len; continue; }
     if (spent + len <= cap) { spent += len; continue; }
-    out[i] = { ...m, content: headTail(c, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL) };
-    spent += toolFloorLength(c);
+    // Charge what the floored text actually costs, marker included — the marker
+    // grew when it started carrying counts, and an under-count here would let
+    // the budget drift above CONTEXT_TOOL_BUDGET.
+    // Floor the preview but never the locator: without it the spilled text is
+    // unreachable and re-running the tool is the model's only way back to it.
+    const spill = splitSpillLocator(c);
+    const flooredContent = spill
+      ? `${headTail(spill.body, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL)}\n${shortSpillLocator(spill.id)}`
+      : headTail(c, TOOL_FLOOR_HEAD, TOOL_FLOOR_TAIL);
+    out[i] = { ...m, content: flooredContent };
+    spent += Array.from(flooredContent).length;
   }
   return out;
 }
@@ -1480,6 +1808,38 @@ async function spillResult(
     + `[spill ${id} — ${total} chars, ${lines} lines. `
     + `Read any part with read_spill({"spill_id":"${id}","start_line":N,"max_lines":M}). `
     + `Do NOT re-run ${toolName} to see the rest; page this spill instead.]`;
+}
+
+// ── Keeping a spill reachable through compaction ─────────────────────────────
+// A spilled result is a preview plus a locator, and the locator is the only
+// thing that makes the stored text reachable. It sits on the last line, and the
+// compaction floor keeps 120 characters of tail — far less than the locator is
+// long — so flooring a spilled result silently destroyed the id and stranded
+// the very text the spill notice had just promised was "stored, not lost". The
+// model's only route back to it was to re-run the tool: exactly the loop
+// spilling exists to prevent. The floor now re-attaches a compact locator.
+
+const SPILL_LOCATOR_PREFIX = "[spill ";
+
+/** The compact locator kept when a spilled result is floored. */
+function shortSpillLocator(id: string): string {
+  return `${SPILL_LOCATOR_PREFIX}${id} — the full result is stored, not lost. `
+    + `Page it with read_spill({"spill_id":"${id}"}); do NOT re-run the tool.]`;
+}
+
+/**
+ * Split a tool result into its body and the spill id its trailing locator names.
+ *
+ * @param content a stored tool result
+ * @returns the id and the body without the locator line, or null when there is no locator
+ */
+function splitSpillLocator(content: string): { id: string; body: string } | null {
+  const nl = content.lastIndexOf("\n");
+  const last = nl < 0 ? content : content.slice(nl + 1);
+  if (!last.startsWith(SPILL_LOCATOR_PREFIX) || !last.endsWith("]")) return null;
+  const m = /^\[spill ([0-9a-f-]{36})\b/i.exec(last);
+  if (!m) return null;
+  return { id: m[1], body: nl < 0 ? "" : content.slice(0, nl).trimEnd() };
 }
 
 // ── Repeat-tool chain ────────────────────────────────────────────────────────
@@ -1829,6 +2189,57 @@ function segmentMadeProgress(actions: string[], finalText: string): boolean {
  * Only the terminal transition is inferred. `done`/`remaining` are the model's
  * to describe and are never invented here.
  */
+/**
+ * Why a deliberate segment hand-off must be refused, or null to allow it.
+ *
+ * The model cannot pause on its own otherwise — replying with text ends the
+ * whole run — so a segment always ended wherever the step budget happened to
+ * fall, mid-task. `end_segment` lets it stop somewhere it chose. All three
+ * refusals guard the same thing: that there is something to resume, and a
+ * segment left to resume in.
+ *
+ * @param goal the run's current goal
+ * @param depth this segment's auto-continue depth
+ * @param toolsRun tool calls made this segment BEFORE this one
+ * @returns the reason to refuse, or null
+ */
+function handoffRefusal(goal: RunGoal | null, depth: number, toolsRun: number, doneAtStart: number): string | null {
+  // Handing off with no goal hands off amnesia: the next segment's orientation
+  // would read "no goal recorded yet" and it would start over.
+  if (!goal) {
+    return "no goal recorded — call set_goal first, or the next segment has nothing to resume from.";
+  }
+  if (goal.phase !== "active") {
+    return `the goal is '${goal.phase}', so there is nothing to hand off. `
+      + (goal.phase === "complete"
+        ? "Reply with your final summary instead."
+        : "A blocked run stops rather than continuing; say what a human must do.");
+  }
+  // No next segment exists, so this would file the run as out-of-segments rather
+  // than pausing it. Finishing badly here is still better than that.
+  if (depth >= MAX_AUTO_CONTINUES) {
+    return "this is the last segment — there is no next one to hand off to. "
+      + "Finish what you can and reply with a summary of where things stand.";
+  }
+  // Without this a model could open every segment with end_segment and burn the
+  // whole chain doing nothing, each segment scoring "progress" for the one tool
+  // call it made — the no-progress guard's blind spot, reached by a new route.
+  if (toolsRun < 1) {
+    return "this segment has not done anything yet. Do some work first; "
+      + "handing off an empty segment just spends one.";
+  }
+  // The goal is the entire hand-off. A segment that ran tools but left `done`
+  // exactly as it found it is handing the next one the same starting position
+  // it had, so the next segment repeats this one — which is the "set the goal
+  // once and never touch it again" failure, now with a hand-off attached to it.
+  if (goal.done.length <= doneAtStart) {
+    return "the goal's `done` list has not changed this segment, so the next one "
+      + "would resume from where this one started and repeat it. Call set_goal to "
+      + "record what you finished, then end_segment.";
+  }
+  return null;
+}
+
 function reconcileGoal(goal: RunGoal | null, status: string): RunGoal | null {
   if (!goal) return null;
   if (status === "success" && goal.phase === "active") {
@@ -1894,6 +2305,11 @@ async function runAgentLoop(opts: {
   let fellBack = false;
   // Mutated by the set_goal tool, checkpointed with every other bit of progress.
   const goalRef: { current: RunGoal | null } = { current: opts.goal ?? null };
+  // Set by the end_segment tool when the model chooses to hand off here.
+  const handoffRef: { current: string | null } = { current: null };
+  // How much the goal already claimed done when this segment began, so a
+  // hand-off can require that the segment actually moved it forward.
+  const doneAtSegmentStart = goalRef.current?.done.length ?? 0;
   const started = Date.now();
   const hardStop = started + DEADLINE_MS;
   const remaining = () => Math.max(0, hardStop - Date.now());
@@ -2051,7 +2467,11 @@ async function runAgentLoop(opts: {
       try { args = JSON.parse(tc?.function?.arguments || "{}"); } catch { /* leave empty */ }
       const raw = await runTool(name, args, {
         userId: ctx.userId, key, account: ctx.account, triggerKey: ctx.triggerKey, enabled: ctx.enabled, runId,
-        timeoutMs: toolBudget, goalRef,
+        timeoutMs: toolBudget, goalRef, handoffRef, doneAtSegmentStart,
+        segmentDepth: opts.depth ?? 0,
+        // Tool calls already made this segment. end_segment reads this to refuse
+        // a hand-off from a segment that has not done anything yet.
+        toolsRunThisSegment: actions.length,
       });
       // Spill before truncating: store the whole thing and hand the model a
       // preview plus a locator, so an oversized result becomes a fetch rather
@@ -2064,15 +2484,34 @@ async function runAgentLoop(opts: {
       // Fallback cap for anything not spilled (a spill insert can fail, and it
       // must never fail the tool call). File reads keep the higher ceiling.
       const cap = name === "gh_read_file" ? GH_READ_RESULT_CAP : TOOL_RESULT_CAP;
-      if (result.length > cap) {
-        result = result.slice(0, cap)
-          + `\n\n…[truncated at ${cap} chars of ${result.length}. For files, re-call gh_read_file with start_line/max_lines to page.]`;
+      if (Array.from(result).length > cap) {
+        // Head AND tail, by code point, for the same two reasons the compaction
+        // floor keeps both: for these tools the answer often sits at the end (an
+        // error line appended after a successful-looking preamble, the last
+        // entries of a listing), and a UTF-16 slice can emit a lone surrogate.
+        const head = Math.floor(cap * 0.7);
+        result = headTail(result, head, cap - head, "dropped — the spill write failed, so this text is gone")
+          + `\n[For files, re-call gh_read_file with start_line/max_lines to page.]`;
       }
       const line = `${name}(${JSON.stringify(args).slice(0, 200)}) → ${result.split("\n")[0].slice(0, 120)}`;
       actions.push(line);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       const pr = detectOpenedPr(name, result);
       if (pr.opened) { openedPr = true; prUrl = pr.url; }
+    }
+    // A deliberate hand-off ends the segment here rather than at whatever step
+    // the budget ran out on. `incomplete` is what schedules the next segment, so
+    // this is a pause, not a finish — the guards in handoffRefusal have already
+    // established that a next segment exists and has a goal to resume from.
+    // …except when this batch opened a PR. That path owes the reader a summary
+    // and the next iteration is already set up to write one with tools off;
+    // pausing instead would carry a finished piece of work into another segment
+    // that no longer knows it happened.
+    if (handoffRef.current && !openedPr) {
+      finalText = `Handed off to the next segment: ${handoffRef.current}`;
+      incomplete = true;
+      await saveProgress("running", finalText);
+      break;
     }
     // Advisory only, and after the results so the model sees what it just got
     // back before being told to stop asking for it again.
@@ -2250,10 +2689,16 @@ async function handleRequest(req: Request): Promise<Response> {
       // Refresh system prompt so efficiency rules apply to old transcripts.
       messages[0] = { role: "system", content: buildSystem(model, toolList) };
     }
+    // The auto-continue POST carries AUTO_CONTINUE_PROMPT in its own `prompt`
+    // field, so "is the prompt empty?" can never tell a machine nudge from a
+    // human reply — it labelled neither, and isHumanTurn then read every
+    // segment boundary as a human interjection, resetting the repeat chain at
+    // exactly the boundary it exists to survive. The body's autoContinue flag
+    // is the only authority on who is speaking.
     const humanPrompt = prompt.trim();
-    messages.push(humanPrompt
-      ? { role: "user", content: humanPrompt }
-      : { role: "user", content: AUTO_CONTINUE_PROMPT, _source: SRC_AUTO_CONTINUE });
+    messages.push(isAutoContinue
+      ? { role: "user", content: humanPrompt || AUTO_CONTINUE_PROMPT, _source: SRC_AUTO_CONTINUE }
+      : { role: "user", content: humanPrompt });
 
     await checkpointRun(runId, { status: "running", output: isAutoContinue ? `Continuing… (segment ${continueDepth + 1})` : "Working…" });
 

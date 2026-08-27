@@ -25,7 +25,8 @@ export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudg
          toolBudgetFor, segmentOrientation, TOOL_BUDGET_MS,
          sliceLines, spillResult, toolGroupOf, toolSpecs,
          normalizeGoal, renderGoal, parseStoredGoal, goalBlockStop, openrouter,
-         reconcileGoal };
+         reconcileGoal, handoffRefusal, splitSpillLocator, shortSpillLocator,
+         MAX_AUTO_CONTINUES };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -149,15 +150,39 @@ const msgs = [
   { role: "tool", content: big(50_000) }, // newest
 ];
 const out = m.compactMessages(msgs, 60_000);
-const toolLens = out.filter((x) => x.role === "tool").map((x) => x.content.length);
-const FLOORED = 400 + "\n…[truncated for context]…\n".length;
-eq("newest kept full, older floored", toolLens, [FLOORED, FLOORED, 50_000]);
+const toolResults = out.filter((x) => x.role === "tool");
+const toolLens = toolResults.map((x) => x.content.length);
+eq("newest kept full", toolLens[2], 50_000);
+eq("older two floored", toolLens[0] < 600 && toolLens[1] < 600, true);
 eq("total tool chars under control", toolLens.reduce((a, b) => a + b, 0) <= 61_000, true);
 eq("input not mutated", msgs[1].content.length, 50_000);
 eq("non-tool untouched", out[0].content, "sys");
 const small = [{ role: "tool", content: "tiny" }, { role: "tool", content: big(70_000) }];
 eq("small results never truncated", m.compactMessages(small, 10)[0].content, "tiny");
-eq("zero budget floors big ones", m.compactMessages(small, 0)[1].content.length, FLOORED);
+eq("zero budget floors big ones", m.compactMessages(small, 0)[1].content.length < 600, true);
+
+// An unmeasured "…[truncated]…" leaves the model unable to tell fifty lost
+// characters from fifty thousand, so it cannot judge whether recovering them is
+// worth a step — and the cheapest way to find out is to re-run the tool, which
+// is the loop the repeat guard then has to catch.
+const quantified = m.compactMessages([{ role: "tool", content: big(50_000) }], 0)[0].content;
+eq("floor marker states what was dropped", /49600 of 50000 chars/.test(quantified), true);
+eq("floor marker states the total line count", /1 line total/.test(quantified), true);
+const multiline = m.compactMessages([{ role: "tool", content: `${big(5_000)}\n${big(5_000)}` }], 0)[0].content;
+eq("floor marker pluralizes lines", /2 lines total/.test(multiline), true);
+// The marker grew when it started carrying counts, so the flat 400 the budget
+// used to charge for a floored result now under-states what it really costs.
+// Every floored result must be charged what it actually occupies.
+const BUDGET = 12_000;
+const many = Array.from({ length: 12 }, () => ({ role: "tool", content: big(5_000) }));
+const kept = m.compactMessages(many, BUDGET).filter((x) => x.role === "tool");
+const fullSize = kept.filter((x) => x.content.length === 5_000);
+eq("the newest results fit the budget in full", fullSize.length, 2);
+eq("the newest results are the ones kept", kept.slice(-2).every((x) => x.content.length === 5_000), true);
+eq("a floored result is charged more than the bare 400-char floor",
+   kept[0].content.length > 400, true);
+eq("full-size results never exceed the budget",
+   fullSize.reduce((a, x) => a + x.content.length, 0) <= BUDGET, true);
 
 // The floor keeps a TAIL, not just a head. For every GitHub tool here the answer
 // tends to sit at the end (gh_read_pr patches, a trailing error line), and
@@ -221,6 +246,14 @@ eq("an auto-continue prompt does NOT reset", chainOf(
   [{ role: "user", content: "[auto-continue] …", _source: "auto-continue" }],
   [call("gh_read_file", { path: "a" }), res()],
 ).count, 3);
+// The live 4-segment CALL-2 run exposed this: scheduleAutoContinue POSTs
+// AUTO_CONTINUE_PROMPT in the body's own `prompt` field, so deciding the label
+// from "is the prompt empty?" labelled NOTHING — all three of that run's
+// [auto-continue] turns stored with no _source, and isHumanTurn read each
+// segment boundary as a human interjection, resetting the chain at exactly the
+// boundary deriving-from-transcript exists to survive.
+eq("an auto-continue turn is never a human turn, even carrying its prompt text",
+  m.isHumanTurn({ role: "user", content: "[auto-continue] Resume the task…", _source: "auto-continue" }), false);
 eq("isHumanTurn: bare user turn", m.isHumanTurn({ role: "user", content: "hi" }), true);
 eq("isHumanTurn: injected turn", m.isHumanTurn({ role: "user", content: "hi", _source: "auto-continue" }), false);
 
@@ -431,7 +464,7 @@ const specNames = (en) => m.toolSpecs(new Set(en)).map((s) => s.function.name);
 eq("offered with no groups at all", specNames([]).includes("read_spill"), true);
 eq("offered alongside code tools", specNames(["code"]).includes("read_spill"), true);
 eq("a run with no groups gets only the ungrouped tools",
-  specNames([]).sort(), ["read_spill", "set_goal"]);
+  specNames([]).sort(), ["end_segment", "read_spill", "set_goal"]);
 
 console.log("\n— per-tool time budgets —");
 // Every tool used to get the WHOLE remaining wall, so one slow call could eat
@@ -485,6 +518,168 @@ eq("dollar patterns are literal", m.applyEdits("const a = 1;\n", [
 eq("dollar patterns literal in replace_all", m.applyEdits("a\na\n", [
   { old_string: "a", new_string: "$&$1", replace_all: true },
 ], "f").content, "$&$1\n$&$1\n");
+
+console.log("\n— applyEdits cascading strictness (whitespace / Unicode drift) —");
+// A model that read the file through its own tokenizer emits an em-dash where
+// the source has a hyphen, a curly apostrophe where it has a straight one, LF
+// where the file has CRLF, or loses a trailing space. Demanding a byte-exact
+// match failed every one of those and cost a step plus a re-read.
+const fuzzSrc = "const a = 'x'; // half-open\nconst b = 2;   \n\tif (b) run();\n";
+
+// Pass 1 stays exact: an exact match must never be reinterpreted.
+const exact = m.applyEdits(fuzzSrc, [{ old_string: "const b = 2;", new_string: "const b = 3;" }], "f");
+eq("exact match still wins", exact.content.includes("const b = 3;"), true);
+eq("exact match reports no note", exact.notes, undefined);
+
+// Pass 2 — Unicode punctuation the model substituted for ASCII.
+const smart = m.applyEdits(fuzzSrc, [{ old_string: "const a = \u2018x\u2019; // half\u2010open", new_string: "const a = 'y';" }], "f");
+eq("curly quotes and a Unicode hyphen match", smart.content.includes("const a = 'y';"), true);
+eq("a tolerant match is reported", smart.notes.length, 1);
+eq("the note names the normalization", /Unicode punctuation/.test(smart.notes[0]), true);
+
+// A CRLF file against an LF needle is the same class of drift.
+const crlf = m.applyEdits("one\r\ntwo\r\nthree\r\n", [{ old_string: "one\ntwo", new_string: "ONE" }], "f");
+eq("CRLF file matches an LF old_string", crlf.content, "ONE\r\nthree\r\n");
+
+// Pass 3 — the file has trailing whitespace the model did not copy.
+const trailing = m.applyEdits(fuzzSrc, [{ old_string: "const b = 2;\n", new_string: "const b = 9;\n" }], "f");
+eq("trailing whitespace is ignored", trailing.content.includes("const b = 9;"), true);
+eq("trailing-whitespace match is reported", /trailing whitespace/.test(trailing.notes[0]), true);
+
+// Pass 4 — indentation drift, and it replaces WHOLE lines so the model's own
+// indentation lands verbatim. Splicing inside the line would keep the file's
+// indent and add the model's on top, silently mis-indenting Python or YAML.
+const indent = m.applyEdits(fuzzSrc, [{ old_string: "  if (b) run();", new_string: "\tif (b) walk();" }], "f");
+eq("indentation drift matches", indent.content.includes("walk()"), true);
+eq("whole-line replacement keeps exactly one indent", indent.content.includes("\tif (b) walk();"), true);
+eq("the file's own indentation is gone", indent.content.includes("  \tif"), false);
+eq("indentation match is reported", /indentation/.test(indent.notes[0]), true);
+
+// Indentation tolerance is whole-lines-only: a mid-line needle must not reach
+// pass 4, because its match could not be spliced back without guessing.
+eq("a mid-line needle does not get indentation tolerance",
+   !!m.applyEdits("  foo(bar) + baz\n", [{ old_string: "foo(bar)  +  baz", new_string: "q" }], "f").error, true);
+
+// Strictness cascades: the first pass that hits wins, so a needle that matches
+// exactly in one place must not be widened to a looser match elsewhere.
+const both = "value = 1;\nvalue  =  1;\n";
+eq("the strictest matching pass wins",
+   m.applyEdits(both, [{ old_string: "value = 1;", new_string: "V" }], "f").content, "V\nvalue  =  1;\n");
+
+// Ambiguity is still refused, and now says which pass found the duplicates.
+const dup = m.applyEdits("a = 1;   \na = 1;\t\n", [{ old_string: "a = 1;\n", new_string: "b\n" }], "f");
+eq("ambiguity found by a tolerant pass still errors", !!dup.error, true);
+eq("the error names the pass", /trailing whitespace/.test(dup.error), true);
+
+// The dead end this replaced: "must match EXACTLY — copy it verbatim" sent the
+// model to re-type text that was never going to match. Say so instead.
+const miss = m.applyEdits(fuzzSrc, [{ old_string: "no such text at all", new_string: "x" }], "f");
+eq("a genuine miss says re-typing will not help", /will not help/.test(miss.error), true);
+eq("a genuine miss quotes what was looked for", /no such text at all/.test(miss.error), true);
+
+// replace_all under a tolerant pass hits every occurrence, not just the first.
+const all = m.applyEdits("x \u2013 1\nx \u2014 1\n", [{ old_string: "x - 1", new_string: "ok", replace_all: true }], "f");
+eq("replace_all spans tolerant matches", all.content, "ok\nok\n");
+
+// Splicing by span must stay literal: "$&" in new_string is not a pattern.
+eq("dollar patterns literal under a tolerant match",
+   m.applyEdits("a \u2013 b\n", [{ old_string: "a - b", new_string: "$&$1" }], "f").content, "$&$1\n");
+
+// A needle that normalizes to nothing has no match to offer; it must not become
+// an empty-string match that hits at every offset.
+eq("a whitespace-only needle never matches everywhere",
+   !!m.applyEdits(fuzzSrc, [{ old_string: "\u200B \u00A0", new_string: "x" }], "f").error, true);
+
+// The tolerant passes walk whole files, so their whitespace scan has to be
+// linear. Rescanning each run from every character is quadratic, and one long
+// stretch of spaces — a minified asset, a padded fixture — would hang the tool
+// loop instead of failing an edit. This finishes instantly when linear and
+// takes minutes when not.
+// The trailing spaces after real() are what force the run past the exact and
+// punctuation passes and into the whitespace scan this is testing.
+const padded = `${" ".repeat(100_000)}\nreal();   \n`;
+const t0 = Date.now();
+const paddedOut = m.applyEdits(padded, [{ old_string: "real();\n", new_string: "fake();\n" }], "f");
+eq("the whitespace scan is the pass under test", /trailing whitespace/.test(paddedOut.notes[0]), true);
+eq("a huge whitespace run does not hang the matcher", Date.now() - t0 < 3_000, true);
+eq("and the edit still applies", paddedOut.content.endsWith("\nfake();\n"), true);
+
+console.log("\n— spill locator survives compaction —");
+// A spilled result is a preview plus a locator, and the locator is the ONLY
+// route back to the stored text. It sits on the last line; the floor keeps 120
+// chars of tail. Flooring therefore destroyed the id and stranded the very text
+// the notice had just promised was "stored, not lost" — leaving re-running the
+// tool as the model's only way back, which is the loop spilling exists to stop.
+const SPILL_ID = "0123abcd-45ef-6789-abcd-ef0123456789";
+const spilled = `${"p".repeat(6_000)}\n\n[spill ${SPILL_ID} — 90000 chars, 1200 lines. `
+  + `Read any part with read_spill({"spill_id":"${SPILL_ID}","start_line":N,"max_lines":M}). `
+  + `Do NOT re-run gh_read_file to see the rest; page this spill instead.]`;
+const flooredSpill = m.compactMessages([{ role: "tool", content: spilled }], 0)[0].content;
+eq("the floored result still names the spill id", flooredSpill.includes(SPILL_ID), true);
+eq("…and still says how to read it", /read_spill/.test(flooredSpill), true);
+eq("…and still forbids re-running the tool", /do NOT re-run/i.test(flooredSpill), true);
+eq("the preview itself is still floored", flooredSpill.length < 1_000, true);
+// Only a real locator is treated as one. A result whose last line merely starts
+// the same way must be floored normally, not have text invented for it.
+const lookalike = `${"q".repeat(6_000)}\n[spill something else entirely]`;
+eq("a lookalike last line is not read as a locator", m.splitSpillLocator(lookalike), null);
+eq("a result with no locator is unaffected",
+   m.splitSpillLocator(`${"q".repeat(100)}\nplain tail`), null);
+// Flooring is not once-only: a result floored in one segment is floored again in
+// the next, so the compact locator must itself read as a locator.
+const twice = m.compactMessages(
+  [{ role: "tool", content: m.compactMessages([{ role: "tool", content: spilled }], 0)[0].content }],
+  0,
+)[0].content;
+eq("re-flooring a floored result keeps the id", twice.includes(SPILL_ID), true);
+eq("splitSpillLocator returns the id and the body",
+   m.splitSpillLocator(`body text\n${m.shortSpillLocator(SPILL_ID)}`),
+   { id: SPILL_ID, body: "body text" });
+
+console.log("\n— end_segment (deliberate hand-off) —");
+// Replying with text ends the WHOLE run, so without this the model could not
+// pause: a segment always stopped wherever the step budget happened to fall.
+// Every refusal guards the same thing — that something is left to resume, and a
+// segment left to resume it in.
+const activeGoal = (done = ["read the issue"]) => ({
+  objective: "fix #57", done, remaining: ["open a PR"], phase: "active",
+});
+eq("a clean hand-off is allowed",
+   m.handoffRefusal(activeGoal(["a", "b"]), 0, 3, 1), null);
+// Handing off with no goal hands off amnesia: the next segment's orientation
+// would read "no goal recorded yet" and it would start over.
+eq("no goal is refused", /set_goal first/.test(m.handoffRefusal(null, 0, 3, 0)), true);
+eq("a complete goal is refused",
+   /final summary/.test(m.handoffRefusal({ ...activeGoal(), phase: "complete" }, 0, 3, 0)), true);
+// A blocked run stops the chain by design; handing off would restart it.
+eq("a blocked goal is refused",
+   /blocked run stops/.test(m.handoffRefusal({ ...activeGoal(), phase: "blocked" }, 0, 3, 0)), true);
+// There is no next segment to hand off TO, and `incomplete` on the last one
+// files the run as out-of-segments rather than pausing it.
+eq("the last segment is refused",
+   /last segment/.test(m.handoffRefusal(activeGoal(["a"]), m.MAX_AUTO_CONTINUES, 3, 0)), true);
+eq("…and one before it is not",
+   m.handoffRefusal(activeGoal(["a"]), m.MAX_AUTO_CONTINUES - 1, 3, 0), null);
+// Otherwise a model could open every segment with end_segment and burn the whole
+// chain, each segment scoring "progress" for the single call it made — the
+// no-progress guard's blind spot, reached by a new route.
+eq("an empty segment cannot hand off",
+   /has not done anything yet/.test(m.handoffRefusal(activeGoal(["a"]), 0, 0, 0)), true);
+// A segment that ran tools but left `done` untouched hands the next one its own
+// starting position, so the next segment repeats it — the "set the goal once and
+// never touch it again" failure with a hand-off attached.
+eq("a hand-off that did not move the goal is refused",
+   /has not changed this segment/.test(m.handoffRefusal(activeGoal(["a"]), 1, 4, 1)), true);
+eq("…and says to call set_goal first",
+   /Call set_goal/.test(m.handoffRefusal(activeGoal(["a"]), 1, 4, 1)), true);
+eq("moving the goal forward allows it",
+   m.handoffRefusal(activeGoal(["a", "b"]), 1, 4, 1), null);
+// It is always offered: a run cannot be given the ability to pause by a group it
+// happens not to have enabled.
+eq("end_segment belongs to no group", m.toolGroupOf("end_segment"), "*");
+eq("offered with no groups at all",
+   m.toolSpecs(new Set()).some((t) => t.function.name === "end_segment"), true);
+eq("it declares a time budget", m.TOOL_BUDGET_MS.end_segment > 0, true);
 
 console.log("\n— status classification —");
 eq("budget stop detected", m.isBudgetStop("Stopped after the maximum number of tool steps without a final answer."), true);

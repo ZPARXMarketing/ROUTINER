@@ -247,6 +247,24 @@ threshold before the reaper fires.
 > told the model to page. Spills are scoped to their run and cascade-delete with
 > it; losing one costs a re-read, never work.
 
+> **The model can pause a run; it could only ever end one.** Replying with text
+> finishes the whole run, so a segment always stopped wherever the step budget
+> happened to fall — mid-read, mid-edit, with the next segment paying to work out
+> where it was. **`end_segment`** is the deliberate hand-off: it ends this
+> segment and lets the auto-continue chain start the next one from the goal. It
+> is ungrouped, since the ability to pause cannot depend on which tool groups a
+> run happens to have. Four refusals guard the same thing — that something is
+> left to resume, and a segment left to resume it in: **no goal** (handing off
+> amnesia; the next orientation would read "no goal recorded yet" and start
+> over); a **complete or blocked** goal (one owes a summary, the other stops the
+> chain by design); the **last segment**, where `incomplete` files the run as
+> out-of-segments rather than pausing it; and a segment that **ran no tools**, or
+> **left `done` exactly as it found it** — either hands the next segment its own
+> starting position, so it repeats this one. That last refusal is the "set the
+> goal once and never touch it again" failure caught at the one moment the goal
+> has to be current. A batch that opened a PR ignores the hand-off: that path
+> owes the reader a summary and the next iteration is already set up to write one.
+
 > **A run has a goal, and it lives off the transcript.** `messages` is compacted
 > between segments, so by segment four the model's record of its own plan is
 > mostly gone — and `AUTO_CONTINUE_PROMPT` was telling it to "resume the task
@@ -311,6 +329,29 @@ threshold before the reaper fires.
 > Slicing is by Unicode code point: `String.slice` cuts a surrogate pair in half
 > and emits a lone surrogate, which then rides into a jsonb column and a JSON
 > request body as invalid text.
+
+> **A spill locator must survive the floor that made it necessary.** A spilled
+> result is a preview plus a locator, and the locator is the only route back to
+> the stored text. It sits on the last line — and the compaction floor keeps 120
+> characters of tail, far less than the locator is long. So flooring a spilled
+> result destroyed the id and stranded exactly the text whose notice had just
+> promised it was *stored, not lost*, leaving the model one way back: re-run the
+> tool. Spilling exists to prevent that loop, and flooring was quietly restoring
+> it. The floor now splits the locator off, floors only the preview, and
+> re-attaches a compact locator — which is itself a valid locator, because a
+> result floored in one segment is floored again in the next.
+
+> **A truncation marker states how much it took.** `…[truncated for context]…`
+> left the model unable to tell fifty lost characters from fifty thousand, so it
+> could not judge whether recovering them was worth a step — and the cheapest
+> way to find out is to re-run the tool, which is the loop the repeat guard then
+> has to catch. Truncation was *manufacturing* the loop it is supposed to be
+> defending against. Every marker now carries the numbers: chars dropped, chars
+> total, lines total. Two smaller consequences worth keeping: the compaction
+> budget charges a floored result what it **actually** occupies, marker included,
+> since the flat 400 it used to charge now under-states the cost; and the
+> fallback cap that catches a failed spill keeps a head **and** a tail sliced by
+> code point, for the same two reasons the compaction floor does.
 
 > **Classify retries on the HTTP status, never on the provider's prose.** For
 > five days every agent run died on `Key limit exceeded (total limit)`, which
@@ -455,8 +496,33 @@ for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
 > give up ("I don't have a way to get the full file content"). `gh_propose_edit`
 > takes `{ path, old_string, new_string }` edits; the edge function reads the
 > current file, applies them server-side, and commits the result. `old_string`
-> must match exactly and be unique (or pass `replace_all`), and a bad edit comes
-> back as an actionable tool error the model can correct rather than a dead run.
+> must be unique (or pass `replace_all`), and a bad edit comes back as an
+> actionable tool error the model can correct rather than a dead run.
+
+> **Edit matching cascades; it does not demand bytes.** Requiring a byte-exact
+> `old_string` failed on drift that was never semantic — a model that read the
+> file through its own tokenizer emits an em-dash for a hyphen, a curly
+> apostrophe for a straight one, LF against a CRLF file, or drops a trailing
+> space — and the error told it to "match the file EXACTLY … copy the text
+> verbatim", which is advice that cannot work when the copy is already faithful.
+> Four passes now run in order and the **first one that hits wins**: exact →
+> Unicode punctuation and line endings folded → trailing whitespace ignored →
+> indentation ignored. Strictness first is the load-bearing part: an exact match
+> is never reinterpreted, and tolerance is only reached for once nothing
+> stricter matched. Three properties the tests pin: the indentation pass matches
+> **whole lines only** and replaces whole lines, because splicing inside a line
+> would keep the file's indent and add the model's on top — a silent
+> mis-indentation in Python or YAML is a real bug where a failed edit is only a
+> lost step; a needle with **no non-whitespace character** is refused by every
+> tolerant pass, since normalization can empty it (matching at every offset) or
+> fold `\u200B \u00A0` into two ordinary spaces and hit the first pair in the
+> file; and the whitespace scan is **linear**, because rescanning each run from
+> every character is quadratic and one 100k-character stretch of spaces — a
+> minified asset, a padded fixture — hung the tool loop rather than failing an
+> edit. Every non-exact match is reported in the tool result **and written into
+> the PR body**, so the reviewer knows the server matched text the model did not
+> literally write. Verify with `node --experimental-strip-types
+> scripts/test-agent.mjs`.
 
 **Setup (one-time, human — Supabase → Edge Functions → secrets):**
 
