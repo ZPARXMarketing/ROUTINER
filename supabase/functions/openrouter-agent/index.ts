@@ -2283,6 +2283,28 @@ type LoopResult = {
 };
 
 // Run the bounded tool-use loop over `messages` (mutated in place).
+/**
+ * Is switching to FALLBACK_MODEL available right now?
+ *
+ * Shared by the two paths that reach for it: a transient model error, and an
+ * `ok: true` completion carrying neither content nor tool calls. The second is
+ * the same failure — the model returned nothing usable — but OpenRouter does not
+ * flag it as an error, so it has to be recognised here rather than by the
+ * transient classifier.
+ *
+ * @param activeModel the model the loop is using now
+ * @param fellBack whether this run has already switched once
+ * @param budgetMs milliseconds left for another model call
+ * @returns true when a fallback is configured, allowed, different, and affordable
+ */
+function canUseFallbackModel(activeModel: string, fellBack: boolean, budgetMs: number): boolean {
+  return !fellBack
+    && !!FALLBACK_MODEL
+    && FALLBACK_MODEL !== activeModel
+    && allowedModels().has(FALLBACK_MODEL)
+    && budgetMs >= MIN_MODEL_CALL_MS;
+}
+
 async function runAgentLoop(opts: {
   key: string; model: string; tools: unknown[]; messages: any[]; maxSteps?: number;
   runId?: string | null;
@@ -2399,10 +2421,8 @@ async function runAgentLoop(opts: {
       // instead of ending the run — the user cares about the task, not the model.
       // The fallback model runs on the SAME key, so a spent key makes it futile:
       // switching models here just spends another step to fail identically.
-      const canFallBack = !r.exhausted &&
-        isTransientModelError(err, r.status) && !fellBack && FALLBACK_MODEL &&
-        FALLBACK_MODEL !== activeModel && allowedModels().has(FALLBACK_MODEL) &&
-        callBudget() >= MIN_MODEL_CALL_MS;
+      const canFallBack = !r.exhausted && isTransientModelError(err, r.status)
+        && canUseFallbackModel(activeModel, fellBack, callBudget());
       if (canFallBack) {
         fellBack = true;
         actions.push(`model fallback: ${activeModel} → ${FALLBACK_MODEL} after "${err.slice(0, 120)}"`);
@@ -2436,6 +2456,18 @@ async function runAgentLoop(opts: {
     const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
     if (!toolCalls.length || openedPr) {
       finalText = (msg.content || "").toString().trim() || (openedPr ? `Opened a pull request: ${prUrl}` : "");
+      // An ok:true response with neither content nor tool calls is the model
+      // returning nothing — the same class of failure as a transient error,
+      // but it arrives unflagged. Accepting it ends the segment empty, which
+      // counts as no-progress; two in a row kill the run. Fall back once,
+      // exactly as the error path above does, before giving up on the model.
+      if (!finalText && !openedPr
+          && canUseFallbackModel(activeModel, fellBack, callBudget())) {
+        fellBack = true;
+        actions.push(`model fallback: ${activeModel} → ${FALLBACK_MODEL} after empty completion`);
+        activeModel = FALLBACK_MODEL;
+        continue; // costs one step; far cheaper than losing the run
+      }
       messages.push(assistantTurn({ ...msg, content: msg.content || finalText }));
       incomplete = false;
       break;

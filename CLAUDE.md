@@ -253,7 +253,7 @@ threshold before the reaper fires.
 > where it was. **`end_segment`** is the deliberate hand-off: it ends this
 > segment and lets the auto-continue chain start the next one from the goal. It
 > is ungrouped, since the ability to pause cannot depend on which tool groups a
-> run happens to have. Four refusals guard the same thing — that something is
+> run happens to have. Five refusals guard the same thing — that something is
 > left to resume, and a segment left to resume it in: **no goal** (handing off
 > amnesia; the next orientation would read "no goal recorded yet" and start
 > over); a **complete or blocked** goal (one owes a summary, the other stops the
@@ -352,6 +352,19 @@ threshold before the reaper fires.
 > since the flat 400 it used to charge now under-states the cost; and the
 > fallback cap that catches a failed spill keeps a head **and** a tail sliced by
 > code point, for the same two reasons the compaction floor does.
+
+> **A model that returns nothing is failing, even when the response says ok.**
+> An `ok: true` completion carrying neither content nor tool calls was accepted
+> as a finished segment, so the loop broke with empty `finalText` — which
+> `segmentMadeProgress` scores as no progress, and two in a row hard-error the
+> run. The fallback model was never tried, though the error path directly above
+> already falls back: an empty completion is the same failure (the model gave
+> nothing usable), it simply is not flagged as an error by OpenRouter, so it has
+> to be recognised at the call site rather than by the transient classifier. Both
+> paths now share `canUseFallbackModel`, which is where the guards that make a
+> fallback worth spending a step live: once per run, never to the model already
+> running, and never without time left for the call. Diagnosed and fixed by the
+> self-repair routine itself (#88) — the first agent-authored fix to land.
 
 > **Classify retries on the HTTP status, never on the provider's prose.** For
 > five days every agent run died on `Key limit exceeded (total limit)`, which

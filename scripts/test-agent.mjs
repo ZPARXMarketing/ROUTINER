@@ -26,7 +26,7 @@ export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudg
          sliceLines, spillResult, toolGroupOf, toolSpecs,
          normalizeGoal, renderGoal, parseStoredGoal, goalBlockStop, openrouter,
          reconcileGoal, handoffRefusal, splitSpillLocator, shortSpillLocator,
-         MAX_AUTO_CONTINUES };
+         MAX_AUTO_CONTINUES, canUseFallbackModel, FALLBACK_MODEL, MIN_MODEL_CALL_MS };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -680,6 +680,23 @@ eq("end_segment belongs to no group", m.toolGroupOf("end_segment"), "*");
 eq("offered with no groups at all",
    m.toolSpecs(new Set()).some((t) => t.function.name === "end_segment"), true);
 eq("it declares a time budget", m.TOOL_BUDGET_MS.end_segment > 0, true);
+
+console.log("\n— model fallback availability —");
+// Two paths reach for the fallback: a transient model error, and an ok:true
+// completion carrying neither content nor tool calls. The second is the same
+// failure — the model returned nothing usable — but OpenRouter does not flag it,
+// so accepting it ended the segment empty, which scores as no-progress, and two
+// in a row killed the run without the fallback ever being tried.
+const FB = m.FALLBACK_MODEL;
+const PLENTY = m.MIN_MODEL_CALL_MS + 1_000;
+eq("a fallback is available on a healthy run", m.canUseFallbackModel("z-ai/glm-5.2", false, PLENTY), true);
+// Once only: a second switch would spend another step to fail the same way.
+eq("never falls back twice", m.canUseFallbackModel("z-ai/glm-5.2", true, PLENTY), false);
+// Switching to the model already running is a wasted step, not a recovery.
+eq("never falls back to the model already running", m.canUseFallbackModel(FB, false, PLENTY), false);
+// A call that cannot fit in the time left fails on the clock, not the model.
+eq("no fallback without time for the call", m.canUseFallbackModel("z-ai/glm-5.2", false, m.MIN_MODEL_CALL_MS - 1), false);
+eq("exactly the minimum budget is enough", m.canUseFallbackModel("z-ai/glm-5.2", false, m.MIN_MODEL_CALL_MS), true);
 
 console.log("\n— status classification —");
 eq("budget stop detected", m.isBudgetStop("Stopped after the maximum number of tool steps without a final answer."), true);
