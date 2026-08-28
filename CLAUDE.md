@@ -512,6 +512,17 @@ for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
 > must be unique (or pass `replace_all`), and a bad edit comes back as an
 > actionable tool error the model can correct rather than a dead run.
 
+> **The allowlist is the repo boundary; the token is not.** `GITHUB_ALLOWED_REPOS`
+> takes `owner/name` patterns where either half may be `*`, so an org is
+> authorized once rather than enumerated. Two properties the tests pin, both
+> about not widening further than asked: `*` stops at the `/`, so `acme/*`
+> cannot span owners or reach into a deeper path; and a pattern is regex-escaped
+> before `*` is expanded, so `acme/my.repo` authorizes exactly that and never
+> `acme/myXrepo`. A pattern is something the allowlist may hold and never
+> something a caller may ask for — `resolveRepo` refuses a `*` in a requested
+> repo, which would otherwise match its own allowlist entry and then 404 against
+> GitHub with no useful error.
+
 > **Edit matching cascades; it does not demand bytes.** Requiring a byte-exact
 > `old_string` failed on drift that was never semantic — a model that read the
 > file through its own tokenizer emits an em-dash for a hyphen, a curly
@@ -546,7 +557,11 @@ for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
   agent works on when a call doesn't name one.
 - `GITHUB_ALLOWED_REPOS` *(optional)* — comma-separated allowlist. Omitted →
   only `GITHUB_REPO` is reachable (safe default; the agent can't wander to other
-  repos your token happens to reach).
+  repos your token happens to reach). Each entry is `owner/name` and either half
+  may be `*`, matching any run of characters that is not a `/` — so `acme/*` is
+  every repo under `acme`, `*/name` is that repo under any owner, and `*` (or
+  `*/*`) is every repo the token can reach. Widening this is the decision that
+  matters: the token says what the agent *could* touch, this says what it *may*.
 - `AGENT_ALLOW_MERGE` *(optional)* — set to `true` to let `gh_merge_pr` actually
   merge. **Off by default**: until you set it, the agent opens PRs for you to
   review and merge, and merging returns a clear "disabled" message.

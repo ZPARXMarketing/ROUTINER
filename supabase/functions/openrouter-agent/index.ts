@@ -238,21 +238,54 @@ const GH_MAX_FILES = Math.min(num("AGENT_GH_MAX_FILES", 10), 30);
 const GH_MAX_FILE_CHARS = Math.min(num("AGENT_GH_MAX_FILE_CHARS", 400_000), 1_000_000);
 // Default window when the model pages a large file with start_line/max_lines.
 const GH_READ_DEFAULT_LINES = Math.min(num("AGENT_GH_READ_DEFAULT_LINES", 400), 2_000);
-// null = "only the default repo is allowed"; a set = that explicit allowlist.
-const ghAllowedRepos = (): Set<string> | null => {
+// null = "only the default repo is allowed"; a list = those explicit patterns.
+const ghAllowedRepos = (): string[] | null => {
   const raw = Deno.env.get("GITHUB_ALLOWED_REPOS");
   if (!raw) return null;
-  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  return list.length ? new Set(list.map((s) => s.toLowerCase())) : null;
+  const list = raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return list.length ? list : null;
 };
+
+/**
+ * Does a concrete repo match one allowlist pattern?
+ *
+ * A pattern is `owner/name` where either half may be `*`, matching any run of
+ * characters that is not a `/`. So `acme/*` is every repo under `acme` and
+ * `*` on its own — shorthand for the equally valid `*\/*` — is every repo the
+ * token can reach. Bounding `*` at the `/` is what keeps `acme/*` from
+ * spanning owners.
+ *
+ * The pattern is regex-escaped BEFORE `*` is expanded, so a repo name's `.` or
+ * `+` matches itself instead of acting as a metacharacter — otherwise
+ * `acme/my.repo` would also authorize `acme/myXrepo`.
+ *
+ * @param repo a concrete lowercase `owner/name`
+ * @param pattern one lowercase allowlist entry
+ * @returns true when the pattern covers that repo
+ */
+function repoMatchesPattern(repo: string, pattern: string): boolean {
+  const p = pattern === "*" ? "*/*" : pattern;
+  const rx = new RegExp(
+    "^" + p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*/g, "[^/]*") + "$",
+  );
+  return rx.test(repo);
+}
+
 // Resolve + authorize the repo for a code tool call.
 function resolveRepo(arg?: unknown): { repo?: string; error?: string } {
   const def = GH_DEFAULT_REPO();
   const allow = ghAllowedRepos();
   const want = (typeof arg === "string" && arg.trim()) ? arg.trim() : def;
   if (!want) return { error: "no repo: set the GITHUB_REPO edge secret or pass repo as 'owner/name'." };
+  // A pattern is a thing the ALLOWLIST may contain, never a thing a caller may
+  // ask for: `owner/*` passes the shape check below, and without this it would
+  // match its own allowlist entry and then 404 against GitHub as a repo name.
+  if (want.includes("*")) return { error: `bad repo '${want}' — name one repo, not a pattern.` };
   if (!/^[^/\s]+\/[^/\s]+$/.test(want)) return { error: `bad repo '${want}' — want 'owner/name'.` };
-  if (allow) { if (!allow.has(want.toLowerCase())) return { error: `repo '${want}' is not in GITHUB_ALLOWED_REPOS.` }; }
+  if (allow) {
+    const ok = allow.some((pattern) => repoMatchesPattern(want.toLowerCase(), pattern));
+    if (!ok) return { error: `repo '${want}' is not in GITHUB_ALLOWED_REPOS.` };
+  }
   else if (def && want.toLowerCase() !== def.toLowerCase()) return { error: `repo '${want}' not allowed (only '${def}'); set GITHUB_ALLOWED_REPOS to widen.` };
   return { repo: want };
 }
