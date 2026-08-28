@@ -286,7 +286,14 @@ function resolveRepo(arg?: unknown): { repo?: string; error?: string } {
     const ok = allow.some((pattern) => repoMatchesPattern(want.toLowerCase(), pattern));
     if (!ok) return { error: `repo '${want}' is not in GITHUB_ALLOWED_REPOS.` };
   }
-  else if (def && want.toLowerCase() !== def.toLowerCase()) return { error: `repo '${want}' not allowed (only '${def}'); set GITHUB_ALLOWED_REPOS to widen.` };
+  // Neither an allowlist nor a default repo: nothing has said which repos this
+  // deployment is for, so every repo the token reaches was authorized — the
+  // opposite of the documented safe default, and reached by leaving a secret
+  // unset rather than by setting one wrong. Configure the scope or have none.
+  else if (!def) {
+    return { error: "no repo scope configured: set GITHUB_REPO, or GITHUB_ALLOWED_REPOS, before the agent can touch a repo." };
+  }
+  else if (want.toLowerCase() !== def.toLowerCase()) return { error: `repo '${want}' not allowed (only '${def}'); set GITHUB_ALLOWED_REPOS to widen.` };
   return { repo: want };
 }
 // Block high-risk write paths (CI secrets exfil, env keys, credential dumps). Reads stay open.

@@ -745,6 +745,15 @@ eq("…and still matches itself", M("acme/my.repo", "acme/my.repo"), true);
 eq("other regex metacharacters are literal too", M("acme/aaa", "acme/a+"), false);
 // A pattern is something the allowlist may hold, never something a caller may
 // ask for — otherwise `acme/*` would authorize itself and then 404 on GitHub.
+// With neither GITHUB_REPO nor GITHUB_ALLOWED_REPOS set, nothing has said which
+// repos this deployment is for — and that used to authorize every repo the token
+// could reach. The unconfigured case is reached by leaving a secret unset rather
+// than setting one wrong, so it has to fail closed rather than open.
+// (The test harness stubs every env var as undefined, which IS that case.)
+eq("no scope configured authorizes nothing",
+   !!m.resolveRepo("someoneelse/private").error, true);
+eq("…and says which secret to set",
+   /set GITHUB_REPO, or GITHUB_ALLOWED_REPOS/.test(m.resolveRepo("someoneelse/private").error), true);
 eq("a caller cannot request a pattern", !!m.resolveRepo("acme/*").error, true);
 eq("…and the error says why", /not a pattern/.test(m.resolveRepo("acme/*").error), true);
 
