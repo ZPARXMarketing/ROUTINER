@@ -521,7 +521,11 @@ for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
 > `acme/myXrepo`. A pattern is something the allowlist may hold and never
 > something a caller may ask for — `resolveRepo` refuses a `*` in a requested
 > repo, which would otherwise match its own allowlist entry and then 404 against
-> GitHub with no useful error.
+> GitHub with no useful error. And a deployment that sets **neither**
+> `GITHUB_REPO` nor `GITHUB_ALLOWED_REPOS` now authorizes nothing rather than
+> everything the token can reach: that state is reached by leaving a secret
+> unset rather than by setting one wrong, which is exactly how a fail-open
+> default goes unnoticed.
 
 > **Edit matching cascades; it does not demand bytes.** Requiring a byte-exact
 > `old_string` failed on drift that was never semantic — a model that read the
