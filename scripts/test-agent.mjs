@@ -26,7 +26,8 @@ export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudg
          sliceLines, spillResult, toolGroupOf, toolSpecs,
          normalizeGoal, renderGoal, parseStoredGoal, goalBlockStop, openrouter,
          reconcileGoal, handoffRefusal, splitSpillLocator, shortSpillLocator,
-         MAX_AUTO_CONTINUES, canUseFallbackModel, FALLBACK_MODEL, MIN_MODEL_CALL_MS };
+         MAX_AUTO_CONTINUES, canUseFallbackModel, FALLBACK_MODEL, MIN_MODEL_CALL_MS,
+         repoMatchesPattern, resolveRepo };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -719,6 +720,33 @@ eq("gh_list_prs listing PRs", m.detectOpenedPr("gh_list_prs", OK).opened, false)
 eq("failed propose_edit", m.detectOpenedPr("gh_propose_edit", "error: open PR → 422: already exists").opened, false);
 eq("phrase not at start of a PR tool result", m.detectOpenedPr("gh_propose_edit",
   "note: the template says opened PR #1").opened, false);
+
+console.log("\n— repo allowlist patterns —");
+// GITHUB_ALLOWED_REPOS entries may use `*` in either half of owner/name, so an
+// org can be authorized once instead of enumerated. Everything here is lowercase
+// because resolveRepo lowercases before matching.
+const M = m.repoMatchesPattern;
+eq("an exact entry still matches itself", M("acme/routiner", "acme/routiner"), true);
+eq("an exact entry matches nothing else", M("acme/other", "acme/routiner"), false);
+eq("owner/* covers a repo in that owner", M("acme/anything", "acme/*"), true);
+// The whole point of bounding `*` at the slash: an org wildcard must not span owners.
+eq("owner/* does NOT span owners", M("evilcorp/anything", "acme/*"), false);
+eq("owner/* does not match the owner alone", M("acme", "acme/*"), false);
+// A `*` inside a path cannot be allowed to swallow the separator either.
+eq("owner/* does not reach into a deeper path", M("acme/a/b", "acme/*"), false);
+eq("*/* is everything", M("anyone/anything", "*/*"), true);
+eq("bare * is shorthand for */*", M("anyone/anything", "*"), true);
+eq("*/name pins the repo name across owners", M("other/routiner", "*/routiner"), true);
+eq("*/name rejects a different name", M("other/nope", "*/routiner"), false);
+// The pattern is regex-escaped before `*` is expanded. Without that, a dot in a
+// real repo name would match any character and silently widen the allowlist.
+eq("a dot in a repo name is literal", M("acme/myxrepo", "acme/my.repo"), false);
+eq("…and still matches itself", M("acme/my.repo", "acme/my.repo"), true);
+eq("other regex metacharacters are literal too", M("acme/aaa", "acme/a+"), false);
+// A pattern is something the allowlist may hold, never something a caller may
+// ask for — otherwise `acme/*` would authorize itself and then 404 on GitHub.
+eq("a caller cannot request a pattern", !!m.resolveRepo("acme/*").error, true);
+eq("…and the error says why", /not a pattern/.test(m.resolveRepo("acme/*").error), true);
 
 console.log("\n— write-path guards (must not regress) —");
 eq("blocks .github", !!m.deniedWritePath(".github/workflows/deploy.yml"), true);
