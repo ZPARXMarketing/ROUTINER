@@ -218,6 +218,65 @@ console.log('\nStalls recover instead of hanging');
   await ctx.close();
 }
 
+/* ── Chat: starting one, without first inventing a routine ─────────────────
+   A conversation used to require a routine — you made a scheduled thing, ran
+   it, and its run was the only thread you could talk to. The New chat composer
+   is the fix, and it has no coverage anywhere else: it lives entirely in the
+   pane whose height chain has already broken twice on real devices. */
+{
+  const AGENT_SETTINGS = {
+    user_id: 'test-user', fire_enabled: true, model_policy: null,
+    accounts: [{
+      id: 'acc_kimi', label: 'Kimi', kind: 'openrouter-agent', key: '',
+      triggers: [{ id: 't_a', label: 'A', trigger: '', token: '', model: 'moonshotai/kimi-k2.7-code', tools: ['read', 'research', 'write', 'schedule'] }],
+    }],
+  };
+  const ctx = await browser.newContext({ viewport: { width: 1100, height: 700 } });
+  let posted = null;
+  await ctx.route('**/*.supabase.co/**', (route) => {
+    const url = route.request().url();
+    const json = (body, headers = {}) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body), headers });
+    if (url.includes('/auth/v1/')) return json({});
+    // The agent endpoint: record what the composer actually sent, then answer
+    // as the edge function would for a run that finished in one segment.
+    if (url.includes('/functions/v1/openrouter-agent')) {
+      posted = JSON.parse(route.request().postData() || '{}');
+      return json({ ok: true, runId: 'run-1', output: 'On it.', steps: 1, cost: 0.0001, model: 'moonshotai/kimi-k2.7-code' });
+    }
+    if (url.includes('routiner_settings')) return json(AGENT_SETTINGS);
+    return json([], { 'content-range': '0-0/0' });
+  });
+  await ctx.route('**fonts.g**', (r) => r.abort());
+  const page = await ctx.newPage();
+  await page.addInitScript((s) => localStorage.setItem('routiner-auth', s), STORED);
+  await page.goto(BASE, { waitUntil: 'load' });
+  await page.waitForSelector('.topbar', { timeout: 20000 }).catch(() => {});
+
+  console.log('\nChat can be started without a routine');
+  // With no runs at all, the pane must be somewhere to type — not the dead-end
+  // "Nothing here yet" card it used to be.
+  const composerUp = await page.waitForSelector('#chat-input', { timeout: 10000 }).then(() => true, () => false);
+  check('an empty Chat opens on the composer, not a dead end', composerUp, await seen(page));
+  check('the rail offers a New chat button', await page.isVisible('#hx-new'));
+
+  if (composerUp) {
+    await page.fill('#chat-input', 'Draft the launch email, then check the metrics tomorrow at 9am.');
+    await page.click('#chat-send');
+    await page.waitForTimeout(800);
+    check('sending posts a fresh run', !!posted && !posted.runId, JSON.stringify(posted || {}).slice(0, 160));
+    check('…on the configured instance', posted?.account === 'acc_kimi' && posted?.triggerKey === 't_a');
+    check("…with that instance's model and tools",
+      posted?.model === 'moonshotai/kimi-k2.7-code' && (posted?.tools || []).includes('schedule'));
+    // The title has to come from the message: a chat has no routine to borrow
+    // a name from, and an untitled rail row is unfindable.
+    check('…titled from the message', /^Draft the launch email/.test(posted?.title || ''), posted?.title);
+    // Only the browser knows where the reader is, and "9am tomorrow" is
+    // meaningless without it — a missing zone schedules work overnight.
+    check("…carrying the reader's timezone", typeof posted?.tz === 'string' && posted.tz.length > 0, posted?.tz);
+  }
+  await ctx.close();
+}
+
 await browser.close();
 server.close();
 console.log(`\n${fail ? 'FAILURES' : 'ALL PASS'}: ${pass} passed, ${fail} failed`);

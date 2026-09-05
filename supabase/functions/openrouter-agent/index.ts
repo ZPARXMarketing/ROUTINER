@@ -125,6 +125,11 @@ const FALLBACK_MODEL = (Deno.env.get("AGENT_FALLBACK_MODEL") ?? "moonshotai/kimi
 const CONTEXT_TOOL_BUDGET = budgetNum("AGENT_CONTEXT_TOOL_BUDGET", 60_000);
 const AUTO_CONTINUE_PROMPT =
   "[auto-continue] Resume the task from the transcript. Do NOT re-read files or re-list directories you already saw. Prefer finishing work (gh_propose_edit / write tools) over exploring — if you have read enough to make the change, make it now. When done, reply with a short final summary including any PR links — use no further tools if the work is complete.";
+// Answer to a segment that stopped to ask permission, or left its own goal with
+// work outstanding. Nobody is at the keyboard to type "proceed": the chain says
+// it for them, once, and tells the model not to ask again.
+const AUTO_PROCEED_PROMPT =
+  "[proceed] Yes — go ahead, and do not ask again. You do not need permission for anything within the task you were given; the human is not waiting at the keyboard and every question costs a whole round trip. Carry out the work you just described, then reply with the result. If you genuinely need a decision only the human can make (a credential, a choice between two things they care about, an irreversible action outside the task), call set_goal with phase='blocked' and a blocked_message saying exactly what you need — that, not a question in prose, is how you reach them.";
 
 // ── Message provenance ───────────────────────────────────────────────────────
 // A turn the machine injected is NOT a turn the human typed, and until now the
@@ -134,6 +139,7 @@ const AUTO_CONTINUE_PROMPT =
 // interjection. `_source` is carried on the message itself so the distinction
 // survives into the stored transcript and the UI, not just this invocation.
 const SRC_AUTO_CONTINUE = "auto-continue";
+const SRC_AUTO_PROCEED = "auto-proceed";
 const SRC_REPEAT_GUARD = "repeat-guard";
 const SRC_ORIENTATION = "orientation";
 /** A `user` turn actually typed by a person (no `_source` = a human reply). */
@@ -185,6 +191,7 @@ const TOOL_BUDGET_MS: Record<string, number> = {
   read_spill: 15_000, set_goal: 15_000, end_segment: 5_000,
   read_routines: 15_000, read_notes: 15_000, read_runs: 20_000, read_leads: 15_000,
   write_note: 15_000, write_routine: 15_000,
+  schedule_task: 15_000, reschedule_task: 15_000, cancel_task: 15_000,
   gh_read_file: 30_000, gh_read_pr: 30_000, gh_read_issue: 30_000,
   gh_list_prs: 20_000, gh_list_issues: 20_000, gh_comment_pr: 20_000, gh_merge_pr: 30_000,
   // Multi-request: branch → per-file read+write → open PR.
@@ -849,8 +856,127 @@ function toolGroupOf(name: string): string | null {
   if (name === "read_routines" || name === "read_notes" || name === "read_leads" || name === "read_runs") return "read";
   if (name === "web_research") return "research";
   if (name === "write_note" || name === "find_and_save_leads") return "write";
+  if (name === "schedule_task" || name === "reschedule_task" || name === "cancel_task") return "schedule";
   if (name.startsWith("gh_")) return "code";
   return null;
+}
+
+// ── Delegating work across time ──────────────────────────────────────────────
+// A Routiner routine IS a future agent run: the scheduler fires `prompt` on
+// `account`/`trigger_key` at `scheduled_at`. So "do this now, then check again
+// tomorrow, then write it up on Friday" needs no new machinery — it needs the
+// model to be able to write those rows itself, which is what the `schedule`
+// group is. Every scheduled task inherits the instance that scheduled it, so a
+// delegated task runs with the same model, key and tools as the conversation
+// that planned it.
+
+/** How far ahead a task may be scheduled. A year is past any plan worth one row. */
+const MAX_SCHEDULE_AHEAD_MS = 366 * 24 * 60 * 60 * 1000;
+const RECURRENCES = new Set(["none", "daily", "weekdays", "weekly"]);
+
+/**
+ * Resolve a scheduling request to an absolute UTC instant.
+ *
+ * Two forms, because models are unreliable at date arithmetic and reliable at
+ * counting: `in_minutes` is a relative offset from now, `at` an ISO 8601
+ * timestamp. `at` without a zone designator is read in `tz` — a model told the
+ * owner's timezone writes "2026-09-06T09:00" and means 9am where they live, and
+ * silently reading that as UTC is how a morning task lands in the middle of the
+ * night.
+ *
+ * @param args the tool call's `at` / `in_minutes` fields
+ * @param nowMs the current instant in epoch milliseconds
+ * @param tz IANA zone for a zone-less `at` (default UTC)
+ * @returns the resolved ISO instant, or an error string explaining the refusal
+ */
+function resolveWhen(
+  args: { at?: unknown; in_minutes?: unknown },
+  nowMs: number,
+  tz?: string | null,
+): { iso: string } | { error: string } {
+  const rel = args.in_minutes;
+  if (rel != null && rel !== "") {
+    const mins = Number(rel);
+    if (!Number.isFinite(mins)) return { error: "in_minutes must be a number of minutes from now" };
+    const t = nowMs + mins * 60_000;
+    if (mins < 0) return { error: "in_minutes must not be negative — schedule work in the future" };
+    if (t - nowMs > MAX_SCHEDULE_AHEAD_MS) return { error: "that is more than a year out; schedule something sooner" };
+    return { iso: new Date(t).toISOString() };
+  }
+  const at = typeof args.at === "string" ? args.at.trim() : "";
+  if (!at) return { error: "give either at (ISO 8601 timestamp) or in_minutes (offset from now)" };
+  const t = parseInstant(at, tz);
+  if (t == null) return { error: `could not read "${at}" as a timestamp — use ISO 8601, e.g. 2026-09-06T09:00` };
+  if (t - nowMs > MAX_SCHEDULE_AHEAD_MS) return { error: "that is more than a year out; schedule something sooner" };
+  return { iso: new Date(t).toISOString() };
+}
+
+/**
+ * Parse an ISO 8601 timestamp, reading a zone-less one as local time in `tz`.
+ *
+ * Deno has no zone-aware constructor, so a zone-less stamp is first read as UTC
+ * and then corrected by the offset `tz` had at that instant — computed by
+ * formatting the guess in `tz` and measuring how far the result drifted. One
+ * correction pass settles every case except a stamp inside a DST fold, where
+ * the offset changes across the guess itself; a second pass converges there.
+ *
+ * @param text an ISO 8601 timestamp, with or without a zone designator
+ * @param tz IANA zone to interpret a zone-less stamp in
+ * @returns epoch milliseconds, or null when the text is not a timestamp
+ */
+function parseInstant(text: string, tz?: string | null): number | null {
+  const hasZone = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(text);
+  const base = Date.parse(hasZone ? text : `${text.replace(" ", "T")}Z`);
+  if (!Number.isFinite(base)) return null;
+  if (hasZone || !tz || tz === "UTC") return base;
+  let guess = base;
+  for (let i = 0; i < 2; i++) {
+    const off = zoneOffsetMs(guess, tz);
+    if (off == null) return base;
+    const next = base - off;
+    if (next === guess) break;
+    guess = next;
+  }
+  return guess;
+}
+
+/**
+ * Narrow a caller-supplied timezone to one `Intl` actually knows.
+ *
+ * The value comes from a browser, so it is never trusted; an unusable one costs
+ * only UTC scheduling, which is why this returns null rather than refusing the
+ * whole request.
+ *
+ * @param tz the candidate zone name
+ * @returns the zone name when valid, else null
+ */
+function validTimeZone(tz: unknown): string | null {
+  const name = typeof tz === "string" ? tz.trim() : "";
+  if (!name || name.length > 64) return null;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: name }).format(0);
+    return name;
+  } catch { return null; }
+}
+
+/**
+ * The offset of `tz` from UTC at `instantMs`, in milliseconds.
+ *
+ * @param instantMs the instant to measure the offset at
+ * @param tz IANA zone name
+ * @returns offset in ms (east of UTC positive), or null when `tz` is not a zone
+ */
+function zoneOffsetMs(instantMs: number, tz: string): number | null {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, hour12: false,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    }).formatToParts(new Date(instantMs));
+    const get = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+    const asUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour") % 24, get("minute"), get("second"));
+    return Number.isFinite(asUtc) ? asUtc - instantMs : null;
+  } catch { return null; }
 }
 
 // The single owner user_id, resolved from a routineId when given (so the run row
@@ -1150,6 +1276,29 @@ function toolSpecs(enabled: Set<string>): unknown[] {
         } } } },
     );
   }
+  // Schedule — delegating work to a future run of this same instance.
+  if (enabled.has("schedule")) {
+    specs.push(
+      { type: "function", function: { name: "schedule_task", description: "Delegate a task to a future run. Writes a Routiner routine that fires at the time you give it, on this same instance (same model, key and tools), and shows up on the owner's Calendar. Use this to spread work across time — a multi-day plan is several schedule_task calls, one per step, in order. Do NOT use it to postpone work you could do right now.",
+        parameters: { type: "object", required: ["title", "prompt"], properties: {
+          title: { type: "string", description: "short calendar label, e.g. 'Draft the launch email'" },
+          prompt: { type: "string", description: "the full instructions the future run will receive — it starts with NO memory of this conversation, so restate everything it needs" },
+          at: { type: "string", description: "ISO 8601 time to run, e.g. 2026-09-06T09:00 (read in the owner's timezone unless you add a zone)" },
+          in_minutes: { type: "number", description: "alternative to `at`: minutes from now" },
+          recurrence: { type: "string", enum: ["none", "daily", "weekdays", "weekly"], description: "default none (a one-off)" },
+          duration_min: { type: "number", description: "calendar block length in minutes (default 45)" },
+        } } } },
+      { type: "function", function: { name: "reschedule_task", description: "Move an already-scheduled task to a different time, or change how it repeats. Get ids from read_routines.",
+        parameters: { type: "object", required: ["id"], properties: {
+          id: { type: "string", description: "the routine's id" },
+          at: { type: "string", description: "new ISO 8601 time" },
+          in_minutes: { type: "number", description: "alternative to `at`: minutes from now" },
+          recurrence: { type: "string", enum: ["none", "daily", "weekdays", "weekly"] },
+        } } } },
+      { type: "function", function: { name: "cancel_task", description: "Take a scheduled task off the calendar (archives the routine — it is not deleted). Get ids from read_routines.",
+        parameters: { type: "object", required: ["id"], properties: { id: { type: "string", description: "the routine's id" } } } } },
+    );
+  }
   // Code (GitHub) — only offered when a token is configured, so the model never
   // reaches for a capability the deployment can't back.
   if (enabled.has("code") && GH_TOKEN()) {
@@ -1209,6 +1358,10 @@ async function runTool(
   ctx: {
     userId: string | null; key: string; account: string | null; triggerKey: string | null;
     enabled: Set<string>; timeoutMs?: number; runId?: string | null;
+    /** The run's model id, inherited by anything it schedules for later. */
+    model?: string | null;
+    /** IANA zone the owner reads times in; anchors zone-less scheduling. */
+    tz?: string | null;
     goalRef?: { current: RunGoal | null };
     handoffRef?: { current: string | null };
     segmentDepth?: number;
@@ -1374,6 +1527,85 @@ async function runTool(
         if (!res.ok || data.ok === false) return `error: ${data.error || `enrichment HTTP ${res.status}`}`;
         const t = data.totals || {};
         return `saved ${t.inserted ?? 0} new lead(s) to Command's Review tab (~$${Number(t.cost || 0).toFixed(4)}).`;
+      }
+
+      // ── Schedule (delegate work to a future run) ──────────────────────────
+      case "schedule_task": {
+        const title = String(args.title || "").trim();
+        const taskPrompt = String(args.prompt || "").trim();
+        if (!title) return "error: missing title";
+        if (!taskPrompt) return "error: missing prompt — the future run starts with no memory of this conversation, so it needs full instructions";
+        if (!ctx.userId) return "error: could not resolve owner to schedule the task";
+        const when = resolveWhen(args, Date.now(), ctx.tz);
+        if ("error" in when) return `error: ${when.error}`;
+        const recurrence = String(args.recurrence || "none");
+        if (!RECURRENCES.has(recurrence)) return `error: recurrence must be one of ${[...RECURRENCES].join(", ")}`;
+        const row = {
+          user_id: ctx.userId,
+          title: title.slice(0, 200),
+          prompt: taskPrompt,
+          // The delegated run is this instance, later: same account, trigger,
+          // model and tool groups. Anything else would schedule work the
+          // planning conversation has no reason to believe can be done.
+          account: ctx.account,
+          trigger_key: ctx.triggerKey,
+          model: ctx.model || "auto",
+          status: "scheduled",
+          recurrence,
+          scheduled_at: when.iso,
+          duration_min: Math.min(Math.max(Number(args.duration_min) || 45, 5), 480),
+          tz: ctx.tz || null,
+        };
+        const res = await fetch(rest("routiner_routines"), {
+          method: "POST", headers: { ...H(), Prefer: "return=representation" },
+          body: JSON.stringify(row),
+        });
+        if (!res.ok) return `error: could not schedule (${res.status} ${(await res.text().catch(() => "")).slice(0, 200)})`;
+        const saved = (await res.json().catch(() => []))?.[0];
+        return `scheduled "${row.title}" for ${when.iso}${recurrence === "none" ? "" : ` (repeats ${recurrence})`}`
+          + `${saved?.id ? ` — id ${saved.id}` : ""}. It runs on this instance and appears on the Calendar.`;
+      }
+      case "reschedule_task": {
+        const id = String(args.id || "").trim();
+        if (!id) return "error: missing id";
+        const patch: Record<string, unknown> = {};
+        if (args.at != null || args.in_minutes != null) {
+          const when = resolveWhen(args, Date.now(), ctx.tz);
+          if ("error" in when) return `error: ${when.error}`;
+          patch.scheduled_at = when.iso;
+          patch.status = "scheduled";
+        }
+        if (args.recurrence != null) {
+          const recurrence = String(args.recurrence);
+          if (!RECURRENCES.has(recurrence)) return `error: recurrence must be one of ${[...RECURRENCES].join(", ")}`;
+          patch.recurrence = recurrence;
+        }
+        if (!Object.keys(patch).length) return "error: nothing to change — give at/in_minutes and/or recurrence";
+        // Scoped to the owner. These run on the service-role key, which bypasses
+        // RLS, so an id is not by itself permission to touch a row — an id the
+        // model guessed or read from anywhere else must not reach another user's
+        // calendar. The same scope makes "no such routine" the honest answer.
+        if (!ctx.userId) return "error: could not resolve owner";
+        const res = await fetch(rest(`routiner_routines?id=eq.${encodeURIComponent(id)}&${owner}`.replace(/&$/, "")), {
+          method: "PATCH", headers: { ...H(), Prefer: "return=representation" }, body: JSON.stringify(patch),
+        });
+        if (!res.ok) return `error: reschedule failed (${res.status})`;
+        const rows = await res.json().catch(() => []);
+        if (!rows?.length) return `error: no routine with id ${id}`;
+        return `rescheduled "${rows[0].title || id}" → ${rows[0].scheduled_at} (${rows[0].recurrence})`;
+      }
+      case "cancel_task": {
+        const id = String(args.id || "").trim();
+        if (!id) return "error: missing id";
+        if (!ctx.userId) return "error: could not resolve owner";
+        const res = await fetch(rest(`routiner_routines?id=eq.${encodeURIComponent(id)}&${owner}`.replace(/&$/, "")), {
+          method: "PATCH", headers: { ...H(), Prefer: "return=representation" },
+          body: JSON.stringify({ status: "archived", scheduled_at: null }),
+        });
+        if (!res.ok) return `error: cancel failed (${res.status})`;
+        const rows = await res.json().catch(() => []);
+        if (!rows?.length) return `error: no routine with id ${id}`;
+        return `cancelled (archived) "${rows[0].title || id}" — it will not fire.`;
       }
 
       // ── Code (GitHub) ─────────────────────────────────────────────────────
@@ -1614,9 +1846,39 @@ function segmentOrientation(depth: number, elapsedMs: number, wallMs: number): s
       : "Unfinished work carries to the next segment, but each hand-off costs time — prefer finishing.");
 }
 
-function buildSystem(model: string, toolList: string): string {
-  return `You are a Routiner agent instance running the model ${model}. You complete the user's task fully — like a coding agent that keeps going until the job is done. Results are saved to Routiner History; the user can also reply later.
+/**
+ * The run's standing instructions.
+ *
+ * Rebuilt every segment (including for stored transcripts), so a rule added
+ * here reaches runs that started before it existed.
+ *
+ * @param model the model id serving this run
+ * @param toolList the enabled tool groups, comma-separated
+ * @param opts `tz` the owner's IANA zone, `now` the current instant
+ * @returns the system message content
+ */
+function buildSystem(model: string, toolList: string, opts: { tz?: string | null; now?: Date } = {}): string {
+  const now = opts.now || new Date();
+  const tz = opts.tz || "UTC";
+  let local = "";
+  try {
+    local = new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz, dateStyle: "full", timeStyle: "short",
+    }).format(now);
+  } catch { local = ""; }
+  const clock = `Right now it is ${now.toISOString()} (UTC).`
+    + (local ? ` The owner's timezone is ${tz}, where that is ${local}.` : "");
+  return `You are a Routiner agent instance running the model ${model}. You complete the user's task fully — like a coding agent that keeps going until the job is done. This is a conversation: results are saved to Routiner History and the user can reply to any run to keep it going.
 You have these tool capabilities: ${toolList}.
+${clock}
+
+Never ask for permission to continue (critical):
+- Nobody is watching this run. A question in your reply ENDS the run — the human may not see it for hours, and answering "proceed" is a whole round trip that tells you nothing you didn't already know.
+- So: never close a turn with "shall I proceed?", "would you like me to…?", "let me know if you want…". If you were about to ask that, do the thing instead and report what happened.
+- The task you were given is the authorization. You do not need a second one for any step inside it.
+- If you genuinely need something only the human can supply — a credential, a choice between options they care about, an action outside the task with consequences they haven't agreed to — call set_goal with phase='blocked', a short blocked_code and a blocked_message saying exactly what you need. That reaches them. Prose questions do not.
+- Reply with text only when the work is DONE (or blocked). Text is the end of the run, not a pause; to pause mid-task, call end_segment.
+- Keep set_goal's \`remaining\` honest: a non-empty \`remaining\` on an active goal means the run resumes. Empty it as you finish, and set phase='complete' when done.
 
 Efficiency rules (critical — you have limited steps per segment):
 - Prefer acting over exploring. A 404 on a read is corrected for you automatically when it's only a casing difference, and otherwise comes back with the real directory listing — read that listing instead of guessing again.
@@ -1631,6 +1893,13 @@ Efficiency rules (critical — you have limited steps per segment):
 - Use read_* / web_research only when needed for the task. Skip them for pure code edits when the user already named the file/repo.
 - gh_merge_pr only if merge is enabled and the head is agent/*; when unsure, open the PR and stop.
 - When the work is done (PR opened, note saved, research answered), write a concise final summary and call NO more tools.
+
+Delegating work across time (when the schedule tools are enabled):
+- schedule_task writes a real calendar block that fires on this same instance later. Use it when the user asks for work spread over time, for a recurring check, or when a step genuinely cannot happen yet (waiting on a deploy, a review, tomorrow's data).
+- A plan across days is several schedule_task calls, one per step, in the order they should run. Say what you scheduled and when.
+- Each scheduled run starts with NO memory of this conversation. Write its \`prompt\` as complete standing instructions: what to do, where, what "done" looks like, and any ids or URLs it will need.
+- Do not schedule work you could do right now — do that work, then schedule only what has to wait.
+- Times: pass \`at\` as ISO 8601 (read in the owner's timezone unless you add a zone) or \`in_minutes\` for an offset. Use the clock above; do not guess today's date.
 
 Do not claim to have done something a tool did not confirm.`;
 }
@@ -2168,7 +2437,12 @@ async function isRunCancelled(runId: string | null): Promise<boolean> {
 // Uses EdgeRuntime.waitUntil when available so work continues after we respond.
 // `noProgress` is the consecutive no-progress streak (carried in the POST body
 // like continueDepth — no DB state needed).
-function scheduleAutoContinue(runId: string, depth: number, noProgress = 0): boolean {
+function scheduleAutoContinue(
+  runId: string,
+  depth: number,
+  noProgress = 0,
+  opts: { reason?: ContinueReason; tz?: string | null } = {},
+): boolean {
   if (!SB_URL || !SB_KEY || !runId) return false;
   if (depth >= MAX_AUTO_CONTINUES) return false;
   const url = `${SB_URL}/functions/v1/openrouter-agent`;
@@ -2181,8 +2455,10 @@ function scheduleAutoContinue(runId: string, depth: number, noProgress = 0): boo
     },
     body: JSON.stringify({
       runId,
-      prompt: AUTO_CONTINUE_PROMPT,
+      prompt: opts.reason === "proceed" ? AUTO_PROCEED_PROMPT : AUTO_CONTINUE_PROMPT,
       autoContinue: true,
+      continueReason: opts.reason || "segment",
+      ...(opts.tz ? { tz: opts.tz } : {}),
       continueDepth: depth + 1,
       noProgress,
     }),
@@ -2199,15 +2475,111 @@ function scheduleAutoContinue(runId: string, depth: number, noProgress = 0): boo
   return true;
 }
 
+/** Why the next segment is being spawned. `proceed` answers a permission ask. */
+type ContinueReason = "segment" | "proceed";
+
+// ── "Shall I proceed?" ───────────────────────────────────────────────────────
+// Replying with text ends the whole run, so a model that closes a turn by
+// asking for the go-ahead does not pause — it STOPS, and the run sits there
+// until a human types "proceed". That round trip is the single most common
+// reason a Routiner chat feels like babysitting rather than delegation, and it
+// is never information the human actually supplied: the answer is always yes,
+// because the work was already authorized when the task was given.
+//
+// Two independent tells, either of which resumes the chain:
+//
+//  1. The model's own goal still reads `phase: active` with work in
+//     `remaining` — it said, in the one place compaction never touches, that
+//     it is not finished.
+//  2. The final text is shaped like a request for permission.
+//
+// The escape hatch is `set_goal phase='blocked'`, which stops the chain with a
+// named cause (goalBlockStop). A question in prose is not a block: prose cannot
+// be distinguished from thinking out loud, which is exactly how runs used to
+// die holding a question nobody was there to answer.
+
+/**
+ * Does `text` end by asking for permission to keep going?
+ *
+ * Deliberately anchored to the tail: a summary may discuss options at length
+ * and still close by stating what it did. Only the closing move decides.
+ *
+ * @param text the model's final text for the segment
+ * @returns true when the last thing it did was ask to be told to proceed
+ */
+function asksForGoAhead(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return false;
+  // The ask is a closing move, so only the tail can carry it. 400 chars covers
+  // a closing paragraph without letting a mid-summary aside trigger it.
+  const tail = t.slice(-400);
+  return [
+    /\b(shall|should|may|can)\s+i\b[^.?!]*\?/i,
+    /\bwould you like me to\b/i,
+    /\bdo you want me to\b/i,
+    /\bwant me to\b[^.?!]*\?/i,
+    /\blet me know (if|whether|when)\b/i,
+    /\b(say|reply|type)\s+["'“]?(yes|proceed|continue|go)\b/i,
+    /\b(if|once) you (confirm|approve|agree|are happy)\b/i,
+    /\bawaiting (your )?(confirmation|approval|go-?ahead|instructions|sign-?off)\b/i,
+    /\b(before|pending) (your )?(confirmation|approval|go-?ahead|sign-?off)\b/i,
+    /\byour (approval|confirmation|go-?ahead|sign-?off)\b/i,
+    /\b(ready|happy) to (proceed|continue|start|go)\b/i,
+    /\bshould i (proceed|continue|go ahead)\b/i,
+    /\b(proceed|go ahead)\?\s*$/i,
+  ].some((re) => re.test(tail));
+}
+
+/**
+ * Does the run's own goal say there is work left?
+ *
+ * `phase` is authoritative: `complete` is finished and `blocked` stops the
+ * chain deliberately, so only an `active` goal with a non-empty `remaining`
+ * counts. An `active` goal with nothing remaining is the "set it once and never
+ * touched it again" case — reconcileGoal already handles that, and reading it
+ * as outstanding work here would resume every run that ever set a goal.
+ *
+ * @param goal the run's current goal, if it has one
+ * @returns true when the model recorded remaining work and is not blocked
+ */
+function goalWantsMore(goal: RunGoal | null): boolean {
+  if (!goal || goal.phase !== "active") return false;
+  return Array.isArray(goal.remaining) && goal.remaining.length > 0;
+}
+
+/**
+ * Should the chain answer this segment's stopping point with "proceed"?
+ *
+ * @param goal the run's current goal
+ * @param finalText the segment's closing text
+ * @returns true when the run stopped short of done rather than finishing
+ */
+function wantsToProceed(goal: RunGoal | null, finalText: string): boolean {
+  if (isHardError(finalText) || isBudgetStop(finalText)) return false;
+  if (goalWantsMore(goal)) return true;
+  // A closing courtesy ("let me know if you want anything else") reads like an
+  // ask, and answering it costs a model call to be told the work is finished.
+  // A goal the model marked `complete` is the one statement that outranks the
+  // wording, so it settles the case before the text is consulted.
+  if (goal && goal.phase === "complete") return false;
+  return asksForGoAhead(finalText);
+}
+
 // A segment made progress if tools actually ran OR the model produced real text
 // (not a budget-stop / "Paused on step…" / empty). GLM empty/timeout loops hit
 // the no-progress path so we don't burn the full auto-continue chain.
+//
+// A segment that ran no tools and only asked for permission is NOT progress,
+// even though the ask is real text. That is what bounds the proceed chain: a
+// model that answers "yes, go ahead" with another question hits MAX_NO_PROGRESS
+// and stops, instead of trading pleasantries for the whole continue budget.
 function segmentMadeProgress(actions: string[], finalText: string): boolean {
   if (actions.length > 0) return true;
   const t = (finalText || "").trim();
   if (!t) return false;
   if (isBudgetStop(t)) return false;
   if (/^\(empty/i.test(t)) return false;
+  if (asksForGoAhead(t)) return false;
   return true;
 }
 
@@ -2665,6 +3037,11 @@ async function handleRequest(req: Request): Promise<Response> {
   const runId = typeof body.runId === "string" ? body.runId.trim()
               : (typeof body.run_id === "string" ? body.run_id.trim() : "");
 
+  // The owner's timezone, sent by the browser and relayed by the auto-continue
+  // chain. A wrong zone only shifts scheduling by hours, so an unusable value
+  // falls back to UTC rather than failing a run that has nothing to do with time.
+  const tz = validTimeZone(body.tz ?? body.timezone) || "UTC";
+
   const continueDepth = Math.max(0, Number(body.continueDepth) || 0);
   // Consecutive no-progress streak for auto-continue (human replies start at 0).
   const noProgressIn = Math.max(0, Number(body.noProgress) || 0);
@@ -2740,13 +3117,13 @@ async function handleRequest(req: Request): Promise<Response> {
 
     let messages: any[] = Array.isArray(row.messages) && row.messages.length ? row.messages.slice() : [];
     if (!messages.length) {
-      messages = [{ role: "system", content: buildSystem(model, toolList) }];
+      messages = [{ role: "system", content: buildSystem(model, toolList, { tz }) }];
       if (row.output) messages.push({ role: "assistant", content: String(row.output) });
     } else if (messages[0]?.role !== "system") {
-      messages.unshift({ role: "system", content: buildSystem(model, toolList) });
+      messages.unshift({ role: "system", content: buildSystem(model, toolList, { tz }) });
     } else {
       // Refresh system prompt so efficiency rules apply to old transcripts.
-      messages[0] = { role: "system", content: buildSystem(model, toolList) };
+      messages[0] = { role: "system", content: buildSystem(model, toolList, { tz }) };
     }
     // The auto-continue POST carries AUTO_CONTINUE_PROMPT in its own `prompt`
     // field, so "is the prompt empty?" can never tell a machine nudge from a
@@ -2755,8 +3132,11 @@ async function handleRequest(req: Request): Promise<Response> {
     // exactly the boundary it exists to survive. The body's autoContinue flag
     // is the only authority on who is speaking.
     const humanPrompt = prompt.trim();
+    // The chain labels its own nudges so History renders them as notices and
+    // the repeat guard does not read a machine turn as a human interjection.
+    const injectedSource = body.continueReason === "proceed" ? SRC_AUTO_PROCEED : SRC_AUTO_CONTINUE;
     messages.push(isAutoContinue
-      ? { role: "user", content: humanPrompt || AUTO_CONTINUE_PROMPT, _source: SRC_AUTO_CONTINUE }
+      ? { role: "user", content: humanPrompt || AUTO_CONTINUE_PROMPT, _source: injectedSource }
       : { role: "user", content: humanPrompt });
 
     await checkpointRun(runId, { status: "running", output: isAutoContinue ? `Continuing… (segment ${continueDepth + 1})` : "Working…" });
@@ -2764,7 +3144,7 @@ async function handleRequest(req: Request): Promise<Response> {
     const loop = await runAgentLoop({
       key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId,
       depth: continueDepth, runStartedAt: row.started_at ?? null, goal: parseStoredGoal(row.goal),
-      ctx: { userId, account, triggerKey, enabled },
+      ctx: { userId, account, triggerKey, enabled, model, tz },
     });
     let { finalText, actions, cost, steps, incomplete, openedPr, modelUsed, goal } = loop;
     const recap = actions.length ? `\n\n---\n**Actions (${actions.length})**\n\n${actions.map((a) => `- ${a}`).join("\n")}` : "";
@@ -2782,17 +3162,27 @@ async function handleRequest(req: Request): Promise<Response> {
       finalText = blockStop;
       incomplete = false;
     }
+    // A segment that stopped to ask permission, or with its own goal still
+    // listing remaining work, has not finished — it has queued a round trip
+    // nobody is here to make. Answer it instead of filing the run as done.
+    const proceed = !blockStop && !incomplete && wantsToProceed(goal, finalText);
+    if (proceed) incomplete = true;
     if (!wasCancelled && incomplete && !isHardError(finalText)) {
       if (nextNoProgress >= MAX_NO_PROGRESS) {
         noProgressStop = true;
         finalText = noProgressStopMessage(nextNoProgress);
       } else {
-        continuing = scheduleAutoContinue(runId, continueDepth, nextNoProgress);
+        continuing = scheduleAutoContinue(runId, continueDepth, nextNoProgress,
+          { reason: proceed ? "proceed" : "segment", tz });
       }
     }
     // Out of segments with the task unfinished. This used to be filed as
     // "success", so History showed green on runs that did nothing.
-    const exhausted = !wasCancelled && incomplete && !continuing && !noProgressStop && !isHardError(finalText);
+    // A permission ask on the LAST segment is not that: the model did the work
+    // and closed with a question, so its own text is the right ending and the
+    // reader can simply answer it. Only a run that genuinely ran out mid-task
+    // gets the out-of-time notice.
+    const exhausted = !wasCancelled && incomplete && !continuing && !noProgressStop && !proceed && !isHardError(finalText);
     if (exhausted) finalText = `${finalText}\n\n${exhaustedMessage(continueDepth)}`;
 
     const status = wasCancelled
@@ -2853,7 +3243,7 @@ async function handleRequest(req: Request): Promise<Response> {
   const toolList = enabled.size ? [...enabled].join(", ") : "none";
   const title = (typeof body.title === "string" && body.title.trim()) ? body.title.trim() : (routineTitle || `${model} run`);
 
-  const messages: any[] = [{ role: "system", content: buildSystem(model, toolList) }, { role: "user", content: prompt }];
+  const messages: any[] = [{ role: "system", content: buildSystem(model, toolList, { tz }) }, { role: "user", content: prompt }];
 
   // Insert the run *before* the loop so History shows "running" and auto-continue can resume.
   let newRunId: string | null = null;
@@ -2875,7 +3265,7 @@ async function handleRequest(req: Request): Promise<Response> {
   const loop = await runAgentLoop({
     key, model, tools, messages, maxSteps: stepBudgetFor(enabled), runId: newRunId,
     depth: 0, runStartedAt: null,
-    ctx: { userId, account, triggerKey, enabled },
+    ctx: { userId, account, triggerKey, enabled, model, tz },
   });
   let { finalText, actions, cost, steps, incomplete, openedPr, modelUsed, goal } = loop;
 
@@ -2892,15 +3282,18 @@ async function handleRequest(req: Request): Promise<Response> {
     finalText = blockStop;
     incomplete = false;
   }
+  const proceed = !blockStop && !incomplete && wantsToProceed(goal, finalText);
+  if (proceed) incomplete = true;
   if (newRunId && !wasCancelled && incomplete && !isHardError(finalText)) {
     if (nextNoProgress >= MAX_NO_PROGRESS) {
       noProgressStop = true;
       finalText = noProgressStopMessage(nextNoProgress);
     } else {
-      continuing = scheduleAutoContinue(newRunId, 0, nextNoProgress);
+      continuing = scheduleAutoContinue(newRunId, 0, nextNoProgress,
+        { reason: proceed ? "proceed" : "segment", tz });
     }
   }
-  const exhausted = !wasCancelled && incomplete && !continuing && !noProgressStop && !isHardError(finalText);
+  const exhausted = !wasCancelled && incomplete && !continuing && !noProgressStop && !proceed && !isHardError(finalText);
   if (exhausted) finalText = `${finalText}\n\n${exhaustedMessage(0)}`;
 
   const status = wasCancelled
