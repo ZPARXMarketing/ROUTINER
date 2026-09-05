@@ -668,7 +668,13 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   text-transform: uppercase;
   color: var(--text-low);
 }
+/* Starting a chat is the rail's primary action, so it sits above the search box
+   and reads as the one filled control in a column of muted ones. */
+.hx__new { width: 100%; justify-content: center; }
 .hx__search { font-size: 13px; padding: var(--sp-2) var(--sp-3); }
+/* The instance picker rides in the pane header, so it must not push the title
+   around on a narrow pane. */
+.hx__instance { font-size: 12px; padding: 4px var(--sp-2); max-width: 46vw; }
 .hx__list {
   flex: 1;
   min-height: 0;
