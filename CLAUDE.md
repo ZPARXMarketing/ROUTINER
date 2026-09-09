@@ -265,6 +265,63 @@ threshold before the reaper fires.
 > has to be current. A batch that opened a PR ignores the hand-off: that path
 > owes the reader a summary and the next iteration is already set up to write one.
 
+> **"Shall I proceed?" is not a pause — it is the run ending on a question
+> nobody is there to answer.** Replying with text finishes a run, so a model
+> that closed a turn asking for the go-ahead left a thread sitting until a human
+> typed a word that was never in doubt: the task was the authorization, and the
+> answer is always yes. That round trip was the single thing that made Routiner
+> feel like babysitting rather than delegation. Two independent tells now resume
+> the chain with `AUTO_PROCEED_PROMPT` instead of filing the run as done —
+> `goalWantsMore` (the model's own goal still reads `phase: active` with a
+> non-empty `remaining`, said in the one place compaction never touches) and
+> `asksForGoAhead` (the closing text is shaped like a request for permission,
+> matched against the last 400 characters, because the ask is a *closing* move
+> and a summary that discusses options mid-paragraph is still finished). The
+> escape hatch is unchanged and is the whole reason this is safe: something only
+> a human can supply — a credential, a choice they care about, an irreversible
+> action outside the task — goes through `set_goal phase='blocked'`, which stops
+> the chain with a named cause. Prose cannot carry that, because prose cannot be
+> told apart from thinking out loud. Three properties the tests pin: a goal
+> marked `complete` **outranks the wording**, so a closing courtesy ("let me know
+> if you want anything else") does not buy a model call to be told the work is
+> done; a hard error or budget stop never proceeds, since the next segment
+> inherits the same failure; and the chain is **bounded by machinery that already
+> existed** — `segmentMadeProgress` now scores a tool-less segment whose only
+> text is a permission ask as *no progress*, so two in a row hit
+> `MAX_NO_PROGRESS` rather than trading pleasantries for the whole continue
+> budget. A permission ask on the **last** segment is not filed as
+> out-of-segments: the model did the work and closed with a question, so its own
+> text is the ending and the reader can just answer it.
+
+> **Delegating work across time needed no new machinery — only a tool.** A
+> Routiner routine *is* a future agent run: the scheduler fires its `prompt` on
+> its `account`/`trigger_key` at its `scheduled_at`. So "do this now, then check
+> again tomorrow, then write it up Friday" was always one row per step; what was
+> missing was the model's ability to write those rows. That is the **`schedule`
+> tool group** — `schedule_task`, `reschedule_task`, `cancel_task` (with
+> `read_routines`, in the `read` group, to see what is already there). A
+> scheduled task **inherits the instance that scheduled it** — same account,
+> trigger, model and tool groups — because a planning conversation has no reason
+> to believe work can be done by anything else. Two details that decide whether
+> the times are right: `resolveWhen` takes **either** `in_minutes` (an offset —
+> models are unreliable at date arithmetic and reliable at counting) **or** `at`
+> as ISO 8601, and a zone-less `at` is read in the **owner's** timezone, not UTC.
+> That last one is the bug you would notice and never diagnose: a model told the
+> owner's zone writes `09:00` meaning 9am where they live, and reading it as UTC
+> lands a morning task in the middle of the night. The zone reaches the function
+> as `tz` on the request body — only the browser knows it — is relayed by the
+> auto-continue chain, and an unusable value degrades to UTC rather than failing
+> a run that has nothing to do with time. The system prompt also states the
+> current instant, so nothing guesses today's date.
+>
+> **Turning it on:** `Schedule work for later` is a checkbox on each agent
+> instance (Settings → the account → the trigger) and is on by default for
+> instances created from here on. An instance that predates it has an explicit
+> stored tool list, which `normalizeTools` keeps as-is on purpose, so **existing
+> instances need the box ticked once** — there is no way to tell "made before
+> this shipped" from "deliberately unchecked", and guessing wrong would re-enable
+> a capability someone had turned off.
+
 > **A run has a goal, and it lives off the transcript.** `messages` is compacted
 > between segments, so by segment four the model's record of its own plan is
 > mostly gone — and `AUTO_CONTINUE_PROMPT` was telling it to "resume the task
@@ -753,7 +810,11 @@ triggers runs it truly in parallel.
   reach the same blank white page, and a blank page hides its own cause, which
   is why it read as flakiness rather than as a defect. Verified end-to-end in a
   real browser by **`node scripts/test-boot.mjs`** (Playwright; skips cleanly if
-  Chromium isn't installed) — run it if you touch the boot path.
+  Chromium isn't installed) — run it if you touch the boot path. That script now
+  also covers the **New chat** composer end to end (the pane comes up on an empty
+  Chat, and sending posts a fresh run on the configured instance, carrying its
+  model, tools, a title from the message and the reader's timezone) — the only
+  automated coverage the Chat pane has.
   - **supabase-js is vendored** at `js/vendor/supabase-js.js`, *not* imported
     from esm.sh. A CDN import put two serial third-party round trips in front of
     every cold load (esm.sh resolves the unpinned `@2` tag with a short-TTL
@@ -849,7 +910,19 @@ triggers runs it truly in parallel.
   (`#hx-rail`) lists every run — searchable, filterable to failures — and the
   right pane (`#hx-main`) holds the selected run's whole exchange *flat against
   the UI*: transcript scrolling in place, reply box pinned to the bottom. There is
-  no modal. `renderHistory` builds the workspace once; every later repaint (the
+  no modal. **A chat starts here, not from a routine.** The rail's **＋ New
+  chat** button (and the pane itself, when there are no runs — the empty state is
+  a composer, not the dead-end card it used to be) opens `newChatPaneHtml`: pick
+  an instance, type, send. `startChat` posts the same fresh-run body a routine
+  fire does, minus the `routineId`, so the thread it opens is an ordinary run and
+  every existing affordance — reply, Retry, Stop, delete, the live poll — works
+  on it unchanged; the title comes from the first line of the message, since a
+  chat has no routine to borrow a name from. Two things to keep: `selectedRun`
+  returns the `NEW_CHAT_ID` sentinel *stickily* (falling back to the newest run
+  would throw away a half-typed message the moment the 8s poll landed), and
+  `renderRunPane` repaints the new-chat pane only when its signature actually
+  changes, because another run finishing must not rewrite the pane out from
+  under the reader's cursor. `renderHistory` builds the workspace once; every later repaint (the
   8s live poll, a filter flip, a finished reply) goes through `refreshHistory`,
   which re-renders in place so the search box keeps focus, the reader keeps their
   scroll position and an unsent draft survives (`runDrafts`). `selectRun` swaps

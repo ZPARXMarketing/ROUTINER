@@ -27,7 +27,9 @@ export { compactMessages, applyEdits, isTransientModelError, isHardError, isBudg
          normalizeGoal, renderGoal, parseStoredGoal, goalBlockStop, openrouter,
          reconcileGoal, handoffRefusal, splitSpillLocator, shortSpillLocator,
          MAX_AUTO_CONTINUES, canUseFallbackModel, FALLBACK_MODEL, MIN_MODEL_CALL_MS,
-         repoMatchesPattern, resolveRepo };
+         repoMatchesPattern, resolveRepo,
+         asksForGoAhead, goalWantsMore, wantsToProceed,
+         resolveWhen, parseInstant, validTimeZone, buildSystem };
 export function __resetKeyCache() { keySpentCache = null; }
 `;
 const OUT = `${process.env.TMPDIR || "/tmp"}/agent_under_test.ts`;
@@ -764,6 +766,129 @@ eq("blocks traversal", !!m.deniedWritePath("../../etc/passwd"), true);
 eq("allows normal source", m.deniedWritePath("supabase/functions/openrouter-agent/index.ts"), null);
 eq("forces agent/ prefix", m.normalizeAgentBranch("fix-thing"), "agent/fix-thing");
 eq("no double prefix", m.normalizeAgentBranch("agent/agent/x"), "agent/x");
+
+// ── Never stopping to ask permission ─────────────────────────────────────────
+// Replying with text ENDS a run, so a model that closes by asking "shall I
+// proceed?" does not pause — it stops, and the thread sits there until a human
+// types a word that was never in doubt. These pin the two tells that resume it
+// and, just as importantly, the endings that must NOT.
+console.log("\n— asksForGoAhead (permission asks) —");
+for (const s of [
+  "I've read the file. Shall I go ahead and open the PR?",
+  "Here's the plan. Would you like me to implement it?",
+  "Do you want me to start with the scheduler?",
+  "That's the diagnosis — let me know if you want me to fix it.",
+  "Ready to proceed?",
+  "Reply 'yes' and I'll make the change.",
+  "I'll open the PR once you confirm.",
+  "Awaiting your approval before merging.",
+]) eq(`asks: ${s.slice(0, 42)}…`, m.asksForGoAhead(s), true);
+// A finished run reports; it does not solicit. None of these may resume.
+for (const s of [
+  "Opened https://github.com/acme/x/pull/12 — squash-merge when CI is green.",
+  "Done. The note is on the board and the routine is scheduled for 09:00 tomorrow.",
+  "Blocked: GITHUB_TOKEN is not configured, so I could not open a PR.",
+  "The bug is in compactMessages: it charges a floored result 400 chars flat.",
+  "",
+]) eq(`finishes: ${(s || "(empty)").slice(0, 42)}…`, m.asksForGoAhead(s), false);
+// The ask is a CLOSING move. A summary that discusses a question mid-paragraph
+// and then states what it did is finished, not waiting.
+eq("a question early, a report at the end",
+   m.asksForGoAhead("Should I have used gh_propose_change? No — the file was too large. "
+     + `${"x".repeat(600)} I used gh_propose_edit and opened PR #14.`), false);
+
+console.log("\n— goalWantsMore / wantsToProceed —");
+const active = (remaining) => m.normalizeGoal({ objective: "fix #57", remaining });
+eq("active goal with work left", m.goalWantsMore(active(["open the PR"])), true);
+eq("active goal with nothing left", m.goalWantsMore(active([])), false);
+eq("no goal at all", m.goalWantsMore(null), false);
+// `complete` is finished and `blocked` stops the chain on purpose with a named
+// cause. Reading either as outstanding work would resume a run that is done, or
+// re-run one straight back into the obstacle it just reported.
+eq("complete goal never resumes",
+   m.goalWantsMore(m.normalizeGoal({ objective: "x", phase: "complete", remaining: ["stale"] })), false);
+eq("blocked goal never resumes",
+   m.goalWantsMore(m.normalizeGoal({ objective: "x", phase: "blocked", remaining: ["stale"],
+     blocked_code: "needs-human", blocked_message: "set GITHUB_TOKEN" })), false);
+eq("either tell resumes", m.wantsToProceed(active([]), "Shall I continue?"), true);
+eq("goal alone resumes", m.wantsToProceed(active(["open the PR"]), "Read the file."), true);
+eq("a clean finish does not", m.wantsToProceed(active([]), "Opened PR #14."), false);
+// A hard error is not a pause: the next segment inherits the same failure. And
+// a budget stop already has its own path (exhausted / auto-continue).
+eq("hard error never proceeds",
+   m.wantsToProceed(active(["open the PR"]), "⚠ Model error: Invalid API key"), false);
+eq("budget stop never proceeds",
+   m.wantsToProceed(active(["open the PR"]), "Stopped: hit the time budget before a final answer."), false);
+// A closing courtesy reads like an ask, and answering it buys a model call to
+// be told the work is finished. A goal marked complete outranks the wording.
+eq("a complete goal outranks a closing courtesy",
+   m.wantsToProceed(m.normalizeGoal({ objective: "x", phase: "complete" }),
+     "Opened PR #14. Let me know if you want anything else."), false);
+eq("…but with no goal the ask still resumes",
+   m.wantsToProceed(null, "Opened PR #14. Would you like me to merge it?"), true);
+// The proceed chain is bounded by the machinery that already exists: a segment
+// that ran no tools and only asked a question scores no progress, so two in a
+// row hit MAX_NO_PROGRESS instead of trading pleasantries for the whole budget.
+console.log("\n— the proceed chain is bounded —");
+eq("a bare permission ask is not progress", m.segmentMadeProgress([], "Shall I proceed?"), false);
+eq("…but one alongside real work is", m.segmentMadeProgress(["read a file"], "Shall I proceed?"), true);
+eq("a real answer is still progress", m.segmentMadeProgress([], "The bug is on line 40."), true);
+
+// ── Delegating work across time ──────────────────────────────────────────────
+// schedule_task writes a row the scheduler will fire, so the instant it resolves
+// to is the whole contract. Models are unreliable at date arithmetic and
+// reliable at counting, hence two forms.
+console.log("\n— resolveWhen (scheduling) —");
+const NOW = Date.parse("2026-09-05T12:00:00Z");
+eq("in_minutes counts from now", m.resolveWhen({ in_minutes: 90 }, NOW), { iso: "2026-09-05T13:30:00.000Z" });
+eq("an absolute UTC stamp passes through", m.resolveWhen({ at: "2026-09-06T09:00:00Z" }, NOW), { iso: "2026-09-06T09:00:00.000Z" });
+eq("an explicit offset is honoured", m.resolveWhen({ at: "2026-09-06T09:00:00-05:00" }, NOW), { iso: "2026-09-06T14:00:00.000Z" });
+// A model told the owner's timezone writes "09:00" and means 9am where they
+// live. Reading that as UTC is how a morning task lands in the middle of the
+// night — the one scheduling bug the user would notice and never diagnose.
+eq("a zone-less stamp is read in the owner's zone",
+   m.resolveWhen({ at: "2026-09-06T09:00" }, NOW, "America/Chicago"), { iso: "2026-09-06T14:00:00.000Z" });
+eq("…and in winter, when the offset differs",
+   m.resolveWhen({ at: "2026-01-06T09:00" }, NOW, "America/Chicago"), { iso: "2026-01-06T15:00:00.000Z" });
+eq("no zone given means UTC", m.resolveWhen({ at: "2026-09-06T09:00" }, NOW, null), { iso: "2026-09-06T09:00:00.000Z" });
+// in_minutes wins when both are given: it cannot be mis-parsed, so it is the
+// safer reading of a contradictory call.
+eq("in_minutes wins over at", m.resolveWhen({ at: "2027-01-01T00:00Z", in_minutes: 5 }, NOW), { iso: "2026-09-05T12:05:00.000Z" });
+eq("nothing given is refused", "error" in m.resolveWhen({}, NOW), true);
+eq("unparseable text is refused", "error" in m.resolveWhen({ at: "next tuesday-ish" }, NOW), true);
+eq("a negative offset is refused", "error" in m.resolveWhen({ in_minutes: -30 }, NOW), true);
+eq("beyond a year out is refused", "error" in m.resolveWhen({ in_minutes: 400 * 24 * 60 }, NOW), true);
+// A zone comes from a browser, so it is never trusted. An unusable one costs
+// only UTC scheduling — it must never fail a run that has nothing to do with time.
+// A tool group is a capability boundary: an instance that did not enable
+// `schedule` must not be handed calendar writes, and runTool re-checks the
+// group so a hallucinated call cannot slip past the specs either.
+console.log("\n— the schedule group is gated —");
+eq("offered when enabled", specNames(["schedule"]).includes("schedule_task"), true);
+eq("…with its whole set", ["schedule_task", "reschedule_task", "cancel_task"].every((n) => specNames(["schedule"]).includes(n)), true);
+eq("withheld when not", specNames(["read", "research", "write"]).some((n) => n.startsWith("schedule_") || n === "cancel_task"), false);
+eq("schedule_task belongs to schedule", m.toolGroupOf("schedule_task"), "schedule");
+eq("cancel_task belongs to schedule", m.toolGroupOf("cancel_task"), "schedule");
+eq("reschedule_task belongs to schedule", m.toolGroupOf("reschedule_task"), "schedule");
+
+console.log("\n— validTimeZone —");
+eq("a real zone survives", m.validTimeZone("America/Chicago"), "America/Chicago");
+eq("UTC survives", m.validTimeZone("UTC"), "UTC");
+eq("nonsense is rejected, not thrown", m.validTimeZone("Mars/Olympus_Mons"), null);
+eq("a non-string is rejected", m.validTimeZone(42), null);
+eq("an absurdly long value is rejected", m.validTimeZone("A/".repeat(60)), null);
+
+// The system prompt is where the two behaviors above are actually asked for, so
+// a refactor that drops the wording would pass every test above and still ship
+// a model that stops to ask.
+console.log("\n— buildSystem —");
+const sysNow = new Date("2026-09-05T12:00:00Z");
+const sys = m.buildSystem("z-ai/glm-5", "read, schedule", { tz: "America/Chicago", now: sysNow });
+eq("states the current instant", sys.includes("2026-09-05T12:00:00.000Z"), true);
+eq("states the owner's zone", sys.includes("America/Chicago"), true);
+eq("forbids asking permission", /never ask for permission|Never ask for permission/i.test(sys), true);
+eq("names the blocked escape hatch", /phase='blocked'/.test(sys), true);
+eq("a bad zone degrades to UTC wording", m.buildSystem("x", "read", { tz: "Mars/Base", now: sysNow }).includes("(UTC)"), true);
 
 console.log(`\n${fail === 0 ? "ALL PASS" : "FAILURES"}: ${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);

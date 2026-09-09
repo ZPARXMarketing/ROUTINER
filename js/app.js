@@ -90,6 +90,7 @@ const AGENT_TOOLS = [
   { id: 'read', label: 'Read your data + run history' },
   { id: 'research', label: 'Web research' },
   { id: 'write', label: 'Write to apps' },
+  { id: 'schedule', label: 'Schedule work for later' },
   { id: 'code', label: 'Fix code (GitHub)' },
 ];
 const AGENT_TOOL_IDS = AGENT_TOOLS.map((t) => t.id);
@@ -1137,6 +1138,45 @@ let swipedRowId = null;      // the row swiped open to reveal Delete (touch)
 let runBusy = false;         // a follow-up is in flight
 const runDrafts = new Map(); // id → unsent reply text, so re-renders never eat it
 
+/* ---------- Starting a chat ----------
+   A conversation used to require a routine: you made a scheduled thing, ran it,
+   and the run it produced was the only way to talk to a model. That is the
+   wrong way round — most chats never want a calendar block, and the ones that
+   do can ask the model to schedule one (the `schedule` tool group). So Chat has
+   a New chat composer of its own: pick an instance, type, send. It posts the
+   same fresh-run body a routine fire does, minus the routineId, so the thread
+   it opens is an ordinary run — resumable, stoppable, metered, in History. */
+const NEW_CHAT_ID = '__new-chat__';
+let newChatDraft = '';       // survives the pane's live re-renders
+let newChatInstance = null;  // { account, triggerKey } the composer will fire on
+
+/* Every agent instance the user has configured, flattened to pickable rows. */
+function agentInstances() {
+  const out = [];
+  for (const a of listAccounts()) {
+    if (a.kind !== 'openrouter-agent') continue;
+    for (const t of (a.triggers || [])) out.push({ account: a.id, triggerKey: t.id, label: `${a.label} · ${t.label || 'instance'}` });
+  }
+  return out;
+}
+
+/* The instance a new chat will run on: the reader's pick, else the first one
+   configured. Null when no agent account exists — the composer says so rather
+   than failing on send. */
+function currentChatInstance() {
+  const all = agentInstances();
+  if (!all.length) return null;
+  const picked = newChatInstance && all.find((i) => i.account === newChatInstance.account && i.triggerKey === newChatInstance.triggerKey);
+  return picked || all[0];
+}
+
+/* A run's title comes from its opening message — the first line, trimmed to
+   something a rail row can show. Chats have no routine to borrow a name from. */
+function chatTitleFrom(text) {
+  const line = String(text || '').trim().split('\n').find((l) => l.trim()) || 'New chat';
+  return line.trim().slice(0, 80);
+}
+
 /* Compact rail timestamp: clock time for today, date for anything older. */
 function fmtShort(iso) {
   if (!iso) return '';
@@ -1229,11 +1269,15 @@ function historyFiltered() {
   return { all, failures, items };
 }
 
-/* The run in the pane — falling back to the newest one that survives the active
-   filter, so the pane is never blank while runs exist. */
+/* The run in the pane: the selected one, else the newest that survives the
+   active filter, so the pane is never blank while runs exist — and the
+   NEW_CHAT_ID sentinel when the reader is composing a new one, or when there is
+   nothing to show. The sentinel is sticky: falling back to list[0] would throw
+   away a half-typed message the moment the 8s poll landed. */
 function selectedRun(items) {
+  if (selectedRunId === NEW_CHAT_ID) return NEW_CHAT_ID;
   const list = items || historyFiltered().items;
-  return list.find((x) => x.id === selectedRunId) || list[0] || null;
+  return list.find((x) => x.id === selectedRunId) || list[0] || NEW_CHAT_ID;
 }
 
 function railRowHtml(it, active) {
@@ -1294,23 +1338,20 @@ function railListHtml(items) {
 
 function renderHistory() {
   const { all, failures, items } = historyFiltered();
-  if (!all.length) {
-    view.innerHTML = `<div class="hx"><section class="hx__main"><div class="hx__blank"><div class="empty">
-      <h3>Nothing here yet</h3>
-      <p>Finished runs land here — pick one from the list to read the whole exchange, and reply to keep it going.</p>
-    </div></div></section></div>`;
-    return;
-  }
+  // No runs yet is not a dead end any more: the workspace still builds, and the
+  // pane falls through to the New chat composer so the first thing a new user
+  // sees is somewhere to type.
   // The workspace is already up (a live poll, a filter flip): refresh it in
   // place so the search box keeps focus and the reader keeps their place.
   if ($('#hx')) { refreshHistory(); return; }
   const current = selectedRun(items);
-  selectedRunId = current ? current.id : null;
+  selectedRunId = current === NEW_CHAT_ID ? NEW_CHAT_ID : (current ? current.id : null);
   view.innerHTML = `<div class="hx${railOpen ? ' is-rail-open' : ''}" id="hx">
     <div class="hx__scrim" id="hx-scrim"></div>
     <aside class="hx__rail" id="hx-rail">
       <div class="hx__rail-head">
         <span class="hx__rail-title">Chat · ${all.length} run${all.length === 1 ? '' : 's'}</span>
+        <button class="btn btn--primary btn--sm hx__new" id="hx-new" type="button" title="Start a new chat">＋ New chat</button>
         <input class="input hx__search" id="hx-search" type="search" placeholder="Search runs…" value="${esc(historyQuery)}" />
         <div class="log__filter">
           <button class="btn btn--sm ${historyFilter === 'all' ? 'btn--secondary' : 'btn--ghost'}" data-histf="all">All <span id="hx-fall">${all.length}</span></button>
@@ -1461,6 +1502,7 @@ function wireRail() {
     selectedRunId = null;            // fall back to the newest run in the new filter
     renderHistory();
   }));
+  $('#hx-new')?.addEventListener('click', () => { setRail(false); openNewChat(); });
   const search = $('#hx-search');
   if (search) search.addEventListener('input', () => { historyQuery = search.value; refreshRail(); });
   $('#hx-scrim')?.addEventListener('click', () => setRail(false));
@@ -1623,7 +1665,50 @@ function runTimingChip(it) {
   };
 }
 
+/* The New chat pane: an instance picker and a composer, nothing else. It shares
+   the pane's head/compose chrome so starting a chat and continuing one look and
+   behave the same. */
+function newChatPaneHtml() {
+  const all = agentInstances();
+  const inst = currentChatInstance();
+  const picker = all.length > 1
+    ? `<select class="select hx__instance" id="chat-instance" aria-label="Which instance to run on">${all.map((i) =>
+        `<option value="${esc(i.account)}|${esc(i.triggerKey)}" ${inst && i.account === inst.account && i.triggerKey === inst.triggerKey ? 'selected' : ''}>${esc(i.label)}</option>`).join('')}</select>`
+    : '';
+  const model = inst ? modelLabel(triggerModel(inst.account, inst.triggerKey)) : '';
+  const body = inst
+    ? `<div class="empty">
+        <h3>New chat</h3>
+        <p>Ask for anything ${esc(model)} can do with its tools — read your board and run history, research the web, fix code, or schedule work for later. Say <em>"then check again tomorrow morning"</em> and it will put a block on the Calendar.</p>
+      </div>`
+    : `<div class="empty">
+        <h3>No agent instance yet</h3>
+        <p>Add an <strong>OpenRouter agent</strong> account in Settings, then come back — a chat runs on one of its instances.</p>
+      </div>`;
+  const compose = inst
+    ? `<div class="hx__compose">
+        <div class="hx__compose-inner">
+          <textarea class="textarea chat__input" id="chat-input" placeholder="What do you want done? (Enter to send)" ${runBusy ? 'disabled' : ''}>${esc(newChatDraft)}</textarea>
+          <button class="btn btn--primary" id="chat-send" ${runBusy ? 'disabled' : ''}>Send</button>
+        </div>
+      </div>`
+    : '';
+  return `<div class="hx__head">
+      <button type="button" class="hx__railbtn" id="hx-railbtn" aria-label="Show the run list">☰ Runs</button>
+      <h2 class="hx__title">New chat</h2>
+      <span class="hx__head-actions">${picker}</span>
+    </div>
+    <div class="hx__thread" id="hx-thread">
+      <div class="hx__thread-inner">
+        ${body}
+        ${runBusy ? '<div class="chatmsg chatmsg--bot chatmsg--busy"><span class="hist__spin" aria-hidden="true"></span> Starting…</div>' : ''}
+      </div>
+    </div>
+    ${compose}`;
+}
+
 function runPaneHtml(it) {
+  if (it === NEW_CHAT_ID) return newChatPaneHtml();
   if (!it) {
     return `<div class="hx__blank"><div class="empty">
       <h3>Pick a run</h3><p>Choose a run from the list to read its full exchange here.</p>
@@ -1633,7 +1718,7 @@ function runPaneHtml(it) {
   const bubbles = turns.map((t) => {
     if (t.kind === 'user') return `<div class="chatmsg chatmsg--user">${esc(t.content)}</div>`;
     if (t.kind === 'notice') {
-      const label = { 'repeat-guard': 'repeat guard', 'auto-continue': 'auto-continue', orientation: 'orientation' }[t.source] || t.source;
+      const label = { 'repeat-guard': 'repeat guard', 'auto-continue': 'auto-continue', 'auto-proceed': 'kept going (no need to say proceed)', orientation: 'orientation' }[t.source] || t.source;
       return `<details class="transcript__notice"><summary>⟳ ${esc(label)}</summary><pre>${esc(t.content.slice(0, 4000))}</pre></details>`;
     }
     if (t.kind === 'tool') return `<div class="transcript__tool">⚙ ${esc(t.content)}</div>`;
@@ -1685,6 +1770,22 @@ function runPaneHtml(it) {
 
 function wireRunPane(it) {
   const main = $('#hx-main'); if (!main || !it) return;
+  if (it === NEW_CHAT_ID) {
+    $('#hx-railbtn', main)?.addEventListener('click', () => setRail(!railOpen));
+    $('#chat-instance', main)?.addEventListener('change', (e) => {
+      const [account, triggerKey] = String(e.target.value || '').split('|');
+      newChatInstance = { account, triggerKey };
+    });
+    main.dataset.newChatSig = `${runBusy}|${(currentChatInstance() || {}).triggerKey || ''}`;
+    const box = $('#chat-input', main);
+    if (box) {
+      const send = () => startChat(box.value);
+      box.addEventListener('input', () => { newChatDraft = box.value; });
+      $('#chat-send', main)?.addEventListener('click', send);
+      box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+    }
+    return;
+  }
   $('#hx-railbtn', main)?.addEventListener('click', () => setRail(!railOpen));
   const input = $('#run-input', main);
   if (input) {
@@ -1703,6 +1804,17 @@ function wireRunPane(it) {
    were already pinned to the bottom (then it follows the new output). */
 function renderRunPane(it, { focus = false } = {}) {
   const main = $('#hx-main'); if (!main) return;
+  // The New chat pane has no live content — nothing on it changes except the
+  // busy state. Another run finishing 8s into a half-typed message must not
+  // rewrite it out from under the reader's cursor, so repaint only when the
+  // pane would actually differ.
+  if (it === NEW_CHAT_ID) {
+    const sig = `${runBusy}|${(currentChatInstance() || {}).triggerKey || ''}`;
+    if (main.dataset.newChatSig === sig && $('#chat-input', main)) return;
+    main.dataset.newChatSig = sig;
+  } else {
+    delete main.dataset.newChatSig;
+  }
   const prev = $('#hx-thread', main);
   const prevTop = prev ? prev.scrollTop : 0;
   const wasBottom = prev ? (prev.scrollHeight - prev.scrollTop - prev.clientHeight < 48) : true;
@@ -1710,7 +1822,7 @@ function renderRunPane(it, { focus = false } = {}) {
   wireRunPane(it);
   const thread = $('#hx-thread', main);
   if (thread) thread.scrollTop = wasBottom ? thread.scrollHeight : prevTop;
-  if (focus && !runBusy) setTimeout(() => $('#run-input', main)?.focus(), 30);
+  if (focus && !runBusy) setTimeout(() => ($('#run-input', main) || $('#chat-input', main))?.focus(), 30);
 }
 
 /* Repaint the whole workspace from fresh data (a live poll, a filter flip, a
@@ -1720,7 +1832,7 @@ function refreshHistory() {
   if (currentView !== 'history' || !$('#hx')) return;
   const { items } = historyFiltered();
   const current = selectedRun(items);
-  selectedRunId = current ? current.id : null;
+  selectedRunId = current === NEW_CHAT_ID ? NEW_CHAT_ID : (current ? current.id : null);
   $$('#hx [data-histf]').forEach((b) => {
     const on = b.dataset.histf === historyFilter;
     b.classList.toggle('btn--secondary', on);
@@ -1761,6 +1873,11 @@ async function stopRun(it) {
 // scheduler instead sends the service-role Bearer, which the function also accepts.
 async function agentPost(body) {
   const payload = { ...(body || {}) };
+  // The reader's timezone, so "schedule this for 9am tomorrow" means 9am where
+  // they are. Only the browser knows it; the edge function falls back to UTC.
+  if (!payload.tz) {
+    try { payload.tz = Intl.DateTimeFormat().resolvedOptions().timeZone || undefined; } catch { /* UTC it is */ }
+  }
   // Prefer a token the caller already resolved; else pull the current session.
   if (!payload.accessToken && !payload.access_token) {
     try {
@@ -1773,6 +1890,54 @@ async function agentPost(body) {
     headers: { 'content-type': 'text/plain;charset=UTF-8' },
     body: JSON.stringify(payload),
   });
+}
+
+/* Start a fresh conversation on the picked instance. Same fresh-run body a
+   routine fire sends, minus the routineId — so the run it opens is an ordinary
+   History thread and every existing affordance (reply, Retry, Stop, delete)
+   works on it unchanged. */
+async function startChat(raw) {
+  const text = (raw || '').trim();
+  if (!text || runBusy) return;
+  const inst = currentChatInstance();
+  if (!inst) { toast('Add an OpenRouter agent account in Settings first.', 'error'); return; }
+  const { error } = await sessionForFire();
+  if (error) { toast(error, 'error'); return; }
+  const model = triggerModel(inst.account, inst.triggerKey);
+  runBusy = true;
+  newChatDraft = '';
+  renderRunPane(NEW_CHAT_ID);
+  try {
+    const r = await agentPost({
+      account: inst.account, triggerKey: inst.triggerKey, model,
+      tools: triggerTools(inst.account, inst.triggerKey),
+      prompt: text, title: chatTitleFrom(text), source: 'chat',
+    });
+    const data = await r.json().catch(() => ({}));
+    runBusy = false;
+    if (!r.ok || data.ok === false) {
+      toast(`Could not start the chat (${r.status})${data.error ? `: ${data.error}` : ''}.`, 'error');
+      newChatDraft = text;            // hand the message back so it isn't lost
+      renderRunPane(NEW_CHAT_ID, { focus: true });
+      return;
+    }
+    try { await loadAll(); } catch { /* the row is saved regardless */ }
+    if (data.runId) openRunInChat(data.runId); else refreshHistory();
+  } catch (e) {
+    runBusy = false;
+    toast(`Could not start the chat: ${e.message}`, 'error');
+    newChatDraft = text;
+    renderRunPane(NEW_CHAT_ID, { focus: true });
+  }
+}
+
+/* Swap the pane to the New chat composer without leaving Chat. */
+function openNewChat() {
+  selectedRunId = NEW_CHAT_ID;
+  confirmDeleteId = null;
+  if (currentView !== 'history') { currentView = 'history'; syncTabs(); render(); }
+  else { refreshHistory(); }
+  setTimeout(() => $('#chat-input')?.focus(), 60);
 }
 
 async function continueRun(it, raw) {
