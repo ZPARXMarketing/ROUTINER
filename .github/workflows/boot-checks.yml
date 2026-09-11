@@ -45,6 +45,13 @@ jobs:
         with:
           node-version: '22'
 
+      # Pure logic, no browser: the model catalog and the per-user slug/color
+      # overrides layered on it. Runs first because it needs nothing installed —
+      # a broken catalog should fail in two seconds, not after a Chromium
+      # download.
+      - name: Model catalog tests
+        run: node scripts/test-models.mjs
+
       # The repo ships no package.json — the site publishes as-is — so the
       # browser harness is installed for the run and thrown away with it.
       - name: Install Playwright + Chromium

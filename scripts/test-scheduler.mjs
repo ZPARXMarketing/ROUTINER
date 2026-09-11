@@ -16,7 +16,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 const SRC = new URL("../supabase/functions/routiner-scheduler/index.ts", import.meta.url).pathname;
 let src = readFileSync(SRC, "utf8");
 src = src.replace(/^import "jsr:.*$/m, "// jsr import stripped");
-src += `\nexport { drainWithLimit, accountKind, checkKeyBalance };\n`;
+src += `\nexport { drainWithLimit, accountKind, checkKeyBalance, resolveAgentModel, pickAgentInstance };\n`;
 const OUT = `${process.env.TMPDIR || "/tmp"}/scheduler_under_test.ts`;
 writeFileSync(OUT, src);
 
@@ -170,6 +170,27 @@ eq("a garbled payload is silent", (await withKey({ data: {} })).result, "no-limi
 r = await withKey(LIMITED(0), { board: [{ id: "existing" }] });
 eq("an existing recent note suppresses a duplicate", r.result, "already-warned");
 eq("…and writes nothing", r.writes.length, 0);
+
+// ── Which model an agent routine runs ───────────────────────────────────────
+// The instance used to win over the routine, which made the drawer's model
+// select inert on every scheduled agent routine while the card went on
+// displaying the model the routine had stored — the UI naming a model that
+// never ran (issue #102). The instance is the default; the routine's pick wins.
+console.log("\nagent model precedence");
+const INST = "moonshotai/kimi-k2.7-code";
+eq("the routine's own pick wins", m.resolveAgentModel("z-ai/glm-5", INST), "z-ai/glm-5");
+eq("'auto' defers to the instance", m.resolveAgentModel("auto", INST), INST);
+eq("an unset model defers to the instance", m.resolveAgentModel(null, INST), INST);
+eq("blank and whitespace defer too", m.resolveAgentModel("   ", INST), INST);
+eq("with no instance model, the default", m.resolveAgentModel("auto", null), "moonshotai/kimi-k2.7-code");
+eq("a non-string model is ignored", m.resolveAgentModel({ nope: 1 }, INST), INST);
+
+// pickAgentInstance still resolves the instance the routine names, and falls
+// back to the account's first — a routine saved before trigger_key existed.
+const ACCTS = [{ id: "a1", triggers: [{ id: "t_a", model: "x/one", tools: ["read"] }, { id: "t_b", model: "x/two" }] }];
+eq("the named instance is used", m.pickAgentInstance(ACCTS, "a1", "t_b").model, "x/two");
+eq("an unknown instance falls back to the first", m.pickAgentInstance(ACCTS, "a1", "t_zz").model, "x/one");
+eq("an unknown account yields nothing", m.pickAgentInstance(ACCTS, "nope", "t_a").model, null);
 
 console.log(`\n${fail ? "FAILURES" : "ALL PASS"}: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

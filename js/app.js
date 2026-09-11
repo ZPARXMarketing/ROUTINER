@@ -19,10 +19,12 @@
 import { createClient } from './vendor/supabase-js.js';
 import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 import {
-  MODELS, TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
-  effectiveModel, displayModel, getModelForTask, modelLabel, isClaudeModel, runModel,
+  TASK_TYPES, COMPLEXITIES, DEFAULT_MODEL, DEFAULT_TASK_TYPE, DEFAULT_COMPLEXITY,
+  effectiveModel, displayModel, getModelForTask, modelLabel, modelFullLabel, isClaudeModel, runModel,
   ROUTING_POLICY, setActivePolicy, getActivePolicy, normalizePolicy,
-  estimateRunCost, fmtUSD,
+  estimateRunCost, fmtUSD, rateLabel,
+  modelOptionsHtml, catalogByLab, DEFAULT_CATALOG, TIER_LABEL,
+  routineColor, setModelPrefs, normalizeModelPrefs, modelPrefsAreDefault,
 } from './model-router.js';
 import { nextOccurrence, nextOccurrences } from './schedule.js';
 
@@ -103,9 +105,9 @@ const normalizeTools = (t) => {
   const arr = Array.isArray(t) ? t : (t && typeof t === 'object' ? Object.keys(t).filter((k) => t[k]) : null);
   return AGENT_TOOL_IDS.filter((id) => (arr || DEFAULT_AGENT_TOOLS).includes(id));
 };
-/* OpenRouter chat models an agent instance can run — every non-Claude,
-   non-perplexity, non-auto id in the shared catalog. */
-const AGENT_MODELS = () => MODELS.filter((m) => !m.auto && !isClaudeModel(m.id) && !/^perplexity\//.test(m.id));
+/* The models an agent instance can run are every non-Claude row in the shared
+   catalog (Perplexity research models belong to the enrichment account, not to
+   an agent) — rendered by `modelOptionsHtml(…, { via: 'openrouter' })`. */
 /* A fresh OpenRouter agent account for the "Add OpenRouter account" button. */
 const NEW_AGENT_ACCOUNT = () => ({ id: genId('acc'), label: 'Kimi', kind: 'openrouter-agent', key: '',
   triggers: [{ id: genId('t'), label: 'A', trigger: '', token: '', model: DEFAULT_AGENT_MODEL, tools: [...DEFAULT_AGENT_TOOLS] }] });
@@ -166,6 +168,15 @@ const triggerTools = (accId, tId) => {
   const t = triggerCfg(accId, tId) || accountTriggers(accId)[0];
   return normalizeTools(t && t.tools);
 };
+/* Which model an agent routine actually runs: its own pick if it made one,
+   otherwise the instance's. The instance is the default, not an override —
+   otherwise the model select on an agent routine is decoration (issue #102).
+   The scheduler resolves it the same way, so Run now and a scheduled fire can
+   never disagree. */
+const agentModelFor = (routine = {}) => {
+  const m = (routine.model || '').trim();
+  return (m && m !== 'auto') ? m : triggerModel(routine.account, routine.triggerKey || null);
+};
 
 /* Color engine: each account gets a themed set of DISTINCT hues (not just
    shades), so its triggers A/B/C are easy to tell apart at a glance while the
@@ -199,7 +210,6 @@ function triggerColor(accId, tId) {
   if (ti < 0) ti = tId ? (1 + hashStr(String(tId)) % Math.max(1, fam.length - 1)) : 0;
   return swatch(fam[ti % fam.length]);
 }
-const accountColor = (accId) => triggerColor(accId, null); // base shade for the account
 
 /* How long a routine block occupies on the calendar */
 const DEFAULT_DURATION_MIN = 45;
@@ -344,6 +354,9 @@ async function loadAllOnce() {
   // scheduler will fire (null/invalid → built-in default).
   settingsPolicy = normalizePolicy(setRes && setRes.data && setRes.data.model_policy);
   setActivePolicy(settingsPolicy);
+  // Renamed slugs + recolored models, so the calendar paints and the pickers
+  // offer what this user configured (undefined pre-migration → browser copy).
+  applyModelPrefs(setRes && setRes.data && setRes.data.model_prefs);
   routines = (rRes.data || []).map(fromRow);
   runs = (runRes.data || []).map((x) => ({
     id: x.id, routineId: x.routine_id, title: x.title, status: x.status, output: x.output, firedAt: x.fired_at,
@@ -402,18 +415,40 @@ async function dbLoadAccountCreds() {
   const { data, error } = await sb.from('routiner_settings').select('*').maybeSingle();
   if (error) { toast('Couldn’t load account settings: ' + error.message, 'error'); return {}; }
   settingsPolicy = normalizePolicy(data && data.model_policy); // keep the editor's copy fresh (undefined pre-migration → null)
+  applyModelPrefs(data && data.model_prefs);
   return (data && data.accounts) || {};
 }
-// Persist accounts, and — when `modelPolicy` is explicitly passed (an object to
-// set, or null to clear) — the auto-routing policy too. Omitting the arg leaves
-// model_policy untouched.
-async function dbSaveAccountCreds(accounts, modelPolicy) {
+/* Model slug/color overrides (Settings → Models). The column may not exist yet
+   — migrations are applied by hand — so the browser copy is the fallback and
+   the feature works either way; the stored row wins when it is there. */
+const MODEL_PREFS_LS = 'routiner.modelprefs.v1';
+function applyModelPrefs(fromRow) {
+  let prefs = fromRow;
+  if (!prefs) { try { prefs = JSON.parse(localStorage.getItem(MODEL_PREFS_LS) || 'null'); } catch { prefs = null; } }
+  setModelPrefs(prefs);
+}
+// Persist accounts, and — when `modelPolicy` / `modelPrefs` are explicitly
+// passed (an object to set, or null to clear) — those too. Omitting an arg
+// leaves that column untouched.
+async function dbSaveAccountCreds(accounts, modelPolicy, modelPrefs) {
   const { data: { user } } = await sb.auth.getUser();
   if (!user) { toast('Sign in to save settings.', 'error'); return false; }
   const row = { user_id: user.id, accounts, updated_at: new Date().toISOString() };
   if (modelPolicy !== undefined) row.model_policy = modelPolicy;
-  const { error } = await sb.from('routiner_settings')
-    .upsert(row, { onConflict: 'user_id' });
+  if (modelPrefs !== undefined) {
+    row.model_prefs = modelPrefs;
+    // Always keep a browser copy: it is what makes the feature survive a
+    // deployment whose database has not had 0017 applied yet.
+    try { localStorage.setItem(MODEL_PREFS_LS, JSON.stringify(modelPrefs || null)); } catch { /* private mode */ }
+  }
+  let { error } = await sb.from('routiner_settings').upsert(row, { onConflict: 'user_id' });
+  // Pre-migration database: drop the unknown column and save everything else
+  // rather than failing a Save the user has no way to interpret.
+  if (error && modelPrefs !== undefined && /model_prefs/.test(error.message || '')) {
+    delete row.model_prefs;
+    ({ error } = await sb.from('routiner_settings').upsert(row, { onConflict: 'user_id' }));
+    if (!error) toast('Saved. Model colors + slugs are kept in this browser until migration 0017 is applied.');
+  }
   if (error) { toast('Save failed: ' + error.message, 'error'); return false; }
   return true;
 }
@@ -644,7 +679,10 @@ async function fireEnrichment(routine) {
 async function fireAgent(routine) {
   const account = routine?.account;
   const triggerKey = routine?.triggerKey || null;
-  const model = triggerModel(account, triggerKey);
+  // The routine's own pick wins; the instance's model is what `auto` and an
+  // unset model fall back to. Same precedence as the scheduler, so Run now and
+  // a scheduled fire cannot run different models (issue #102).
+  const model = agentModelFor(routine);
   const tools = triggerTools(account, triggerKey);
   if (!routine?.prompt || !routine.prompt.trim()) { toast('This routine has no directions.', 'error'); return; }
   const { error } = await sessionForFire();
@@ -693,9 +731,10 @@ async function callClaude(prompt, model) {
 /* A one-off (recurrence 'none') is "past" once it has fired (a run logged for
    it) or its scheduled time has elapsed. Past one-offs drop out of *Scheduled*
    — they are no longer queued — and the run itself shows under History.
-   They do NOT drop out of the Library: the Library is a permanent shelf of
-   every routine you have made, so a one-off can always be re-run or
-   re-scheduled. Only archiving takes a routine off the shelf. */
+   They also drop out of the Library's default view, into its Done filter: a
+   one-off that has already run is finished work, not something you keep to run
+   again (issue #99). Nothing is deleted — Done lists them, and Copy puts a
+   fresh unfired copy back on the shelf. */
 const isRecurringRoutine = (r) => (r.recurrence || 'none') !== 'none';
 function firedRoutineIds() {
   const s = new Set();
@@ -729,16 +768,37 @@ function historyItems() {
   items.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
   return items;
 }
+/* ---------- What belongs on the shelf ----------
+   The Library was every non-archived routine, fired one-offs included, so
+   everything the planner or an agent ever ran piled up in it and the one view
+   meant to answer "what do I keep around to run again?" answered "everything
+   that has ever happened" instead (issue #99).
+
+   A one-off that has already run is finished work. Its record is the run, in
+   Chat; the Library is the shelf. So the shelf holds what is still live — a
+   queued routine, a recurring one — plus anything never fired, and the
+   completed ones move behind the Library's own Done filter, where **Copy**
+   puts a fresh, unfired copy back on the shelf in one click. Nothing is
+   deleted and nothing is hidden without a way to see it. */
+const isCompletedRoutine = (r, fired) => r.status !== 'archived' && isPastOneOff(r, fired || firedRoutineIds());
+/* saved · done · all — which slice of the Library is showing. */
+let libraryFilter = 'saved';
+const LIBRARY_FILTERS = [
+  { id: 'saved', label: 'Saved' },
+  { id: 'done', label: 'Done' },
+  { id: 'all', label: 'All' },
+];
+
 function counts() {
   const fired = firedRoutineIds();
-  const c = { scheduled: 0, library: 0, archived: 0, history: 0, historyFail: 0, board: notes.filter((n) => n.status === 'active').length };
+  const c = { scheduled: 0, library: 0, libraryDone: 0, archived: 0, history: 0, historyFail: 0, board: notes.filter((n) => n.status === 'active').length };
   routines.forEach((r) => {
     if (r.status === 'archived') { c.archived++; return; }
     // Scheduled counts only what is still queued; a fired one-off is not.
     if (r.status === 'scheduled' && !isPastOneOff(r, fired)) c.scheduled++;
-    // The Library is every non-archived routine — scheduled ones stay live in
-    // it, and fired one-offs stay on the shelf. Only archiving removes one.
-    c.library++;
+    // The Library badge counts the shelf — what you would actually reach for —
+    // not the whole history of the account.
+    if (isCompletedRoutine(r, fired)) c.libraryDone++; else c.library++;
   });
   const items = historyItems();
   c.history = items.length;
@@ -877,31 +937,53 @@ function render() {
   if (currentView === 'history') return renderHistory();
   const fired = firedRoutineIds();
   const items = routines.filter((r) => {
-    // Library = every non-archived routine, scheduled ones included (they stay
-    // live in the Library; only archiving takes a routine off the air).
+    // Library = every non-archived routine, sliced by the Saved/Done filter.
     if (currentView === 'library' ? r.status === 'archived' : r.status !== currentView) return false;
     if (currentView === 'archived') return true;
-    // The Library is permanent: a routine you made stays on the shelf even after
-    // a one-off has fired, so you can re-run or re-schedule it. Only archiving
-    // takes one off. (Scheduled still drops past one-offs — they are no longer
-    // queued — and History still records the run itself.)
-    if (currentView === 'library') return true;
+    if (currentView === 'library') {
+      const done = isCompletedRoutine(r, fired);
+      return libraryFilter === 'all' ? true : (libraryFilter === 'done' ? done : !done);
+    }
     return !isPastOneOff(r, fired); // Scheduled: past one-offs are no longer queued
   }).sort((a, b) =>
     currentView === 'scheduled' ? new Date(a.scheduledAt || 0) - new Date(b.scheduledAt || 0) : new Date(b.updatedAt) - new Date(a.updatedAt));
-  if (!items.length) return renderEmpty();
-  view.innerHTML = `<div class="grid">${items.map(card).join('')}</div>`;
+  const bar = currentView === 'library' ? libraryBarHtml() : '';
+  if (!items.length) { view.innerHTML = bar; return renderEmpty(true); }
+  view.innerHTML = `${bar}<div class="grid">${items.map(card).join('')}</div>`;
+  bindLibraryBar();
   bindCards();
 }
 
-function renderEmpty() {
+/* The Library's own filter row: the shelf, the finished work, or both. */
+function libraryBarHtml() {
+  const c = counts();
+  const n = { saved: c.library, done: c.libraryDone, all: c.library + c.libraryDone };
+  const btns = LIBRARY_FILTERS.map((f) => `<button class="btn btn--sm ${libraryFilter === f.id ? 'btn--secondary' : 'btn--ghost'}" data-libf="${f.id}">${f.label} <span class="libbar__n">${n[f.id]}</span></button>`).join('');
+  const note = libraryFilter === 'done'
+    ? 'Routines that already ran. <b>Copy</b> puts a fresh one back on the shelf; the run itself is in Chat.'
+    : 'What you keep to run again — queued routines, repeating ones, and anything you saved but haven’t fired.';
+  return `<div class="libbar"><div class="libbar__btns">${btns}</div><span class="libbar__note">${note}</span></div>`;
+}
+function bindLibraryBar() {
+  $$('[data-libf]', view).forEach((b) => b.addEventListener('click', () => {
+    libraryFilter = b.dataset.libf;
+    render();
+  }));
+}
+
+function renderEmpty(keepBar = false) {
+  const libCopy = libraryFilter === 'done'
+    ? ['Nothing has run yet', 'One-off routines move here once they fire. Their transcripts live in Chat.']
+    : ['Your shelf is empty', 'The Library holds what you keep to run again. Save a routine here — or save a chat prompt from Chat — and it waits for you.'];
   const copy = {
     scheduled: ['No routines queued', 'Create a routine and give it a time to line it up here.'],
-    library: ['Your library is empty', 'Every routine you keep lives here — scheduled ones stay live on the calendar too. Only archiving takes one off the air.'],
+    library: libCopy,
     archived: ['Nothing archived', 'Archived routines rest here. Restore them to the library anytime.'],
   }[currentView];
-  view.innerHTML = `<div class="grid"><div class="empty"><h3>${copy[0]}</h3><p>${copy[1]}</p>
+  const empty = `<div class="grid"><div class="empty"><h3>${copy[0]}</h3><p>${copy[1]}</p>
     <button class="btn btn--primary" data-act="new">New routine</button></div></div>`;
+  if (keepBar) view.insertAdjacentHTML('beforeend', empty); else view.innerHTML = empty;
+  if (keepBar) bindLibraryBar();
   $('[data-act="new"]', view)?.addEventListener('click', () => openDrawer());
 }
 
@@ -931,7 +1013,7 @@ function card(r) {
   return `<article class="card" data-id="${r.id}">
     <div class="card__head"><span class="card__title">${esc(r.title) || '<em>Untitled routine</em>'}</span>${statusChip(r)}</div>
     <div class="card__prompt">${esc(r.prompt) || '(no prompt)'}</div>
-    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${triggerColor(r.account, r.triggerKey).solid}"></span><b>${esc(acctText)}</b></span><span class="card__meta-item"><b>${esc(modelName)}</b></span><span class="card__meta-item"><b>${fmtDuration(r.durationMin || DEFAULT_DURATION_MIN)}</b></span>${cost}${when}</div>
+    <div class="card__meta">${recur}<span class="card__meta-item"><span class="acct-dot" style="background:${triggerColor(r.account, r.triggerKey).solid}"></span><b>${esc(acctText)}</b></span><span class="card__meta-item" title="Its color on the calendar"><span class="acct-dot" style="background:${routineColor(r)}"></span><b>${esc(modelName)}</b></span><span class="card__meta-item"><b>${fmtDuration(r.durationMin || DEFAULT_DURATION_MIN)}</b></span>${cost}${when}</div>
     <div class="card__foot">${cardActions(r)}</div>
   </article>`;
 }
@@ -963,8 +1045,10 @@ function bindCards() {
         render(); await fireTrigger(r); return;
       }
       if (act === 'duplicate') {
-        const made = await dbCreate({ title: (r.title || 'Untitled') + ' (copy)', prompt: r.prompt, model: r.model, taskType: r.taskType, complexity: r.complexity, recurrence: r.recurrence, status: 'library', scheduledAt: null });
-        if (made) { render(); toast('Duplicated to Library.'); } return;
+        const made = await dbCreate({ title: (r.title || 'Untitled') + ' (copy)', prompt: r.prompt, model: r.model, taskType: r.taskType, complexity: r.complexity, recurrence: r.recurrence, account: r.account, triggerKey: r.triggerKey, durationMin: r.durationMin, status: 'library', scheduledAt: null });
+        // A copy is unfired, so it lands on the shelf — show the shelf, or the
+        // copy would be filed somewhere the reader isn't looking.
+        if (made) { libraryFilter = 'saved'; render(); toast('Copied to your Library shelf.'); } return;
       }
       if (act === 'library' || act === 'archive') {
         await dbUpdate(r.id, Object.assign({}, r, { status: act === 'archive' ? 'archived' : 'library', scheduledAt: null }));
@@ -1149,6 +1233,7 @@ const runDrafts = new Map(); // id → unsent reply text, so re-renders never ea
 const NEW_CHAT_ID = '__new-chat__';
 let newChatDraft = '';       // survives the pane's live re-renders
 let newChatInstance = null;  // { account, triggerKey } the composer will fire on
+let newChatModel = null;     // { account, triggerKey, model } — a per-chat model pick
 
 /* Every agent instance the user has configured, flattened to pickable rows. */
 function agentInstances() {
@@ -1168,6 +1253,19 @@ function currentChatInstance() {
   if (!all.length) return null;
   const picked = newChatInstance && all.find((i) => i.account === newChatInstance.account && i.triggerKey === newChatInstance.triggerKey);
   return picked || all[0];
+}
+
+/* The model a new chat will run on: the reader's pick if they made one and it
+   is still offered, else the instance's own. Kept out of `newChatInstance` so
+   switching instances moves the model with it rather than stranding a pick that
+   belonged to a different one. */
+function currentChatModel() {
+  const inst = currentChatInstance();
+  if (!inst) return '';
+  const fallback = triggerModel(inst.account, inst.triggerKey);
+  if (!newChatModel) return fallback;
+  return newChatModel.account === inst.account && newChatModel.triggerKey === inst.triggerKey
+    ? newChatModel.model : fallback;
 }
 
 /* A run's title comes from its opening message — the first line, trimmed to
@@ -1675,7 +1773,13 @@ function newChatPaneHtml() {
     ? `<select class="select hx__instance" id="chat-instance" aria-label="Which instance to run on">${all.map((i) =>
         `<option value="${esc(i.account)}|${esc(i.triggerKey)}" ${inst && i.account === inst.account && i.triggerKey === inst.triggerKey ? 'selected' : ''}>${esc(i.label)}</option>`).join('')}</select>`
     : '';
-  const model = inst ? modelLabel(triggerModel(inst.account, inst.triggerKey)) : '';
+  // Pick the model for this chat, not only which instance runs it (issue #102).
+  // It starts on the instance's own model, so not touching it changes nothing.
+  const chatModel = currentChatModel();
+  const modelPicker = inst
+    ? `<select class="select hx__instance" id="chat-model" aria-label="Which model to run on">${modelOptionsHtml(chatModel, { auto: false, via: 'openrouter' })}</select>`
+    : '';
+  const model = inst ? modelLabel(chatModel) : '';
   const body = inst
     ? `<div class="empty">
         <h3>New chat</h3>
@@ -1689,14 +1793,17 @@ function newChatPaneHtml() {
     ? `<div class="hx__compose">
         <div class="hx__compose-inner">
           <textarea class="textarea chat__input" id="chat-input" placeholder="What do you want done? (Enter to send)" ${runBusy ? 'disabled' : ''}>${esc(newChatDraft)}</textarea>
-          <button class="btn btn--primary" id="chat-send" ${runBusy ? 'disabled' : ''}>Send</button>
+          <div class="hx__compose-btns">
+            <button class="btn btn--primary" id="chat-send" ${runBusy ? 'disabled' : ''}>Send</button>
+            <button class="btn btn--ghost btn--sm" id="chat-save" type="button" title="Keep this prompt in the Library to run or schedule later">Save to Library</button>
+          </div>
         </div>
       </div>`
     : '';
   return `<div class="hx__head">
       <button type="button" class="hx__railbtn" id="hx-railbtn" aria-label="Show the run list">☰ Runs</button>
       <h2 class="hx__title">New chat</h2>
-      <span class="hx__head-actions">${picker}</span>
+      <span class="hx__head-actions">${picker}${modelPicker}</span>
     </div>
     <div class="hx__thread" id="hx-thread">
       <div class="hx__thread-inner">
@@ -1775,13 +1882,22 @@ function wireRunPane(it) {
     $('#chat-instance', main)?.addEventListener('change', (e) => {
       const [account, triggerKey] = String(e.target.value || '').split('|');
       newChatInstance = { account, triggerKey };
+      // The model belongs to the instance it was picked on; a new instance
+      // starts on its own model rather than inheriting the last one.
+      newChatModel = null;
+      renderRunPane(NEW_CHAT_ID);
     });
-    main.dataset.newChatSig = `${runBusy}|${(currentChatInstance() || {}).triggerKey || ''}`;
+    $('#chat-model', main)?.addEventListener('change', (e) => {
+      const i = currentChatInstance();
+      if (i) newChatModel = { account: i.account, triggerKey: i.triggerKey, model: e.target.value };
+    });
+    main.dataset.newChatSig = newChatSig();
     const box = $('#chat-input', main);
     if (box) {
       const send = () => startChat(box.value);
       box.addEventListener('input', () => { newChatDraft = box.value; });
       $('#chat-send', main)?.addEventListener('click', send);
+      $('#chat-save', main)?.addEventListener('click', () => saveChatPrompt(box.value));
       box.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
     }
     return;
@@ -1809,7 +1925,7 @@ function renderRunPane(it, { focus = false } = {}) {
   // rewrite it out from under the reader's cursor, so repaint only when the
   // pane would actually differ.
   if (it === NEW_CHAT_ID) {
-    const sig = `${runBusy}|${(currentChatInstance() || {}).triggerKey || ''}`;
+    const sig = newChatSig();
     if (main.dataset.newChatSig === sig && $('#chat-input', main)) return;
     main.dataset.newChatSig = sig;
   } else {
@@ -1903,7 +2019,7 @@ async function startChat(raw) {
   if (!inst) { toast('Add an OpenRouter agent account in Settings first.', 'error'); return; }
   const { error } = await sessionForFire();
   if (error) { toast(error, 'error'); return; }
-  const model = triggerModel(inst.account, inst.triggerKey);
+  const model = currentChatModel();
   runBusy = true;
   newChatDraft = '';
   renderRunPane(NEW_CHAT_ID);
@@ -1929,6 +2045,35 @@ async function startChat(raw) {
     newChatDraft = text;
     renderRunPane(NEW_CHAT_ID, { focus: true });
   }
+}
+
+/* Keep the prompt, not just the answer (issue #100). A message you are about to
+   send is often the thing worth having again next week, and the only way to get
+   it onto the shelf used to be re-typing it into the routine drawer. This saves
+   it as an unscheduled Library routine aimed at the same instance the chat would
+   have run on, so Run now / Schedule on the card do exactly what Send would
+   have. The draft is left in the box — saving is not sending. */
+async function saveChatPrompt(raw) {
+  const text = (raw || '').trim();
+  if (!text) { toast('Type a prompt first.', 'error'); return; }
+  const inst = currentChatInstance();
+  const title = chatTitleFrom(text);
+  const made = await dbCreate({
+    title, prompt: text, status: 'library', scheduledAt: null,
+    account: inst ? inst.account : (settings.account || DEFAULT_ACCOUNT),
+    triggerKey: inst ? inst.triggerKey : null,
+    model: inst ? currentChatModel() : settings.model,
+    durationMin: DEFAULT_DURATION_MIN, recurrence: 'none', tz: localTz(),
+  });
+  if (made) { libraryFilter = 'saved'; paintCounts(); toast(`Saved “${title}” to your Library.`); }
+}
+
+/* What would actually change on the New chat pane. Anything not in here must
+   not trigger a repaint: another run finishing 8s into a half-typed message
+   must not rewrite the pane out from under the reader's cursor. */
+function newChatSig() {
+  const i = currentChatInstance() || {};
+  return `${runBusy}|${i.account || ''}|${i.triggerKey || ''}|${currentChatModel()}`;
 }
 
 /* Swap the pane to the New chat composer without leaving Chat. */
@@ -2076,13 +2221,17 @@ function calEventHtml(ev) {
   const top = ((s - winStart) / 60) * CAL.hourPx;
   const height = Math.max(((e - s) / 60) * CAL.hourPx, 20);
   const widthPct = 100 / ev.ncols, leftPct = ev.col * widthPct;
-  const c = triggerColor(ev.routine.account, ev.routine.triggerKey);
+  const c = blockSwatch(ev.routine);
   const past = ev.start.getTime() < Date.now();
   const hm = (d) => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
   const timeStr = `${hm(ev.start)}–${hm(ev.end)}`;
   const showTime = height >= 34;
   const tLabel = triggerLabel(ev.routine.account, ev.routine.triggerKey);
   const acctText = accountLabel(ev.routine.account) + (tLabel ? ` · ${tLabel}` : '');
+  // The block says what it is; the model behind its color is one tap away (open
+  // it) and one hover away (here). That is the trade the legend used to make
+  // badly — a permanent key above the grid, for a fact you want per block.
+  const modelText = modelFullLabel(effectiveModel(ev.routine));
   // A block that has already run is a record of something that happened, so it
   // can be renamed in place — no drawer, no round trip. Future blocks still open
   // the drawer on tap, where the title is one of several things to set.
@@ -2092,7 +2241,7 @@ function calEventHtml(ev) {
   const rename = past
     ? `<button type="button" class="cal__ev-edit" data-rename="${ev.routine.id}" title="${esc(renameTip)}" aria-label="Rename">✎</button>`
     : '';
-  return `<div class="cal__ev${past ? ' cal__ev--past' : ''}" data-id="${ev.routine.id}" title="${esc(ev.routine.title)} · ${esc(acctText)} · ${timeStr}"
+  return `<div class="cal__ev${past ? ' cal__ev--past' : ''}" data-id="${ev.routine.id}" title="${esc(ev.routine.title)} · ${esc(modelText)} · ${esc(acctText)} · ${timeStr}"
     style="top:${top}px; height:${height}px; left:calc(${leftPct}% + 3px); width:calc(${widthPct}% - 5px); background:${c.solid}; color:${c.ink}; border-left-color:${c.edge};">
     <div class="cal__ev-title">${esc(ev.routine.title) || 'Untitled'}</div>
     ${showTime ? `<div class="cal__ev-time">${timeStr}</div>` : ''}
@@ -2100,27 +2249,17 @@ function calEventHtml(ev) {
   </div>`;
 }
 
-/* Legend groups: each account with the union of its configured triggers AND any
-   trigger keys that actually appear on scheduled routines (so a routine pointing
-   at a removed/legacy trigger still gets a labeled swatch — the key shows a color
-   per trigger in use, not just the ones currently in Settings). */
-function legendGroups() {
-  const groups = new Map(); // accId → { label, triggers: Map(tId → label) }
-  const ensure = (accId) => {
-    if (!groups.has(accId)) groups.set(accId, { label: accountLabel(accId), triggers: new Map() });
-    return groups.get(accId);
-  };
-  listAccounts().forEach((a) => {
-    const g = ensure(a.id);
-    (a.triggers || []).forEach((t) => g.triggers.set(t.id, t.label || '(unnamed)'));
-  });
-  routines.forEach((r) => {
-    const accId = r.account || DEFAULT_ACCOUNT;
-    const g = ensure(accId);
-    const key = r.triggerKey || '';
-    if (!g.triggers.has(key)) g.triggers.set(key, triggerLabel(accId, r.triggerKey) || '(other)');
-  });
-  return groups;
+/* A calendar block's color is its MODEL's color (issue #101). The key that used
+   to sit above the grid is gone: it explained a color scheme keyed on accounts
+   and triggers, which is not the thing a reader wants named, and it cost a row
+   of chrome on every screen to say it. The scheme now lives in Settings →
+   Models, where each model's swatch is also editable, and the model itself is
+   on the block's tooltip and in the drawer the block opens.
+
+   The ink/edge shades are still derived from the solid, so a light custom color
+   gets dark text without the user having to think about contrast. */
+function blockSwatch(routine) {
+  return swatch(routineColor(routine, getActivePolicy()));
 }
 
 /* Rename a past block in place: the title becomes an input right on the
@@ -2174,14 +2313,6 @@ function renderCalendar() {
 
   const rangeLabel = `${weekStart.toLocaleDateString([], { month: 'short', day: 'numeric' })} – ${weekEnd.toLocaleDateString([], { month: weekStart.getMonth() === weekEnd.getMonth() ? undefined : 'short', day: 'numeric' })}`;
 
-  const legend = Array.from(legendGroups().entries()).map(([accId, g]) => {
-    const trigs = Array.from(g.triggers.entries());
-    const items = trigs.length
-      ? trigs.map(([tId, tLabel]) => `<span class="cal__legtrig" title="${esc(g.label)} · ${esc(tLabel)}"><span class="cal__sw" style="background:${triggerColor(accId, tId || null).solid}"></span>${esc(tLabel)}</span>`).join('')
-      : `<span class="cal__legtrig"><span class="cal__sw" style="background:${accountColor(accId).solid}"></span></span>`;
-    return `<span class="cal__leg"><span class="cal__leg-name">${esc(g.label)}</span>${items}</span>`;
-  }).join('');
-
   const dayHeaders = days.map((d) => {
     const isToday = sameDate(d, today);
     return `<div class="cal__dh${isToday ? ' cal__dh--today' : ''}"><div class="cal__dow">${DOW[(d.getDay() + 6) % 7]}</div><div class="cal__dnum">${d.getDate()}</div></div>`;
@@ -2205,7 +2336,7 @@ function renderCalendar() {
       <button class="cal__today" data-cal="today">Today</button>
       <div class="cal__nav cal__zoom" title="Zoom the timeline — or pinch on a touch screen"><button class="cal__navbtn" data-cal="zoomout" aria-label="Zoom out" ${CAL.hourPx <= CAL_HOURPX_MIN ? 'disabled' : ''}>−</button><button class="cal__navbtn" data-cal="zoomin" aria-label="Zoom in" ${CAL.hourPx >= CAL_HOURPX_MAX ? 'disabled' : ''}>＋</button></div>
       <span class="cal__count">${total} event${total === 1 ? '' : 's'} this week</span>
-      <div class="cal__legend">${legend}</div>
+      <button class="cal__key" data-cal="colors" type="button" title="Block colors come from the model that runs them — set them in Settings → Models">Colors</button>
     </div>
     <div class="cal__head"><div></div>${dayHeaders}</div>
     <div class="cal__scroll"><div class="cal__body">${gutter}${dayCols}</div></div>
@@ -2214,6 +2345,7 @@ function renderCalendar() {
 
   view.querySelectorAll('[data-cal]').forEach((b) => b.addEventListener('click', () => {
     const a = b.dataset.cal;
+    if (a === 'colors') return openSettings({ focus: 'models' }); // where the key lives now
     if (a === 'today') calRef = new Date();
     else if (a === 'zoomin') setCalHourPx(CAL.hourPx * 1.4);
     else if (a === 'zoomout') setCalHourPx(CAL.hourPx / 1.4);
@@ -2452,7 +2584,8 @@ function openDrawer(routine = null, opts = {}) {
       <span class="hint">Runs Perplexity deep research via OpenRouter — no Claude session, no token. Abstrax needs its service key set server-side to actually write.</span>
     </div>
     <div class="field"><label class="label" for="f-model">Model</label>
-      <select class="select" id="f-model">${MODELS.map((m) => `<option value="${m.id}" ${(r.model || settings.model) === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select></div>
+      <select class="select" id="f-model">${modelOptionsHtml(r.model || settings.model)}</select>
+      <span class="hint">Grouped by lab, three tiers each, with the per-million-token rate. Its color is the block's color on the calendar — edit both in Settings → Models.</span></div>
     <div class="field__row" id="f-auto-row">
       <div class="field"><label class="label" for="f-tasktype">Task type</label>
         <select class="select" id="f-tasktype">${TASK_TYPES.map((t) => `<option value="${t.id}" ${(r.taskType || DEFAULT_TASK_TYPE) === t.id ? 'selected' : ''}>${t.label}</option>`).join('')}</select></div>
@@ -2501,8 +2634,23 @@ function refreshDrawerKind() {
   // Toggle fields by kind. Prompt is hidden only for enrichment (agent uses it).
   const hide = (sel, cond) => { const el = $(sel, drawerBody)?.closest('.field'); if (el) el.style.display = cond ? 'none' : ''; };
   hide('#f-prompt', isEnrich);
-  hide('#f-model', nonClaude);
+  // An agent routine keeps the model picker — that is the whole of issue #102 on
+  // this screen. It is narrowed to models the agent can actually run, and it
+  // starts on the instance's own model so leaving it alone changes nothing.
+  // Only the enrichment account hides it (its model is the Perplexity select).
+  hide('#f-model', isEnrich);
   hide('#f-test', nonClaude);
+  const modelSel = $('#f-model', drawerBody);
+  if (modelSel && isAgent) {
+    const tId = $('#f-trigger', drawerBody)?.value || null;
+    const cur = modelSel.dataset.kind === 'agent' ? modelSel.value : (modelSel.value && modelSel.value !== 'auto' ? modelSel.value : triggerModel(acc, tId));
+    modelSel.innerHTML = modelOptionsHtml(cur, { auto: false, via: 'openrouter' });
+    modelSel.dataset.kind = 'agent';
+  } else if (modelSel && modelSel.dataset.kind === 'agent') {
+    // Switched back to a Claude account: restore the full catalog.
+    modelSel.innerHTML = modelOptionsHtml(modelSel.value);
+    delete modelSel.dataset.kind;
+  }
   const autoRow = $('#f-auto-row', drawerBody); if (autoRow && nonClaude) autoRow.style.display = 'none';
   const hint = $('#f-model-hint', drawerBody); if (hint) hint.style.display = nonClaude ? 'none' : '';
   // Agent instance hint: which model + tools this instance runs.
@@ -2514,7 +2662,7 @@ function refreshDrawerKind() {
       const m = triggerModel(acc, tId);
       const tools = triggerTools(acc, tId);
       const toolNames = tools.length ? tools.map((id) => (AGENT_TOOLS.find((x) => x.id === id) || {}).label || id).join(', ') : 'no tools';
-      ah.innerHTML = `Runs <b>${esc(modelLabel(m))}</b> <code>${esc(m)}</code> with ${esc(toolNames)}. Its output lands in History, where you can reply to continue it. Change the model &amp; tools in Settings.`;
+      ah.innerHTML = `This instance runs <b>${esc(modelLabel(m))}</b> <code>${esc(m)}</code> by default, with ${esc(toolNames)}. Pick a different model below to run <em>this</em> routine on it. Its output lands in Chat, where you can reply to continue it; tools are per instance, in Settings.`;
     }
   }
   const promptLabel = $('label[for="f-prompt"]', drawerBody);
@@ -2573,10 +2721,13 @@ function readDrawer() {
     return Object.assign(common, { title, prompt: JSON.stringify(cfg), model, taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY, openrouter: true });
   }
   if (isAgentKind(account)) {
-    // Agent routine: plain-text task. The model comes from the chosen instance
-    // (stored on the routine's `model` column so cards/forecasts show it).
+    // Agent routine: plain-text task, on the model the drawer's picker is
+    // showing — which starts on the instance's own, so an untouched drawer
+    // still saves what the instance would have run.
+    const picked = ($('#f-model').value || '').trim();
     return Object.assign(common, { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value,
-      model: triggerModel(account, common.triggerKey), taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY });
+      model: (picked && picked !== 'auto') ? picked : triggerModel(account, common.triggerKey),
+      taskType: DEFAULT_TASK_TYPE, complexity: DEFAULT_COMPLEXITY });
   }
   return Object.assign(common, { title: $('#f-title').value.trim(), prompt: $('#f-prompt').value, model: $('#f-model').value, taskType: $('#f-tasktype').value, complexity: $('#f-complexity').value });
 }
@@ -2689,7 +2840,7 @@ function renderCfgAccounts() {
         <span class="pill" title="Runs an OpenRouter model with tools">⚡ Agent</span>
         <button class="iconbtn" title="Remove account" data-act="del-acct" data-ai="${ai}">✕</button>
       </div>
-      <input class="input cfg-akey" data-ai="${ai}" type="password" autocomplete="off" placeholder="${a.key ? '•••• key saved — blank to keep' : 'OpenRouter API key (sk-or-…) — blank = use server key'}" />
+      <input class="input cfg-akey" data-ai="${ai}" type="password" autocomplete="off" placeholder="${a.key ? '•••• key saved — blank to keep' : 'Own OpenRouter key (sk-or-…) — blank = the key in Keys, above'}" />
       <div class="hint" style="padding:4px 2px"><b>Fix code (GitHub)</b> lets this non-Claude model read the repo and open/merge pull requests — no Claude session. It needs a <code>GITHUB_TOKEN</code> edge secret (and <code>GITHUB_REPO</code>); merging also needs <code>AGENT_ALLOW_MERGE=true</code>. Without them the checkbox is inert.</div>
       <div class="trig-list">${a.triggers.map((t, ti) => `
         <div class="trig-cfg">
@@ -2698,7 +2849,7 @@ function renderCfgAccounts() {
             <input class="input cfg-tlabel" data-ai="${ai}" data-ti="${ti}" value="${esc(t.label)}" placeholder="Instance name" />
             <button class="iconbtn" title="Remove instance" data-act="del-trig" data-ai="${ai}" data-ti="${ti}">✕</button>
           </div>
-          <select class="select cfg-tmodel" data-ai="${ai}" data-ti="${ti}">${AGENT_MODELS().map((m) => `<option value="${m.id}" ${(t.model || DEFAULT_AGENT_MODEL) === m.id ? 'selected' : ''}>${esc(m.label.split(' — ')[0])}</option>`).join('')}</select>
+          <select class="select cfg-tmodel" data-ai="${ai}" data-ti="${ti}">${modelOptionsHtml(t.model || DEFAULT_AGENT_MODEL, { auto: false, via: 'openrouter' })}</select>
           <div class="trig-tools">${AGENT_TOOLS.map((tool) => `<label class="tool-chk"><input type="checkbox" class="cfg-ttool" data-ai="${ai}" data-ti="${ti}" data-tool="${tool.id}" ${normalizeTools(t.tools).includes(tool.id) ? 'checked' : ''} /> ${esc(tool.label)}</label>`).join('')}</div>
           <div class="trig-test"><button class="btn btn--ghost btn--sm" data-act="test-trig" data-ai="${ai}" data-ti="${ti}">Save &amp; test run</button><span class="trig-status" data-ai="${ai}" data-ti="${ti}"></span></div>
         </div>`).join('')}</div>
@@ -2799,10 +2950,9 @@ async function testAgentRun(ai, ti) {
 /* Auto-routing policy editor — a task_type × complexity grid of model pickers.
    Prefilled from the live policy (the user's saved one, else the built-in
    default). Routing targets are concrete models, so 'auto' is excluded. */
-const POLICY_MODELS = MODELS.filter((m) => m.id !== 'auto');
 function policyEditorHtml() {
   const pol = getActivePolicy();
-  const opts = (sel) => POLICY_MODELS.map((m) => `<option value="${m.id}" ${sel === m.id ? 'selected' : ''}>${esc(m.label.split(' — ')[0])}</option>`).join('');
+  const opts = (sel) => modelOptionsHtml(sel, { auto: false });
   const rows = TASK_TYPES.map((tt) => `
     <tr><th class="pol-th">${esc(tt.label)}</th>${COMPLEXITIES.map((cx) => {
       const cur = (pol[tt.id] && pol[tt.id][cx.id]) || '';
@@ -2825,7 +2975,80 @@ function policyIsDefault(pol) {
     (pol[tt.id] || {})[cx.id] === ROUTING_POLICY[tt.id][cx.id]));
 }
 
-async function openSettings() {
+/* ---------- Settings → Models ----------
+   The catalog ships filled in, so nothing here has to be typed to get started
+   (issue #104). Two things are yours to change, and they are the two that go
+   stale: the **color** each model wears on the calendar — this is the key the
+   calendar no longer prints above itself (issue #101) — and the **slug**, which
+   labs rename and retire on their own schedule.
+
+   A slug edit re-points the catalog row. Routines already saved keep the slug
+   they were pinned to (that is what actually runs), and still show their name
+   and color, because lookups fall back to the shipped table. */
+function modelsEditorHtml() {
+  return catalogByLab().map((lab) => `
+    <div class="mdl-lab">
+      <div class="mdl-lab__head"><span class="mdl-lab__name">${esc(lab.name)}</span><span class="mdl-lab__origin">${esc(lab.origin)}</span></div>
+      ${lab.models.map((m) => `
+        <div class="mdl-row">
+          <input type="color" class="mdl-color" data-key="${esc(m.key)}" value="${esc(m.color.toLowerCase())}" title="Calendar color for ${esc(m.name)}" aria-label="Color for ${esc(m.name)}" />
+          <span class="mdl-row__name">${esc(m.name)}</span>
+          <input class="input mdl-slug" data-key="${esc(m.key)}" value="${esc(m.slug)}" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Model slug for ${esc(m.name)}" />
+          <span class="mdl-row__meta"><span class="mdl-row__tier">${esc(TIER_LABEL[m.tier])}</span><span class="mdl-row__rate" title="USD per million tokens, in / out">${esc(rateLabel(m.slug))}</span></span>
+          <span class="mdl-row__check" data-key="${esc(m.key)}"></span>
+        </div>`).join('')}
+    </div>`).join('');
+}
+/* Read the grid back as prefs. Only genuine differences from the shipped row
+   are stored, so "reset to defaults" is the absence of an entry rather than a
+   copy of the default that would silently pin a model the catalog later moves. */
+function readModelPrefsFromDom() {
+  const byKey = Object.fromEntries(DEFAULT_CATALOG.map((m) => [m.key, m]));
+  const slugs = {}, colors = {};
+  $$('.mdl-slug').forEach((el) => {
+    const d = byKey[el.dataset.key]; const v = el.value.trim();
+    if (d && v && v !== d.slug) slugs[el.dataset.key] = v;
+  });
+  $$('.mdl-color').forEach((el) => {
+    const d = byKey[el.dataset.key]; const v = String(el.value || '').toUpperCase();
+    if (d && v && v !== d.color.toUpperCase()) colors[el.dataset.key] = v;
+  });
+  return normalizeModelPrefs({ slugs, colors });
+}
+/* Ask OpenRouter which ids it actually serves and mark each row. The catalog is
+   a snapshot and models get renamed; this turns "my agent run 400s and I don't
+   know why" into a ✓/✕ next to the slug. Public endpoint, no key. Claude rows
+   are skipped — they fire Claude Code sessions, not OpenRouter. */
+async function checkModelSlugs(btn) {
+  const marks = $$('.mdl-row__check');
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Checking…';
+  marks.forEach((el) => { el.textContent = ''; el.className = 'mdl-row__check'; });
+  try {
+    const r = await fetch('https://openrouter.ai/api/v1/models');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    const ids = new Set((data.data || []).map((m) => m.id));
+    const slugOf = Object.fromEntries($$('.mdl-slug').map((el) => [el.dataset.key, el.value.trim()]));
+    const viaOf = Object.fromEntries(DEFAULT_CATALOG.map((m) => [m.key, m.via]));
+    let missing = 0;
+    marks.forEach((el) => {
+      const key = el.dataset.key;
+      if (viaOf[key] === 'claude') { el.textContent = '–'; el.title = 'Claude model — runs as a Claude Code session, not through OpenRouter'; return; }
+      const ok = ids.has(slugOf[key]);
+      if (!ok) missing++;
+      el.textContent = ok ? '✓' : '✕';
+      el.className = 'mdl-row__check ' + (ok ? 'is-ok' : 'is-err');
+      el.title = ok ? 'OpenRouter serves this id' : 'OpenRouter does not list this id — edit the slug';
+    });
+    toast(missing ? `${missing} slug${missing === 1 ? '' : 's'} OpenRouter doesn’t list — edit them here.` : 'Every OpenRouter slug checks out.', missing ? 'error' : '');
+  } catch (e) {
+    toast(`Couldn’t reach OpenRouter’s model list: ${e.message}`, 'error');
+  }
+  btn.disabled = false; btn.textContent = label;
+}
+
+async function openSettings(opts = {}) {
   editingId = null;
   drawerTitle.textContent = 'Settings';
   drawerBody.innerHTML = `<div class="notice">Loading your settings…</div>`;
@@ -2835,12 +3058,16 @@ async function openSettings() {
   cfgModel = normalizeAccounts(await dbLoadAccountCreds(), true);
 
   drawerBody.innerHTML = `
-    <div class="notice">Add a Claude <b>account</b>, then give it one or more <b>triggers</b> — each is a Fire URL (or <code>trig_…</code>) + token. Or add an <b>OpenRouter account</b> whose named <b>instances</b> each run a model (e.g. Kimi) with tools to read your data, research the web, and write into your apps — their output lands in <b>Chat</b>, where you can reply to continue the conversation. Routines pick which trigger/instance fires them. Saved to your account and used server-side; no Netlify setup needed.</div>
+    <div class="notice">Two things to set up: your <b>Claude trigger</b>(s) — a Fire URL (or <code>trig_…</code>) + token per instance — and your <b>OpenRouter key</b>, below. Everything else already has a value: the model catalog ships filled in, each model has a color, and <b>Auto</b> has a routing table. Adjust those only if you want to.</div>
+    <div class="cfg-sep">Keys</div>
+    <div class="field"><label class="label" for="s-or-key">OpenRouter key</label>
+      <input class="input" id="s-or-key" type="password" autocomplete="off" placeholder="${settings.openrouterKey ? '•••• saved — blank to clear' : 'sk-or-…'}" value="${esc(settings.openrouterKey)}" />
+      <span class="hint">One key for every non-Claude model: it runs your <b>agent instances</b> and the drawer's <b>Test live</b> button. An account below can still override it with its own. Get one at <code>openrouter.ai/keys</code>. (A server-side key set as the <code>OPENROUTER_API_KEY</code> edge secret is used when this is blank.)</span></div>
     <div class="field__row">
       <div class="field"><label class="label" for="s-account">Default account</label>
         <select class="select" id="s-account">${cfgModel.map((a) => `<option value="${a.id}" ${(settings.account || DEFAULT_ACCOUNT) === a.id ? 'selected' : ''}>${esc(a.label)}</option>`).join('')}</select></div>
       <div class="field"><label class="label" for="s-model">Default model</label>
-        <select class="select" id="s-model">${MODELS.map((m) => `<option value="${m.id}" ${settings.model === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}</select>
+        <select class="select" id="s-model">${modelOptionsHtml(settings.model)}</select>
         <span class="hint">New routines start here. <b>Auto</b> lets Routiner pick per task.</span></div>
     </div>
     <div class="cfg-sep">Firing</div>
@@ -2856,6 +3083,13 @@ async function openSettings() {
     </div>
     <div class="cfg-sep">Accounts &amp; triggers</div>
     <div id="cfg-accounts"></div>
+    <div class="cfg-sep" id="cfg-models-sep">Models &amp; colors</div>
+    <div class="notice">The colors your calendar blocks wear — this is the key that used to sit above the grid. Each model ships with one; click a swatch to change it. The <b>slug</b> is what gets sent to the provider, so when a lab renames a model you fix it here instead of waiting for an update. Routines already saved keep the slug they were pinned to.</div>
+    <div id="cfg-models">${modelsEditorHtml()}</div>
+    <div class="pol-actions">
+      <button class="btn btn--ghost btn--sm" id="mdl-check" type="button" title="Ask OpenRouter which of these ids it still serves">Check slugs</button>
+      <button class="btn btn--ghost btn--sm" id="mdl-reset" type="button">Reset models to defaults</button>
+    </div>
     <details class="cfg-adv"><summary>Auto-routing policy</summary>
       <div class="notice">Which model <b>Auto</b> picks per task type &amp; complexity. Both the app and the scheduler read this — leave it to use Routiner's defaults.</div>
       ${policyEditorHtml()}
@@ -2867,10 +3101,7 @@ async function openSettings() {
         <span class="hint">Leave blank to use <code>/.netlify/functions/claude-trigger</code>. Set a URL only to POST a different webhook directly (bypasses the accounts above).</span></div>
       <div class="field"><label class="label" for="s-key">Anthropic API key (“Test live” on Claude models)</label>
         <input class="input" id="s-key" type="password" autocomplete="off" placeholder="sk-ant-…" value="${esc(settings.anthropicKey)}" />
-        <span class="hint">Stored only in this browser; used only by the in-drawer Test button.</span></div>
-      <div class="field"><label class="label" for="s-or-key">OpenRouter API key (“Test live” on OpenRouter models)</label>
-        <input class="input" id="s-or-key" type="password" autocomplete="off" placeholder="sk-or-…" value="${esc(settings.openrouterKey)}" />
-        <span class="hint">Optional. Only needed to preview OpenRouter models. Get one at openrouter.ai/keys.</span></div>
+        <span class="hint">Stored only in this browser; used only by the in-drawer Test button. Scheduled Claude routines don't need it — they fire through your trigger.</span></div>
     </details>`;
   drawerFoot.innerHTML = `<button class="btn btn--primary" id="s-save">Save settings</button>`;
   renderCfgAccounts();
@@ -2884,6 +3115,16 @@ async function openSettings() {
   if (resetBtn) resetBtn.addEventListener('click', () => {
     $$('.pol-cell').forEach((el) => { el.value = ROUTING_POLICY[el.dataset.tt][el.dataset.cx]; });
   });
+  // Models: put every slug + color back to what shipped (saved on Save).
+  $('#mdl-reset')?.addEventListener('click', () => {
+    const byKey = Object.fromEntries(DEFAULT_CATALOG.map((m) => [m.key, m]));
+    $$('.mdl-slug').forEach((el) => { el.value = byKey[el.dataset.key].slug; });
+    $$('.mdl-color').forEach((el) => { el.value = byKey[el.dataset.key].color.toLowerCase(); });
+    $$('.mdl-row__check').forEach((el) => { el.textContent = ''; el.className = 'mdl-row__check'; });
+  });
+  $('#mdl-check')?.addEventListener('click', (e) => checkModelSlugs(e.currentTarget));
+  // Opened from the calendar's "Colors" button — land on the key, not the top.
+  if (opts.focus === 'models') setTimeout(() => $('#cfg-models-sep')?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 60);
 
   $('#s-save').addEventListener('click', async () => {
     syncCfgFromDom();
@@ -2891,13 +3132,25 @@ async function openSettings() {
     // A policy identical to the built-in default is stored as null (use defaults).
     const pol = readPolicyFromDom();
     const toStore = (!pol || policyIsDefault(pol)) ? null : pol;
-    const ok = await dbSaveAccountCreds(cfgModel, toStore);
+    const prefs = readModelPrefsFromDom();
+    const prefsToStore = modelPrefsAreDefault(prefs) ? null : prefs;
+    // One OpenRouter key, not one per account: the top-level key fills in for
+    // every agent account that hasn't set its own, and follows along when it's
+    // changed. An account that was deliberately given a different key keeps it.
+    const prevKey = (settings.openrouterKey || '').trim();
+    const orKey = $('#s-or-key').value.trim();
+    cfgModel.forEach((a) => {
+      if ((a.kind || '') !== 'openrouter-agent') return;
+      const own = (a.key || '').trim();
+      if (!own || (prevKey && own === prevKey)) a.key = orKey;
+    });
+    const ok = await dbSaveAccountCreds(cfgModel, toStore, prefsToStore);
     accountsCfg = normalizeAccounts(cfgModel, false);
-    if (ok) { settingsPolicy = toStore; setActivePolicy(toStore); }
+    if (ok) { settingsPolicy = toStore; setActivePolicy(toStore); setModelPrefs(prefsToStore); }
     settings.account = $('#s-account').value;
     if (!getAccountCfg(settings.account)) settings.account = (accountsCfg[0] || {}).id || DEFAULT_ACCOUNT;
     settings.model = $('#s-model').value; settings.triggerUrl = $('#s-trigger').value.trim();
-    settings.anthropicKey = $('#s-key').value.trim(); settings.openrouterKey = $('#s-or-key').value.trim();
+    settings.anthropicKey = $('#s-key').value.trim(); settings.openrouterKey = orKey;
     saveSettings();
     btn.disabled = false; btn.textContent = 'Save settings';
     if (ok) { closeDrawer(); render(); toast('Settings saved.'); }

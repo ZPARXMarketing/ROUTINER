@@ -232,7 +232,7 @@ console.log('\nStalls recover instead of hanging');
     }],
   };
   const ctx = await browser.newContext({ viewport: { width: 1100, height: 700 } });
-  let posted = null;
+  let posted = null, savedRoutine = null;
   await ctx.route('**/*.supabase.co/**', (route) => {
     const url = route.request().url();
     const json = (body, headers = {}) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body), headers });
@@ -244,6 +244,12 @@ console.log('\nStalls recover instead of hanging');
       return json({ ok: true, runId: 'run-1', output: 'On it.', steps: 1, cost: 0.0001, model: 'moonshotai/kimi-k2.7-code' });
     }
     if (url.includes('routiner_settings')) return json(AGENT_SETTINGS);
+    // Keeping a chat prompt writes an ordinary routine row; answer as PostgREST
+    // does for insert().select().single() so the app's own path is exercised.
+    if (url.includes('routiner_routines') && route.request().method() === 'POST') {
+      savedRoutine = JSON.parse(route.request().postData() || '{}');
+      return json({ id: 'rt-1', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), ...savedRoutine });
+    }
     return json([], { 'content-range': '0-0/0' });
   });
   await ctx.route('**fonts.g**', (r) => r.abort());
@@ -261,6 +267,21 @@ console.log('\nStalls recover instead of hanging');
 
   if (composerUp) {
     await page.fill('#chat-input', 'Draft the launch email, then check the metrics tomorrow at 9am.');
+
+    // Keeping the prompt, not just the answer (issue #100). The message you are
+    // about to send is often the thing worth having again next week, and the
+    // only way onto the shelf used to be re-typing it into the routine drawer.
+    await page.click('#chat-save');
+    await page.waitForTimeout(400);
+    check('the composer can keep a prompt in the Library', !!savedRoutine, JSON.stringify(savedRoutine || {}).slice(0, 160));
+    check('…as an unscheduled shelf item', savedRoutine?.status === 'library' && !savedRoutine?.scheduled_at);
+    check('…carrying the prompt and the instance it would have run on',
+      /launch email/.test(savedRoutine?.prompt || '') && savedRoutine?.account === 'acc_kimi' && savedRoutine?.trigger_key === 't_a');
+    // Saving is not sending: the draft stays put, so one click does not cost
+    // the message.
+    check('…without sending it or clearing the box',
+      !posted && /launch email/.test(await page.inputValue('#chat-input')));
+
     await page.click('#chat-send');
     await page.waitForTimeout(800);
     check('sending posts a fresh run', !!posted && !posted.runId, JSON.stringify(posted || {}).slice(0, 160));
@@ -273,6 +294,22 @@ console.log('\nStalls recover instead of hanging');
     // Only the browser knows where the reader is, and "9am tomorrow" is
     // meaningless without it — a missing zone schedules work overnight.
     check("…carrying the reader's timezone", typeof posted?.tz === 'string' && posted.tz.length > 0, posted?.tz);
+
+    // Choosing the model for this one chat (issue #102). The picker starts on
+    // the instance's model — the check above — so this proves the pick is what
+    // actually gets sent, not just what the select shows.
+    await page.click('#hx-new');
+    const pickerUp = await page.waitForSelector('#chat-model', { timeout: 8000 }).then(() => true, () => false);
+    check('the composer offers a model picker', pickerUp);
+    if (pickerUp) {
+      check('…defaulting to the instance model', await page.inputValue('#chat-model') === 'moonshotai/kimi-k2.7-code');
+      check('…grouped by lab', (await page.locator('#chat-model optgroup').count()) >= 5);
+      await page.selectOption('#chat-model', 'z-ai/glm-5');
+      await page.fill('#chat-input', 'Second chat, different model.');
+      await page.click('#chat-send');
+      await page.waitForTimeout(800);
+      check('…and the pick is what gets run', posted?.model === 'z-ai/glm-5', posted?.model);
+    }
   }
   await ctx.close();
 }
