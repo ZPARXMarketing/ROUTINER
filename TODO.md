@@ -56,7 +56,14 @@ Related code: `supabase/functions/openrouter-agent/index.ts`, `js/app.js` (`agen
 - [x] **Safer merge (`gh_merge_pr`)** *(shipped — awaiting merge/deploy)*
   - `AGENT_ALLOW_MERGE` still **off** by default.
   - When enabled: only merges PRs whose head ref starts with `agent/` and is open.
-  - Still no CI-green check (GitHub branch protection remains the backstop).
+  - [x] **CI-green check** *(shipped)* — a merge now reads both CI signals on the
+    PR's head commit (Checks API + combined commit status) and refuses while it
+    is red, unfinished, or conflicting with the base. An empty check list on a
+    just-pushed commit reads as *pending*, not as "no CI", and an unreadable
+    probe holds rather than merging blind. `AGENT_MERGE_REQUIRE_CHECKS=false`
+    opts a genuinely CI-less repo out. Branch protection remains the backstop —
+    the point of this gate is that the *model* learns which check failed, which
+    a 405 from a protected branch never told it.
 
 ### Defaults & product
 
