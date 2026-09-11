@@ -1,0 +1,67 @@
+# Does the app actually come up?
+#
+# `scripts/test-boot.mjs` drives the real index.html / app.js / app.css in
+# Chromium and covers the boot path plus the Chat composer — every check in it
+# corresponds to a way Routiner used to end up as a blank white page. It has
+# always existed and never run anywhere but by hand, so the whole browser
+# surface (index.html, js/, css/) was the one part of this repo with no
+# automated gate at all. A blank page hides its own cause, which is exactly why
+# that surface reads as flakiness rather than as a defect.
+#
+# It is a separate workflow from "Agent checks" because the two watch different
+# paths and only this one needs a browser.
+
+name: Boot checks
+
+on:
+  pull_request:
+    paths:
+      - 'index.html'
+      - 'usage.html'
+      - 'js/**'
+      - 'css/**'
+      - 'scripts/test-boot.mjs'
+      - '.github/workflows/boot-checks.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+      - 'usage.html'
+      - 'js/**'
+      - 'css/**'
+      - 'scripts/test-boot.mjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The repo ships no package.json — the site publishes as-is — so the
+      # browser harness is installed for the run and thrown away with it.
+      - name: Install Playwright + Chromium
+        run: |
+          npm install --no-save --no-fund --no-audit playwright@1
+          npx playwright install --with-deps chromium
+
+      # The script exits 0 with "SKIP" when Playwright is missing, which is what
+      # lets it sit in a dev checkout without being mandatory — and would make
+      # this job green while testing nothing. Fail on a skip here: in CI we have
+      # just installed it, so a skip means the install broke.
+      - name: Boot-path tests
+        run: |
+          set -euo pipefail
+          out=$(node scripts/test-boot.mjs 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          if grep -q '^SKIP:' <<<"$out"; then
+            echo "::error::test-boot.mjs skipped — Playwright/Chromium did not install, so nothing was verified."
+            exit 1
+          fi

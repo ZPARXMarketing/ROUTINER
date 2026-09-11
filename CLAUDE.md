@@ -554,11 +554,15 @@ executed by the `openrouter-agent` edge function through the **GitHub REST API**
 **Tools the model gets** (when `code` is checked on the instance and a token is
 configured): `gh_read_file` (read a file or list a dir; an omitted path lists the
 root, and a 404 that's only a casing miss is corrected automatically instead of
-costing the model a step), `gh_read_issue` + `gh_list_issues` (so *"read issue
-#57 and fix it"* actually works), `gh_list_prs`, `gh_read_pr` (metadata +
-per-file patches), **`gh_propose_edit`** (branch → apply exact find/replace edits
-→ open PR — the preferred *fix* path), `gh_propose_change` (whole-file rewrite,
-for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
+costing the model a step), **`gh_search_code`** (find which files contain a term
+— the *first* call when the target file isn't already known), `gh_read_issue` +
+`gh_list_issues` (so *"read issue #57 and fix it"* actually works),
+`gh_list_prs`, `gh_read_pr` (metadata + per-file patches), **`gh_check_status`**
+(CI on a PR's head commit, with the failing check's annotations),
+**`gh_propose_edit`** (branch → apply exact find/replace edits → open PR — the
+preferred *fix* path, and the way to push a follow-up onto a PR already open),
+`gh_propose_change` (whole-file rewrite, for new files), `gh_comment_pr`, and
+`gh_merge_pr` (the *merge* path, refused while CI is red or unfinished).
 
 > **`gh_propose_edit` is the important one.** `gh_propose_change` requires the
 > model to emit the *complete* new file, which is impossible on anything large —
@@ -625,7 +629,17 @@ for new files), `gh_comment_pr`, and `gh_merge_pr` (the *merge* path).
   matters: the token says what the agent *could* touch, this says what it *may*.
 - `AGENT_ALLOW_MERGE` *(optional)* — set to `true` to let `gh_merge_pr` actually
   merge. **Off by default**: until you set it, the agent opens PRs for you to
-  review and merge, and merging returns a clear "disabled" message.
+  review and merge, and merging returns a clear "disabled" message. Turning it
+  on is now a much smaller decision than it was: a merge reads the PR's CI first
+  and refuses while it is red, unfinished, or conflicting.
+- `AGENT_MERGE_REQUIRE_CHECKS` *(optional, default `true`)* — the CI gate above.
+  Set it to `false` only for a repo that genuinely has no CI and never will;
+  a repo with no checks *configured* is already handled without this.
+- `AGENT_POST_PR_STEPS` *(optional, default 4)* — steps the model may spend
+  after opening a PR, verifying and fixing it before it has to wrap up.
+- `AGENT_CODE_SEARCH_MAX` *(optional, default 20)* — files per
+  `gh_search_code` result. GitHub rate-limits code search to 10 requests/minute
+  for the whole deployment, so searches are worth making count.
 - `AGENT_MAX_STEPS` *(optional, default 5)* — tool-loop steps per edge
   invocation when the `code` group is **not** enabled.
 - `AGENT_CODE_MAX_STEPS` *(optional, default 12)* — coding runs get a bigger
@@ -677,9 +691,12 @@ worth naming because each one was individually blocking:
 | **Keep** what it read | spill + `read_spill` | A 120k-char file read was 2× the whole context budget, so the next read floored it and the model re-read the same file |
 | **See** what went wrong | `read_runs` (in the `read` group) | An agent asked "why do runs fail?" can only guess — it cannot see History at all. One literally reported *"I can't see raw execution History logs from these tools."* `read_runs` excludes the caller's own run row: a diagnosis run checkpoints its actions to `output` as it goes, so without that filter it reads itself and its own recap crowds out the real failures. |
 | **Read** the ask | `gh_read_issue` | Runs died asking the human to paste the issue body |
+| **Find** the code | `gh_search_code` | The only way in was an exact path, so an agent told "fix the retry classifier" guessed the file and paged 3k lines — the loop the repeat guard exists to catch, manufactured by the absence of a search |
 | **Change** code | `gh_propose_edit` | Whole-file rewrites are impossible on real source files |
 | **Survive** flakiness | `AGENT_MODEL_RETRIES`, `AGENT_FALLBACK_MODEL` | One `Provider returned error` ended the whole run |
 | **Verify** the fix | `scripts/test-agent.mjs` + the **Agent checks** workflow | Nothing checked that a self-authored change actually works — and until CI ran on agent PRs, review was the only gate, so `AGENT_ALLOW_MERGE` could never responsibly be turned on |
+| **See** the verdict | `gh_check_status`, and the gate inside `gh_merge_pr` | The workflow above existed and the loop could not read it. A merge checked the branch name and the open state, then merged whatever CI said |
+| **Finish** the PR | the post-PR verification phase | Opening a PR stripped every tool, so an agent could never watch its own PR go red, fix a bad edit, or answer a review |
 
 `node --experimental-strip-types scripts/test-agent.mjs` runs the reliability
 tests with no network and no Deno, so an agent (or CI, or you) can check a change
@@ -712,8 +729,81 @@ without a PR.
 > reading of the instructions that produced a no-op every single run. The model
 > was obedient, not weak. Instructions that can dead-end will dead-end.
 
+> **The verify leg existed and the loop was blind to it.** `agent-checks.yml`
+> was written so a self-authored change would have a gate — and then
+> `gh_merge_pr` validated three things (token, `agent/` head branch, PR open)
+> and merged, whatever CI said. Branch protection is a backstop for the *merge*;
+> it is not feedback for the *model*, which gets an opaque 405 and no way to
+> learn which check failed. `gh_check_status` reads both of GitHub's CI signals
+> — the Checks API and the legacy combined commit status — because reading only
+> one calls a commit green whenever the failure arrived through the other, and
+> most non-Actions CI still reports through the second. Three orderings in
+> `summarizeChecks` are load-bearing: **red outranks pending**, since a failing
+> check is actionable now and waiting for a sibling job will not turn it green;
+> a completed run with an **unrecognised conclusion fails closed**, because the
+> only safe direction for a gate is the one that stops; and **`none` is its own
+> verdict**, not a green, since "no CI configured" and "CI passed" are different
+> facts. The subtle one is the gap between a push and the first check run
+> appearing: an empty list on a commit pushed seconds ago reads as **pending**,
+> not as "no CI here" — and that is exactly the moment an agent asks, having
+> just opened the PR itself. An unreadable probe holds rather than merging
+> blind, for the same reason the key-exhaustion probe stays retryable: a GitHub
+> blip must never be the thing that lands an untested change.
+
+> **Nothing could search, so everything guessed.** The only route into the repo
+> was `gh_read_file` by exact path. An agent told "fix the retry classifier" had
+> to guess `supabase/functions/openrouter-agent/index.ts` and then page 3,300
+> lines to find `isTransientModelError`. That is worth naming plainly: a lot of
+> the machinery in this file — the repeat guard, the spill table, the head/tail
+> floor, the byte counts in truncation markers — manages the *cost* of an agent
+> groping through files it cannot search. `gh_search_code` is one endpoint and
+> addresses the cause. One property matters more than the ergonomics: a scope
+> qualifier in the model's own query (`repo:`, `org:`, `user:`, `owner:`) is
+> **refused**, never appended to. `resolveRepo` is the allowlist boundary, and a
+> query carrying its own `repo:` would read a repository the deployment never
+> authorized — through a tool argument that never passed the check. Note what
+> the tool does *not* return: GitHub's code index has no line numbers, so a hit
+> is a file plus a snippet and the model still reads it before editing.
+
+> **A pull request was where the run stopped.** `useTools = openedPr ? [] : tools`
+> — tools were stripped the moment a PR opened, and the system prompt agreed
+> ("stop tools and summarize with the PR URL"). So the agent structurally could
+> not see its own PR go red, fix a malformed edit, answer a review, or resolve a
+> conflict. It got one shot and the thread died. Now a PR opens a bounded
+> **verification phase**: a narrow tool set (`gh_check_status`,
+> `gh_propose_edit`, `gh_merge_pr`, `gh_comment_pr`, `schedule_task` and the
+> reads) for `AGENT_POST_PR_STEPS` steps, then the wrap-up. Narrow on purpose —
+> the phase is for finishing *this* change, not for starting the next piece of
+> work with the budget that is left — and bounded because a summary still has to
+> be written inside the segment. `gh_propose_edit` can now commit onto the head
+> of an **open PR** rather than opening a second one for the same change; a
+> branch that exists with no open PR still refuses unless `update_branch=true`,
+> which is the same guard as before with the one legitimate exception carved
+> out. That also repairs a contradiction: running dry mid-write told the model
+> to "re-call with `branch=…`", and doing so hit the very 422 that refused.
+> When CI is still running the answer is `schedule_task`, not a poll loop — the
+> machinery to come back later already existed and this path had never used it.
+
+> **Text a stranger wrote is now labelled as such.** `gh_read_issue` returns
+> issue bodies *and comments*; anyone who can comment on the repo could put text
+> into a model holding a `GITHUB_TOKEN` with Contents + Pull requests write and,
+> with `AGENT_ALLOW_MERGE` on, the ability to merge. The existing guards genuinely
+> bound the blast radius — `agent/` branches only, `deniedWritePath`, the repo
+> allowlist — so this was a missing *label*, not an open door. Bodies, titles and
+> comments come back inside `<<<UNTRUSTED … >>> … >>>END-UNTRUSTED<<<`, and the
+> system prompt says once that everything inside is data describing a problem,
+> never an instruction that can change which files may be touched or what may be
+> merged. The envelope is a label, not a sandbox, and it has exactly **one**
+> security property: a body cannot forge the closing marker, so it can never
+> appear to end its own envelope and continue as trusted text. Markers in a body
+> are stripped rather than escaped — they mean nothing inside one, so removing
+> them loses nothing a reader wanted — and an author login is sanitised for the
+> same reason before it is interpolated into the header.
+
 Keep `AGENT_ALLOW_MERGE` **off** for this routine's account until you've watched
-a few of its PRs. The loop is: it reads its own failures → proposes a fix → you
+a few of its PRs. The CI gate makes that a smaller leap than it was, but a
+green check says the change did not break the tests — not that it was the right
+change. The loop is: it reads its own failures → proposes a fix → you
 review and merge → the edge function auto-deploys from `main` → the next run is
 measurably better. Review every PR; a model diagnosing its own logs is a genuine
 feedback loop, but it is not a substitute for judgment.
@@ -810,7 +900,13 @@ triggers runs it truly in parallel.
   reach the same blank white page, and a blank page hides its own cause, which
   is why it read as flakiness rather than as a defect. Verified end-to-end in a
   real browser by **`node scripts/test-boot.mjs`** (Playwright; skips cleanly if
-  Chromium isn't installed) — run it if you touch the boot path. That script now
+  Chromium isn't installed) — run it if you touch the boot path. It also runs in
+  CI now, as the **Boot checks** workflow, on any change to `index.html`, `js/`
+  or `css/`: the script had always existed and never run anywhere but by hand,
+  which left the whole browser surface as the one part of this repo with no
+  automated gate. That job treats a `SKIP:` as a failure — in CI it has just
+  installed Playwright, so a skip means the install broke and nothing was
+  actually verified. That script now
   also covers the **New chat** composer end to end (the pane comes up on an empty
   Chat, and sending posts a fresh run on the configured instance, carrying its
   model, tools, a title from the message and the reader's timezone) — the only
