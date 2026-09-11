@@ -659,6 +659,11 @@ agent function. Neither is load-bearing for a run to *finish* — without them
 spills fall back to the old inline truncation and `set_goal` writes are dropped
 at checkpoint — but you lose exactly the two things they add.
 
+`0017_model_prefs.sql` (`routiner_settings.model_prefs`) is the same kind of
+optional: it stores per-user model slug + color overrides. Without it the app
+keeps them in the browser instead of on the account — the feature works either
+way, it just stops following you between devices.
+
 Edge functions **auto-deploy from `main`** via
 [`.github/workflows/deploy-edge-functions.yml`](.github/workflows/deploy-edge-functions.yml)
 when `supabase/functions/**` changes (after a PR merges). Manual run:
@@ -867,7 +872,9 @@ were returning Birmingham and Chattanooga businesses). Verify with
   that fire as independent, parallel sessions. Also `model_policy` jsonb — the
   optional auto-routing table (`task_type → complexity → model`) edited in
   Settings and read by **both** the app and the scheduler; null = built-in
-  default (`js/model-router.js`).
+  default (`js/model-router.js`) — and `model_prefs` jsonb (0017): per-user
+  model overrides `{slugs:{key:slug}, colors:{key:'#RRGGBB'}}`, keyed by the
+  catalog's stable key, null = the catalog exactly as it ships.
 - **`routiner_tool_spills`** — oversized tool results, stored whole so the
   model's context can carry a preview + locator instead of a truncated blob.
   RLS per user; cascade-deleted with the run. Disposable: losing a row costs a
@@ -908,9 +915,13 @@ triggers runs it truly in parallel.
   installed Playwright, so a skip means the install broke and nothing was
   actually verified. That script now
   also covers the **New chat** composer end to end (the pane comes up on an empty
-  Chat, and sending posts a fresh run on the configured instance, carrying its
-  model, tools, a title from the message and the reader's timezone) — the only
-  automated coverage the Chat pane has.
+  Chat; sending posts a fresh run on the configured instance, carrying its
+  model, tools, a title from the message and the reader's timezone; *Save to
+  Library* writes an unscheduled routine without sending or clearing the box;
+  and the model picker defaults to the instance's model but sends the reader's
+  pick) — the only automated coverage the Chat pane has. The same workflow runs
+  `scripts/test-models.mjs` first: pure logic, no browser, so a broken catalog
+  fails in two seconds rather than after a Chromium download.
   - **supabase-js is vendored** at `js/vendor/supabase-js.js`, *not* imported
     from esm.sh. A CDN import put two serial third-party round trips in front of
     every cold load (esm.sh resolves the unpinned `@2` tag with a short-TTL
@@ -957,12 +968,70 @@ triggers runs it truly in parallel.
   than on Save. Note the tradeoff — with it out of the rail there is no
   at-a-glance sign that firing is paused.
 - Key views in `app.js`: **Board** (`renderBoard`), **Calendar**
-  (`renderCalendar` — full 24h, blocks colored by trigger within a per-account
-  hue family), Scheduled / Library / Archived, **History** (`renderHistory`),
+  (`renderCalendar` — full 24h, blocks colored by the **model** that runs them),
+  Scheduled / Library / Archived, **History** (`renderHistory`),
   the **budget forecast** (top-bar chip →
   projected spend from the scheduled queue), the Settings **accounts & triggers**
-  manager, and the create/edit **drawer**. The Library holds every non-archived
-  routine — scheduling doesn't remove it, only archiving takes one off the air.
+  manager, the Settings **models & colors** manager, and the create/edit
+  **drawer**.
+- **One catalog, grouped by lab, and both of its stale parts are editable.**
+  Models used to be a flat `MODELS` array plus a parallel `MODEL_PRICING` map,
+  and a picker was the whole list in one flat `<select>`. `js/model-router.js`
+  is now a **catalog**: eleven labs (US, EU and China), three tiers each
+  (flagship / balanced / fast), each row carrying its price and its color.
+  `modelOptionsHtml()` builds every model `<select>` in the app — drawer,
+  Settings, routing grid, chat composer — so they cannot drift apart, and each
+  option names its tier and its per-million rate, because you choose a model
+  where you choose it and not on a pricing page. Two identities, and the
+  difference is load-bearing: `key` is how Routiner refers to a model forever
+  and is what preferences hang off; `slug` is what gets sent to the provider and
+  is **editable**, because labs rename and retire ids on their own schedule and
+  a catalog baked into `js/` is wrong the moment one moves. Keying prefs on the
+  slug would mean renaming a model threw away the color you picked for it. A
+  routine stores the slug it was saved with (that is what runs), so lookups try
+  the live slug then the shipped default — an old pin still resolves to a name,
+  a price and a color rather than reading as unknown. **Settings → Models**
+  edits both halves, and *Check slugs* asks OpenRouter's public model list which
+  ids it still serves, which turns "my agent run 400s and I don't know why" into
+  a ✕ next to the slug. Covered by `node scripts/test-models.mjs`.
+- **A calendar block is colored by its model, and the key moved into Settings.**
+  Blocks took their color from the account + trigger that fired them, and the
+  only way to know what a color meant was a legend printed above the grid on
+  every screen — a permanent row of chrome explaining a scheme keyed on the one
+  thing a reader is least likely to be asking about. The model is the fact worth
+  telling apart at a glance, so that is the color; the block's tooltip names it,
+  the drawer it opens names it, and the key is in Settings → Models, where it is
+  also editable. The bar keeps one **Colors** button that opens exactly there.
+- **The Library is a shelf, not a log.** It was every non-archived routine,
+  fired one-offs included, so everything the planner or an agent ever ran piled
+  up in it (issue #99) and the one view meant to answer *"what do I keep around
+  to run again?"* answered *"everything that has ever happened"*. A one-off that
+  has already run is finished work — its record is the run, in Chat. So the
+  shelf holds what is still live (queued, recurring) plus anything never fired,
+  and completed one-offs move behind the Library's own **Done** filter, where
+  **Copy** puts a fresh unfired copy back on the shelf. Nothing is deleted and
+  nothing is hidden without a visible way to see it; the tab badge counts the
+  shelf, which is the number that was lying before.
+- **A chat prompt can be kept, not just its answer** (issue #100). The message
+  you are about to send is often the thing worth having again next week, and the
+  only route onto the shelf used to be re-typing it into the routine drawer.
+  *Save to Library* on the New chat composer stores it as an unscheduled routine
+  aimed at the same instance the chat would have run on — so **Run now** and
+  **Schedule** on the card do exactly what Send would have. Saving is not
+  sending: the draft stays in the box.
+- **The instance is a model's default, not an override.** An agent routine's own
+  model pick used to lose to the instance's, which made the drawer's model
+  select inert on every scheduled agent routine while the card went on
+  displaying the model the routine had stored — the UI naming a model that never
+  ran (issue #102). The routine's pick now wins; `auto` and an unset model fall
+  back to the instance. `js/app.js agentModelFor` and the scheduler's
+  `resolveAgentModel` resolve it identically, so **Run now** and a scheduled
+  fire can never disagree. The New chat composer picks a model the same way.
+  Because a slug can be renamed, `openrouter-agent` no longer treats its
+  allowlist as the only authority: `modelAuthorizedByOwner` also accepts a model
+  the owner stored on that instance or renamed in `model_prefs` — a request body
+  can put a model in neither place, so it never widens what a stranger may ask
+  for. Pinned by `scripts/test-scheduler.mjs`.
 - **The shell is exactly one viewport tall, and the Chat pane got stuck twice
   getting there.** Symptom both times, iPadOS only: the run list and transcript
   would not scroll, content just ran off the bottom of the window. Cause both

@@ -67,6 +67,11 @@ create table if not exists public.routiner_settings (
   user_id      uuid primary key default auth.uid() references auth.users(id) on delete cascade,
   accounts     jsonb not null default '{}'::jsonb,
   model_policy jsonb,                                  -- optional auto-routing policy shared by app + scheduler (0011); null = built-in default
+  -- Model overrides keyed by the catalog's stable key (0017): a renamed slug
+  -- (labs retire ids on their own schedule) and the color that model's blocks
+  -- wear on the calendar. Null = the catalog exactly as it ships.
+  --   { "slugs": { "zai.fast": "z-ai/glm-4.9" }, "colors": { "zai.fast": "#BCEF2F" } }
+  model_prefs  jsonb,
   updated_at   timestamptz not null default now()
 );
 

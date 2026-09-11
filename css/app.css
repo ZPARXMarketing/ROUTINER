@@ -360,6 +360,16 @@ a { color: var(--periwinkle); }
   gap: var(--sp-4);
 }
 
+/* ── Library filter row (shelf · done · all) ──────
+   The Library shows what you keep; finished one-offs sit behind Done rather
+   than in the shelf. The row is always present so the split is visible — a
+   filter you cannot see reads as missing routines. */
+.libbar { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-bottom: var(--sp-4); }
+.libbar__btns { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.libbar__n { font-family: var(--font-mono); font-size: 11px; opacity: 0.75; margin-left: 4px; }
+.libbar__note { font-family: var(--font-body); font-size: 12.5px; color: var(--text-low); flex: 1 1 240px; min-width: 0; }
+.libbar__note b { color: var(--text-mid); font-weight: 600; }
+
 .card {
   background: linear-gradient(180deg, var(--bg-surface), #121829);
   border: 1px solid var(--hairline);
@@ -749,6 +759,10 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
   line-height: 1.5;
 }
 .hx__compose .btn { flex: 0 0 auto; }
+/* Send, and — on a new chat — "Save to Library" under it: keeping the prompt is
+   a second thing you can do with what you just typed, not a second send. */
+.hx__compose-btns { display: flex; flex-direction: column; gap: var(--sp-2); align-items: stretch; flex: 0 0 auto; }
+.hx__compose-btns .btn { width: 100%; white-space: nowrap; }
 .hx__note {
   max-width: 860px; margin: 0 auto;
   font-size: 12.5px; color: var(--text-low);
@@ -1194,11 +1208,11 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .cal__today { font-family: var(--font-body); font-weight: 600; font-size: 12px; color: var(--text-mid); background: transparent; border: 1px solid var(--hairline); border-radius: var(--r-pill); padding: 5px 13px; cursor: pointer; }
 .cal__today:hover { color: var(--text-hi); border-color: var(--grey-700); }
 .cal__count { font-family: var(--font-pixel); font-size: 10px; letter-spacing: 0.06em; color: var(--text-low); text-transform: uppercase; }
-.cal__legend { margin-left: auto; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-.cal__leg { display: flex; align-items: center; gap: 8px; font-family: var(--font-body); font-weight: 500; font-size: 12px; color: var(--text-mid); }
-.cal__leg-name { font-weight: 700; color: var(--text-hi); }
-.cal__legtrig { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-weight: 600; font-size: 11px; color: var(--text-mid); }
-.cal__sw { width: 13px; height: 13px; border-radius: 4px; flex: 0 0 auto; }
+/* The color key used to live here as a permanent row of account/trigger
+   swatches. Blocks are colored by their model now, and the key is in
+   Settings → Models — this is the one-word way back to it. */
+.cal__key { margin-left: auto; font-family: var(--font-body); font-weight: 600; font-size: 12px; color: var(--text-mid); background: transparent; border: 1px solid var(--hairline); border-radius: var(--r-pill); padding: 5px 13px; cursor: pointer; }
+.cal__key:hover { color: var(--text-hi); border-color: var(--grey-700); }
 
 .cal__head { display: grid; grid-template-columns: 56px repeat(7, 1fr); border-bottom: 1px solid var(--hairline); }
 .cal__dh { padding: 8px 0; text-align: center; border-left: 1px solid #1f2740; }
@@ -1267,7 +1281,7 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .cal__hint { padding: 16px 20px; font-family: var(--font-body); font-size: 13px; color: var(--text-mid); border-top: 1px solid var(--hairline); }
 
 @media (max-width: 760px) {
-  .cal__legend { margin-left: 0; width: 100%; }
+  .cal__key { margin-left: 0; }
   .cal__dnum { font-size: 13px; }
 }
 
@@ -1316,6 +1330,36 @@ body[data-view="history"] .toasts { bottom: calc(104px + env(safe-area-inset-bot
 .trig-tools { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
 .tool-chk { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-body); font-size: 12px; color: var(--text-mid); cursor: pointer; }
 .tool-chk input { cursor: pointer; }
+
+/* ── Settings: models, colors & slugs ───────────
+   The calendar's color key, made editable. One block per lab so the three tiers
+   read as a set; the swatch is a native color input (no picker to build) and
+   the slug is a plain text field because that is exactly what it is. */
+.mdl-lab { border: 1px solid var(--hairline); border-radius: var(--r-md); background: rgba(20,27,46,0.5); padding: var(--sp-2) var(--sp-3); margin-bottom: var(--sp-2); }
+.mdl-lab__head { display: flex; align-items: baseline; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.mdl-lab__name { font-family: var(--font-body); font-weight: 700; font-size: 13px; color: var(--text-hi); }
+.mdl-lab__origin { font-family: var(--font-pixel); font-size: 9px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-low); }
+/* Two lines, not one wrapping row: the drawer is narrow, and a name / rate /
+   slug that reflow into each other at 500px are unreadable. The swatch spans
+   both lines so the color reads as belonging to the whole entry. */
+.mdl-row {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto 14px;
+  grid-template-areas: "sw name meta check" "sw slug slug slug";
+  align-items: center; gap: 3px var(--sp-2);
+  padding: var(--sp-2) 0; border-top: 1px solid rgba(42,52,84,0.5);
+}
+.mdl-lab .mdl-row:first-of-type { border-top: 0; }
+.mdl-color { grid-area: sw; width: 26px; height: 44px; padding: 0; border: 1px solid var(--hairline); border-radius: var(--r-sm); background: transparent; cursor: pointer; }
+.mdl-row__name { grid-area: name; font-family: var(--font-body); font-size: 12.5px; color: var(--text-hi); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mdl-row__meta { grid-area: meta; display: flex; align-items: baseline; gap: var(--sp-2); white-space: nowrap; }
+.mdl-row__tier { font-family: var(--font-pixel); font-size: 9px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-low); }
+.mdl-row .mdl-slug { grid-area: slug; min-width: 0; font-family: var(--font-mono); font-size: 11.5px; padding: var(--sp-1) var(--sp-2); }
+.mdl-row__rate { font-family: var(--font-mono); font-size: 11px; color: var(--text-low); }
+.mdl-row__check { grid-area: check; font-family: var(--font-mono); font-size: 12px; color: var(--text-low); text-align: center; }
+.mdl-row__check.is-ok { color: var(--lime); }
+.mdl-row__check.is-err { color: var(--danger); }
+.pol-actions { gap: var(--sp-2); }
 
 /* ── Settings: per-trigger test fire ───────────── */
 .trig-test { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; margin-top: 2px; }

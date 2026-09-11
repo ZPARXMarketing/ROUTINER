@@ -53,10 +53,19 @@ const RESEARCH_MODEL = Deno.env.get("AGENT_RESEARCH_MODEL") || "perplexity/sonar
 // AGENT_ALLOWED_MODELS edge secret (comma-separated) to add/restrict.
 const AGENT_DEFAULT_ALLOWED = [
   "openrouter/auto",
+  // US
   "openai/gpt-5.6-sol", "openai/gpt-5.6-terra", "openai/gpt-5.6-luna",
   "google/gemini-3.1-pro-preview", "google/gemini-3.5-flash", "google/gemini-3-flash-preview",
-  "deepseek/deepseek-chat", "moonshotai/kimi-k2.7-code", "moonshotai/kimi-k3",
-  "meta-llama/llama-3.3-70b-instruct", "z-ai/glm-4.7", "z-ai/glm-5", "z-ai/glm-5.2",
+  "x-ai/grok-4", "x-ai/grok-4-fast", "x-ai/grok-code-fast-1",
+  "meta-llama/llama-4-maverick", "meta-llama/llama-4-scout", "meta-llama/llama-3.3-70b-instruct",
+  // EU
+  "mistralai/mistral-large-2411", "mistralai/mistral-medium-3", "mistralai/mistral-small-3.2-24b-instruct",
+  // China
+  "deepseek/deepseek-r1", "deepseek/deepseek-chat", "deepseek/deepseek-chat-v3.1",
+  "moonshotai/kimi-k3", "moonshotai/kimi-k2.7-code", "moonshotai/kimi-k2",
+  "z-ai/glm-5.2", "z-ai/glm-5", "z-ai/glm-4.7",
+  "qwen/qwen3-max", "qwen/qwen3-235b-a22b", "qwen/qwen3-coder",
+  "minimax/minimax-m2", "minimax/minimax-m1", "minimax/minimax-01",
 ];
 const allowedModels = (): Set<string> => {
   const raw = Deno.env.get("AGENT_ALLOWED_MODELS");
@@ -1246,6 +1255,50 @@ async function accountKeyOverride(userId: string | null, account?: string): Prom
     const key = a && typeof a.key === "string" ? a.key.trim() : "";
     return key || null;
   } catch { return null; }
+}
+
+/**
+ * Has the OWNER already chosen this model, in their own settings row?
+ *
+ * The allowlist is a snapshot of a catalog that goes stale on someone else's
+ * schedule: labs rename and retire ids. So the app lets the owner re-point a
+ * catalog row at a new slug (routiner_settings.model_prefs) and pick a model per
+ * instance — and without this, doing either produced a 400 naming an edge secret
+ * the owner may have no way to set. That is the allowlist refusing a choice the
+ * owner had already made, in this app, against their own key.
+ *
+ * Two things vouch for a model, both written by the owner and nothing else:
+ *   • the `model` stored on one of that account's instances, and
+ *   • a slug in `model_prefs.slugs` — the renames they typed in Settings.
+ * A request body can put neither there; writing that row is RLS-gated to its
+ * owner. So this never widens what an arbitrary caller may ask for.
+ */
+async function modelAuthorizedByOwner(
+  userId: string | null, account?: string | null, triggerKey?: string | null, model?: string,
+): Promise<boolean> {
+  // No resolved owner, no vouching: without a user filter this would read
+  // whichever settings row came back first, so a stranger's settings could
+  // authorize a model here. Falling back to the allowlist is the safe answer.
+  if (!userId || !model) return false;
+  try {
+    // select=* rather than naming model_prefs: the column arrived in migration
+    // 0017 and naming a column a database has not got is a 400 on the whole
+    // query, which would take the instance check down with it.
+    const rows = await sbGet(`routiner_settings?user_id=eq.${encodeURIComponent(userId)}&select=*&limit=1`);
+    const row = rows?.[0];
+    if (!row) return false;
+    const renamed = row.model_prefs && typeof row.model_prefs === "object" ? row.model_prefs.slugs : null;
+    if (renamed && typeof renamed === "object"
+        && Object.values(renamed).some((s) => typeof s === "string" && s.trim() === model)) return true;
+    const accts = row.accounts;
+    if (!Array.isArray(accts) || !account) return false;
+    const a = accts.find((x: any) => x && x.id === account);
+    const trigs = Array.isArray(a?.triggers) ? a.triggers : [];
+    // No trigger named → any instance of that account may vouch, which is what a
+    // routine saved before trigger_key existed looks like.
+    const rel = triggerKey ? trigs.filter((t: any) => t && t.id === triggerKey) : trigs;
+    return rel.some((t: any) => typeof t?.model === "string" && t.model.trim() === model);
+  } catch { return false; }
 }
 
 // ── OpenRouter ────────────────────────────────────────────────────────────────
@@ -3500,7 +3553,10 @@ async function handleRequest(req: Request): Promise<Response> {
     const account = typeof row.account === "string" ? row.account : null;
     const triggerKey = typeof row.trigger_key === "string" ? row.trigger_key : null;
     let model = typeof row.model === "string" && row.model.trim() ? row.model.trim() : DEFAULT_MODEL;
-    if (!allow.has(model)) model = DEFAULT_MODEL;
+    // Same two authorities as a fresh run, and for the same reason: a reply to a
+    // thread must not silently change which model is answering just because the
+    // owner renamed a slug the allowlist snapshot has not caught up with.
+    if (!allow.has(model) && !(await modelAuthorizedByOwner(userId, account, triggerKey, model))) model = DEFAULT_MODEL;
     const enabled = new Set<string>(
       Array.isArray(row.tools) && row.tools.length ? row.tools.filter((t: unknown) => typeof t === "string") : ["read", "research", "write"],
     );
@@ -3607,13 +3663,19 @@ async function handleRequest(req: Request): Promise<Response> {
 
   // ── Fresh run ──
   const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : DEFAULT_MODEL;
-  if (!allow.has(model)) return json({ ok: false, error: `Model "${model}" is not allowed. Allowed: ${[...allow].join(", ")}.` }, 400);
-
   const account = typeof body.account === "string" ? body.account : null;
   const triggerKey = typeof body.triggerKey === "string" ? body.triggerKey : (typeof body.trigger_key === "string" ? body.trigger_key : null);
   const routineId = typeof body.routineId === "string" ? body.routineId : (typeof body.routine_id === "string" ? body.routine_id : "");
 
   const fromRoutine = await resolveOwner(routineId);
+  // The allowlist decides for anyone who has not said otherwise; the owner's own
+  // settings row decides for the instance they configured. Only reached when the
+  // allowlist refuses, so the common path is still one in-memory Set lookup.
+  if (!allow.has(model)
+      && !(await modelAuthorizedByOwner(auth.userId || fromRoutine.userId, account, triggerKey, model))) {
+    return json({ ok: false, error: `Model "${model}" is not allowed. Pick it on the instance in Settings, or set AGENT_ALLOWED_MODELS. Allowed: ${[...allow].join(", ")}.` }, 400);
+  }
+
   const userId = auth.userId || fromRoutine.userId;
   const routineTitle = fromRoutine.title;
   const override = await accountKeyOverride(userId, account || undefined);

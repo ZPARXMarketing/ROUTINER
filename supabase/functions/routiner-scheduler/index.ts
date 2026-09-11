@@ -343,6 +343,24 @@ function pickAgentInstance(accounts: unknown, account: string, triggerKey?: stri
   };
 }
 
+/**
+ * Which model an agent routine runs: its OWN pick if it made one, else the
+ * instance's, else the default.
+ *
+ * It used to be the other way round — the instance won — which quietly made the
+ * model select on a scheduled agent routine do nothing at all: every routine on
+ * an instance ran that instance's model no matter what the drawer said, and the
+ * card then displayed the model the routine had stored, so the UI named a model
+ * that was never used (issue #102). The instance is the DEFAULT — what "auto"
+ * and an unset model resolve to — not an override. js/app.js `agentModelFor`
+ * resolves it identically, so Run now and a scheduled fire cannot disagree.
+ */
+function resolveAgentModel(routineModel: unknown, instanceModel: string | null): string {
+  const pinned = typeof routineModel === "string" && routineModel.trim() && routineModel.trim() !== "auto"
+    ? routineModel.trim() : null;
+  return pinned || instanceModel || DEFAULT_AGENT_MODEL;
+}
+
 // Fire an OpenRouter agent routine: POST the task to the openrouter-agent edge
 // function, which runs the model + tool loop and writes the full output to
 // routiner_runs itself. `persisted` tells the caller whether a run row was
@@ -350,7 +368,7 @@ function pickAgentInstance(accounts: unknown, account: string, triggerKey?: stri
 async function fireAgent(r: Record<string, any>, accounts: unknown): Promise<{ status: string; output: string; persisted: boolean }> {
   if (!r.prompt || !String(r.prompt).trim()) return { status: "error", output: "Agent routine has no directions.", persisted: false };
   const inst = pickAgentInstance(accounts, r.account, r.trigger_key);
-  const model = inst.model || (typeof r.model === "string" && r.model && r.model !== "auto" ? r.model : DEFAULT_AGENT_MODEL);
+  const model = resolveAgentModel(r.model, inst.model);
   const tools = inst.tools || ["read", "research", "write"];
   try {
     const f = await fetch(OPENROUTER_AGENT_URL, {
