@@ -49,7 +49,7 @@ const DEFAULT_AGENT_MODEL = "moonshotai/kimi-k2.7-code";
 // Tunables (all optional env overrides).
 const num = (name: string, def: number) => Number(Deno.env.get(name)) || def;
 const SCHEDULER_BATCH = num("SCHEDULER_BATCH", 50);   // max routines processed per invocation
-const MAX_RETRIES = num("SCHEDULER_MAX_RETRIES", 1);  // transient one-off fire retries before giving up
+const MAX_RETRIES = num("SCHEDULER_MAX_RETRIES", 3);  // transient one-off fire retries before giving up (backoff 2/4/8 min)
 const RETRY_BACKOFF_MIN = num("SCHEDULER_RETRY_BACKOFF_MIN", 2); // 2,4,8… minutes
 const MAX_STALE_MIN = num("SCHEDULER_MAX_STALE_MIN", 360); // >6h past due → mark missed, don't fire
 const FIRE_TIMEOUT_MS = num("SCHEDULER_FIRE_TIMEOUT_MS", 30_000); // don't let one hung fire stall the run
