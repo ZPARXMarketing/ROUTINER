@@ -2619,23 +2619,30 @@ const VERIFY_TOOLS = new Set([
   "gh_propose_edit", "gh_comment_pr", "gh_merge_pr",
   "read_spill", "set_goal", "schedule_task",
 ]);
-function prFollowUpPrompt(url: string, number: number): string {
+function prFollowUpPrompt(url: string, number: number, branch = ""): string {
   const n = number ? `#${number}` : "";
-  return `[pr-opened] Pull request ${n} is open: ${url}\n`
+  const onBranch = branch ? `branch="${branch}"` : "branch=<this PR's branch>";
+  return `[pr-opened] Pull request ${n} is open: ${url}${branch ? ` (branch ${branch})` : ""}\n`
     + `You are not finished. Call gh_check_status({"number":${number || 0}}) to see whether CI passed on it.\n`
     + `· green → merge it if merging is enabled and the change is small and obviously correct, then reply with the PR link and what you changed.\n`
-    + `· red → read the failing output, fix it with gh_propose_edit passing branch=<this PR's branch> (that pushes onto this same PR — do NOT open a second one), then check again.\n`
+    + `· red → read the failing output, fix it with gh_propose_edit passing ${onBranch} (that pushes onto this same PR — do NOT open a second one), then check again.\n`
     + `· still running → schedule_task a short follow-up a few minutes out to re-check and merge, or reply now with the link and say CI was still running. Do not poll in a loop.\n`
     + `When there is nothing left to do here, reply with a short summary including the PR link and call no further tools.`;
 }
 const PR_OPENING_TOOLS = new Set(["gh_propose_change", "gh_propose_edit"]);
-function detectOpenedPr(toolName: string, result: string): { opened: boolean; url: string; number: number } {
-  if (!PR_OPENING_TOOLS.has(toolName)) return { opened: false, url: "", number: 0 };
+function detectOpenedPr(toolName: string, result: string): { opened: boolean; url: string; number: number; branch: string } {
+  if (!PR_OPENING_TOOLS.has(toolName)) return { opened: false, url: "", number: 0, branch: "" };
   // "updated" is the follow-through push onto a PR we already opened: the run
   // is in the same state either way — a pull request of ours exists and is what
   // the rest of the segment is about.
-  const m = /^(?:opened|updated) PR #(\d+):\s*(\S+)/i.exec(String(result || "").trim());
-  return m ? { opened: true, url: m[2], number: Number(m[1]) } : { opened: false, url: "", number: 0 };
+  const text = String(result || "").trim();
+  const m = /^(?:opened|updated) PR #(\d+):\s*(\S+)/i.exec(text);
+  if (!m) return { opened: false, url: "", number: 0, branch: "" };
+  // The branch is the one thing a follow-up fix needs and cannot guess. Both
+  // result shapes carry it — "(branch agent/x → main, …)" when the PR is opened,
+  // "(pushed N file(s) to branch agent/x)" when it is updated.
+  const b = /\bbranch ([^\s,)]+)/.exec(text);
+  return { opened: true, url: m[2], number: Number(m[1]), branch: b ? b[1] : "" };
 }
 
 function isBudgetStop(text: string): boolean {
@@ -3101,6 +3108,7 @@ async function runAgentLoop(opts: {
   let cost = 0, steps = 0, finalText = "";
   let openedPr = false;
   let prNumber = 0;
+  let prBranch = "";
   let mergedPr = false;
   let postPrSteps = 0;
   let prFollowUpSent = false;
@@ -3312,7 +3320,7 @@ async function runAgentLoop(opts: {
       actions.push(line);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result });
       const pr = detectOpenedPr(name, result);
-      if (pr.opened) { openedPr = true; prUrl = pr.url; prNumber = pr.number || prNumber; }
+      if (pr.opened) { openedPr = true; prUrl = pr.url; prNumber = pr.number || prNumber; prBranch = pr.branch || prBranch; }
       // A merge ends the verification phase — the change has landed, and the
       // only thing left is to say so.
       if (name === "gh_merge_pr" && /^merged PR #\d+/i.test(result)) mergedPr = true;
@@ -3321,7 +3329,7 @@ async function runAgentLoop(opts: {
     // job it used to be told to stop at. Say what they are for, once.
     if (openedPr && !prFollowUpSent && !mergedPr && verifyTools.length && postPrSteps < POST_PR_STEPS) {
       prFollowUpSent = true;
-      messages.push({ role: "user", content: prFollowUpPrompt(prUrl, prNumber), _source: SRC_PR_FOLLOWUP });
+      messages.push({ role: "user", content: prFollowUpPrompt(prUrl, prNumber, prBranch), _source: SRC_PR_FOLLOWUP });
     }
     // A deliberate hand-off ends the segment here rather than at whatever step
     // the budget ran out on. `incomplete` is what schedules the next segment, so

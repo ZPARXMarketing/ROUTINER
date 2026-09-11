@@ -1718,7 +1718,7 @@ function runPaneHtml(it) {
   const bubbles = turns.map((t) => {
     if (t.kind === 'user') return `<div class="chatmsg chatmsg--user">${esc(t.content)}</div>`;
     if (t.kind === 'notice') {
-      const label = { 'repeat-guard': 'repeat guard', 'auto-continue': 'auto-continue', 'auto-proceed': 'kept going (no need to say proceed)', orientation: 'orientation' }[t.source] || t.source;
+      const label = { 'repeat-guard': 'repeat guard', 'auto-continue': 'auto-continue', 'auto-proceed': 'kept going (no need to say proceed)', orientation: 'orientation', 'pr-followup': 'pull request opened — verifying it' }[t.source] || t.source;
       return `<details class="transcript__notice"><summary>⟳ ${esc(label)}</summary><pre>${esc(t.content.slice(0, 4000))}</pre></details>`;
     }
     if (t.kind === 'tool') return `<div class="transcript__tool">⚙ ${esc(t.content)}</div>`;

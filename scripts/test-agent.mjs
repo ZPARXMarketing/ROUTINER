@@ -714,12 +714,13 @@ eq("tools ran = progress", m.segmentMadeProgress(["gh_read_file(...) → ok"], "
 
 console.log("\n— detectOpenedPr (must only fire on a real PR tool) —");
 const OK = "opened PR #123: https://github.com/o/r/pull/123 (branch agent/x → main, 1 file(s))";
-eq("propose_edit success", m.detectOpenedPr("gh_propose_edit", OK), { opened: true, url: "https://github.com/o/r/pull/123", number: 123 });
+eq("propose_edit success", m.detectOpenedPr("gh_propose_edit", OK),
+  { opened: true, url: "https://github.com/o/r/pull/123", number: 123, branch: "agent/x" });
 // A follow-up push onto an open PR reports "updated", and leaves the run in the
 // same state: a pull request of ours exists and is what the segment is about.
 eq("propose_edit updating an existing PR", m.detectOpenedPr("gh_propose_edit",
   "updated PR #123: https://github.com/o/r/pull/123 (pushed 1 file(s) to branch agent/x)"),
-  { opened: true, url: "https://github.com/o/r/pull/123", number: 123 });
+  { opened: true, url: "https://github.com/o/r/pull/123", number: 123, branch: "agent/x" });
 eq("propose_change success", m.detectOpenedPr("gh_propose_change", OK).opened, true);
 // The regression: reading a file (or a run log) that merely CONTAINS the phrase
 // made the agent claim it had opened a PR. This is the agent's own source line.
@@ -1034,6 +1035,12 @@ const fu = m.prFollowUpPrompt("https://github.com/o/r/pull/9", 9);
 eq("the follow-up names the PR", fu.includes("#9"), true);
 eq("it says to check CI", fu.includes("gh_check_status"), true);
 eq("it forbids opening a second PR for the same change", /do NOT open a second one/i.test(fu), true);
+// The branch is the one thing a follow-up fix needs and cannot guess, so it is
+// stated rather than referred to.
+eq("it names the branch to push the fix onto",
+  m.prFollowUpPrompt("u", 9, "agent/abc").includes('branch="agent/abc"'), true);
+eq("...and degrades to a description when the result did not carry one",
+  m.prFollowUpPrompt("u", 9, "").includes("<this PR's branch>"), true);
 eq("it offers schedule_task instead of polling", fu.includes("schedule_task"), true);
 
 console.log("\n— the code group's new tools —");
