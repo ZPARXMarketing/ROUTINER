@@ -919,7 +919,15 @@ triggers runs it truly in parallel.
   model, tools, a title from the message and the reader's timezone; *Save to
   Library* writes an unscheduled routine without sending or clearing the box;
   and the model picker defaults to the instance's model but sends the reader's
-  pick) — the only automated coverage the Chat pane has. The same workflow runs
+  pick) — the only automated coverage the Chat pane has. It also covers the four
+  fixes below it: a Claude instance is offered in the composer and sends to the
+  Claude trigger rather than the agent function, the drawer puts the prompt
+  under the date and time, two fast clicks on Schedule write one routine, and a
+  routine that logged nothing offers **Run now** instead of claiming it ran.
+  Note the one piece of setup that is easy to miss when adding to it: the master
+  fire switch defaults to **off** anywhere but the live host, so a localhost
+  test that does not seed `routiner.settings.v1` never reaches a fire path at
+  all — and reads as a broken fire rather than a paused one. The same workflow runs
   `scripts/test-models.mjs` first: pure logic, no browser, so a broken catalog
   fails in two seconds rather than after a Chromium download.
   - **supabase-js is vendored** at `js/vendor/supabase-js.js`, *not* imported
@@ -1032,6 +1040,43 @@ triggers runs it truly in parallel.
   the owner stored on that instance or renamed in `model_prefs` — a request body
   can put a model in neither place, so it never widens what a stranger may ask
   for. Pinned by `scripts/test-scheduler.mjs`.
+- **A capability nobody offers is a capability nobody has.** The New chat
+  composer listed OpenRouter agent instances only, so the Claude accounts read
+  as *removed* — still in Settings, still fireable from a routine card, but
+  absent from the one screen where you start a conversation (issue #106). What
+  made the omission defensible is also what made it wrong: a Claude fire hands
+  the turn to a Claude Code session that reports back later, so there is no live
+  thread to watch, and deciding on the reader's behalf that this was therefore
+  not worth offering is what deleted the feature. `chatInstances()` lists both
+  kinds and carries `kind`, so send picks the path — `startClaudeChat` reuses
+  `fireTrigger`, which already resolves the account to a Fire URL, rather than
+  duplicating the trigger logic. Two things follow from the difference and are
+  said out loud rather than hidden: the model picker is **not** shown for a
+  Claude instance (its session picks its own model, so a picker would be a lie),
+  and the confirmation says the session reports back into Chat and that nothing
+  streams in the meantime. An account with no trigger configured is not listed
+  at all — an instance that 401s on send is worse than an absent one.
+- **The drawer asks *when* before *what*.** It opens on a calendar slot most of
+  the time — the reader has just tapped a time — and then asked for the
+  paragraph first and the time underneath it (issue #107). Fire at / Duration /
+  Repeat now sit directly under the title with the prompt below them, which is
+  also the better shape: the prompt is the tallest field, so below the time row
+  it has the rest of the drawer to grow into instead of pushing the schedule off
+  screen. Focus follows the same logic — opened from a slot, the cursor lands in
+  the empty prompt, not on the datetime input just answered; a drawer that
+  arrives with directions already in it (a Board note) lands on the title.
+- **One click, one routine.** Every path out of the drawer awaits a Supabase
+  round trip before it closes, and `editingId` is null throughout the first one
+   — so a second click inside that window ran the whole submit again and
+  inserted a duplicate (issue #108). That is a stray double-tap on a touchpad,
+  or simply a reader pressing Schedule again because nothing had visibly
+  happened. `drawerBusy` drops the second submit and the foot buttons are
+  disabled while one is in flight, which is the part that keeps it from being
+  mysterious: the press is visibly refused rather than silently dropped.
+  `finally` releases both even when validation bounces the submit straight back,
+  so a rejected prompt cannot wedge the drawer. The test that pins it stubs a
+  **slow** insert on purpose — the bug lives entirely in that window, so a fast
+  stub reproduces nothing.
 - **The shell is exactly one viewport tall, and the Chat pane got stuck twice
   getting there.** Symptom both times, iPadOS only: the run list and transcript
   would not scroll, content just ran off the bottom of the window. Cause both
@@ -1142,6 +1187,21 @@ triggers runs it truly in parallel.
   thread you replied to later — that verb keeps elapsed time from claiming the
   model worked the whole span. Rows still sort by last activity, so a
   freshly-continued thread surfaces even though its stamp is older.
+- **A row that logged nothing must not claim it ran.** History synthesises a row
+  for a past one-off that never logged a run, and stamped every one of them
+  `status: 'ran'` with a note saying the run "was never logged, so there's no
+  conversation to continue" (issue #109). Both halves were wrong in the same
+  direction. The chip made a claim about a run that had not happened — so a
+  routine that silently never fired looked, at a glance, exactly like one that
+  had worked. And the note was a dead end: it described the data model, in the
+  data model's words, to a reader whose actual question was *is my routine
+  running?* and whose only remaining move was to go find the routine elsewhere
+  and fire it by hand. These rows now say which of two things happened — fired
+  and still owing a report, or `missed`, its time gone with nothing recorded —
+  and carry **Run now**, which fires that routine and, on an agent instance,
+  opens the run it creates right there. `missed` is deliberate rather than
+  cosmetic: it is the status the Chat tab's alert badge already watches, so a
+  routine that quietly never went off now surfaces on its own.
 - **Past calendar blocks rename in place.** A block whose time has passed is a
   record of something that happened, so it carries a pencil that swaps its title
   for an input right on the grid (`startBlockRename` — Enter saves, Escape

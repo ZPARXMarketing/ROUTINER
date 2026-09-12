@@ -314,6 +314,135 @@ console.log('\nStalls recover instead of hanging');
   await ctx.close();
 }
 
+/* ── The rest of the workspace: a Claude instance in Chat, the routine drawer,
+   and a routine that logged nothing ──────────────────────────────────────────
+   One context, because all four regressions below need the same signed-in app
+   with both kinds of account configured, and rebuilding it four times costs a
+   Chromium page load each. */
+{
+  const MIXED_SETTINGS = {
+    user_id: 'test-user', fire_enabled: true, model_policy: null,
+    accounts: [
+      { id: 'acc_kimi', label: 'Kimi', kind: 'openrouter-agent', key: '',
+        triggers: [{ id: 't_a', label: 'A', trigger: '', token: '', model: 'moonshotai/kimi-k2.7-code', tools: ['read', 'research'] }] },
+      { id: 'sparks9679', label: 'Sparks9679', kind: 'claude', key: '',
+        triggers: [{ id: 't_c', label: 'A', trigger: 'https://example.invalid/fire', token: 'tok', model: '', tools: [] }] },
+    ],
+  };
+  /* A one-off whose time has passed with no run logged — the exact row that
+     used to render as "ran" with a dead-end note (issue #109). */
+  const STALE_ROUTINE = {
+    id: 'rt-stale', user_id: 'test-user', title: 'Deep research sweep',
+    prompt: 'Research the competitor set and summarise.',
+    account: 'acc_kimi', trigger_key: 't_a', model: 'moonshotai/kimi-k2.7-code',
+    task_type: 'research', complexity: 'medium', recurrence: 'none', status: 'scheduled',
+    scheduled_at: new Date(Date.now() - 3 * 3600_000).toISOString(), duration_min: 30,
+    last_run: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  };
+
+  const ctx = await browser.newContext({ viewport: { width: 1100, height: 900 } });
+  const routinePosts = [];
+  let claudeFire = null, agentFire = null;
+  await ctx.route('**/*.supabase.co/**', (route) => {
+    const url = route.request().url();
+    const json = (body, headers = {}) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body), headers });
+    if (url.includes('/auth/v1/')) return json({});
+    if (url.includes('/functions/v1/openrouter-agent')) {
+      agentFire = JSON.parse(route.request().postData() || '{}');
+      return json({ ok: true, runId: 'run-9', output: 'Done.', steps: 1, cost: 0.0001 });
+    }
+    if (url.includes('routiner_settings')) return json(MIXED_SETTINGS);
+    if (url.includes('routiner_routines')) {
+      if (route.request().method() === 'POST') {
+        const body = JSON.parse(route.request().postData() || '{}');
+        routinePosts.push(body);
+        /* Slow on purpose: the duplicate-routine bug lives entirely in the
+           window between the first click and the insert coming back, so a
+           fast stub would never reproduce it (issue #108). */
+        return new Promise((done) => setTimeout(() => done(json({ id: `rt-${routinePosts.length}`,
+          created_at: new Date().toISOString(), updated_at: new Date().toISOString(), ...body })), 700));
+      }
+      return json([STALE_ROUTINE], { 'content-range': '0-0/1' });
+    }
+    return json([], { 'content-range': '0-0/0' });
+  });
+  /* The Claude fire goes to this app's own Netlify function, not Supabase. */
+  await ctx.route('**/.netlify/functions/claude-trigger', (route) => {
+    claudeFire = JSON.parse(route.request().postData() || '{}');
+    return route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
+  });
+  await ctx.route('**fonts.g**', (r) => r.abort());
+  const page = await ctx.newPage();
+  await page.addInitScript((s) => {
+    localStorage.setItem('routiner-auth', s);
+    /* The master fire switch defaults to off anywhere but the live host, so a
+       localhost test would never reach a fire path at all. */
+    localStorage.setItem('routiner.settings.v1', JSON.stringify({ firing: true }));
+  }, STORED);
+  await page.goto(BASE, { waitUntil: 'load' });
+  await page.waitForSelector('.topbar', { timeout: 20000 }).catch(() => {});
+
+  console.log('\nA routine that logged nothing says so (issue #109)');
+  /* The stale routine is the only History row, so it opens selected. */
+  const staleUp = await page.waitForSelector('#run-firenow', { timeout: 10000 }).then(() => true, () => false);
+  check('a routine with no run offers Run now, not a dead end', staleUp, await seen(page));
+  if (staleUp) {
+    const pane = await page.textContent('#hx-main');
+    // "Ran" was a claim about a run that never happened — the whole complaint.
+    check('…and the chip does not claim it ran', /Never ran/.test(pane) && !/>Ran</.test(pane), pane.slice(0, 200));
+    check('…naming what to check', /never fired/i.test(pane));
+    await page.click('#run-firenow');
+    await page.waitForTimeout(900);
+    check('…and Run now actually fires it', !!agentFire && /competitor set/.test(agentFire.prompt || ''),
+      JSON.stringify(agentFire || {}).slice(0, 120));
+  }
+
+  console.log('\nChat can still run a Claude routine (issue #106)');
+  await page.click('#hx-new');
+  await page.waitForSelector('#chat-instance', { timeout: 8000 }).catch(() => {});
+  const opts = await page.locator('#chat-instance option').allTextContents();
+  check('the composer lists the Claude instance too', opts.some((o) => /Claude/.test(o)), opts.join(' | '));
+  if (opts.some((o) => /Claude/.test(o))) {
+    await page.selectOption('#chat-instance', 'sparks9679|t_c');
+    await page.waitForTimeout(200);
+    // A Claude session picks its own model; offering a picker would be a lie.
+    check('…and drops the model picker for it', (await page.locator('#chat-model').count()) === 0);
+    await page.fill('#chat-input', 'Process the board and schedule this week.');
+    await page.click('#chat-send');
+    await page.waitForTimeout(900);
+    check('…sending hits the Claude trigger, not the agent function',
+      !!claudeFire && /Process the board/.test(claudeFire.text || ''), JSON.stringify(claudeFire || {}).slice(0, 140));
+    check('…on the chosen account and trigger',
+      claudeFire?.account === 'sparks9679' && claudeFire?.triggerKey === 't_c');
+  }
+
+  console.log('\nThe routine drawer (issues #107, #108)');
+  await page.click('#newBtn');
+  await page.waitForSelector('#f-prompt', { timeout: 8000 });
+  /* When above what, so the prompt has the rest of the drawer to grow into and
+     the reader is not asked for the paragraph before the time slot. */
+  const whenFirst = await page.evaluate(() => {
+    const w = document.querySelector('#f-when'), p = document.querySelector('#f-prompt');
+    return !!(w && p) && !!(w.compareDocumentPosition(p) & Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+  check('the prompt sits underneath the date and time', whenFirst);
+
+  const before = routinePosts.length;
+  await page.fill('#f-title', 'Twice-clicked routine');
+  await page.fill('#f-prompt', 'Do the thing exactly once.');
+  const soon = new Date(Date.now() + 86_400_000);
+  const pad = (n) => String(n).padStart(2, '0');
+  await page.fill('#f-when', `${soon.getFullYear()}-${pad(soon.getMonth() + 1)}-${pad(soon.getDate())}T09:00`);
+  /* Two clicks inside the insert's round trip — a stray double-tap, or a reader
+     pressing again because nothing visibly happened yet. */
+  await page.click('[data-do="schedule"]');
+  await page.click('[data-do="schedule"]', { force: true }).catch(() => {});
+  await page.waitForTimeout(1600);
+  check('clicking Schedule twice writes one routine, not two', routinePosts.length - before === 1,
+    `${routinePosts.length - before} insert(s)`);
+  await ctx.close();
+}
+
 await browser.close();
 server.close();
 console.log(`\n${fail ? 'FAILURES' : 'ALL PASS'}: ${pass} passed, ${fail} failed`);

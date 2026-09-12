@@ -762,7 +762,15 @@ function historyItems() {
     if (r.status === 'archived') return;
     if (!isPastOneOff(r, fired)) return;
     if (fired.has(r.id)) return;                     // already shown via its run row(s)
-    items.push({ id: 'rt-' + r.id, title: r.title || 'Untitled', status: 'ran',
+    // What actually happened to it, not a flat "ran" (issue #109). These rows
+    // exist precisely because nothing was logged, and calling that a completed
+    // run is the difference between "my routine is working" and "my routine
+    // never went off and nobody told me". A routine with a `lastRun` was fired
+    // and owes a report; one without, whose time simply elapsed, is missed —
+    // which is the status the Chat tab's alert badge already watches for.
+    items.push({ id: 'rt-' + r.id, title: r.title || 'Untitled',
+      status: r.lastRun ? 'ran' : 'missed', noRun: true, fired: !!r.lastRun,
+      routineId: r.id, account: r.account, triggerKey: r.triggerKey, model: r.model,
       output: r.prompt || '', time: r.scheduledAt || r.lastRun || r.updatedAt });
   });
   items.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
@@ -1135,6 +1143,15 @@ const FRIENDLY_STATUS = {
 // than this is almost certainly a dead edge invocation; show "May have stalled"
 // until the scheduler reaper flips it to error.
 const RUN_STALE_MS = 10 * 60 * 1000;
+/* What a row's chip says. A row synthesised from a routine gets its own two
+   labels because "Ran" is a claim about a run, and these rows exist only
+   because there is no run: either it was fired and the session still owes a
+   report, or its time came and went with nothing recorded (issue #109). */
+function statusText(it, stale) {
+  if (stale) return 'May have stalled';
+  if (it && it.noRun) return it.fired ? 'Fired — no report yet' : 'Never ran';
+  return FRIENDLY_STATUS[it?.status] || it?.status || 'ran';
+}
 const RETRY_PROMPT = '[retry] Resume the task from the transcript and finish it.';
 function isRunStale(it) {
   return !!(it && it.status === 'running' && it.time && (Date.now() - new Date(it.time).getTime()) > RUN_STALE_MS);
@@ -1235,21 +1252,40 @@ let newChatDraft = '';       // survives the pane's live re-renders
 let newChatInstance = null;  // { account, triggerKey } the composer will fire on
 let newChatModel = null;     // { account, triggerKey, model } — a per-chat model pick
 
-/* Every agent instance the user has configured, flattened to pickable rows. */
-function agentInstances() {
-  const out = [];
+/* Every instance a chat can run on, flattened to pickable rows.
+
+   This used to be agent instances only, which quietly took the Claude routines
+   away: they were still in Settings, still fireable from a routine card, but
+   the one place you start a conversation offered nothing but the OpenRouter
+   accounts (issue #106). A Claude instance answers differently — the fire hands
+   off to a Claude Code session that reports back later, so there is no live
+   thread to watch — but "differently" is not "not at all", and deciding that
+   for the reader is what made the capability look deleted. Both kinds are
+   listed; `kind` is carried so send knows which path to take and the composer
+   can say what to expect. Agent instances sort first, since they are the ones
+   that answer in place. */
+function chatInstances() {
+  const agents = [];
+  const claude = [];
   for (const a of listAccounts()) {
-    if (a.kind !== 'openrouter-agent') continue;
-    for (const t of (a.triggers || [])) out.push({ account: a.id, triggerKey: t.id, label: `${a.label} · ${t.label || 'instance'}` });
+    const kind = a.kind || (a.id === 'openrouter' ? 'openrouter' : 'claude');
+    if (kind === 'openrouter-agent') {
+      for (const t of (a.triggers || [])) agents.push({ account: a.id, triggerKey: t.id, kind, label: `${a.label} · ${t.label || 'instance'}` });
+    } else if (kind === 'claude') {
+      // A Claude account with no trigger configured cannot fire at all, so it
+      // is not offered — an instance that 401s on send is worse than absent.
+      for (const t of (a.triggers || [])) claude.push({ account: a.id, triggerKey: t.id, kind, label: `${a.label} · ${t.label || 'instance'} (Claude)` });
+    }
   }
-  return out;
+  return agents.concat(claude);
 }
+const isClaudeInstance = (i) => !!i && i.kind === 'claude';
 
 /* The instance a new chat will run on: the reader's pick, else the first one
-   configured. Null when no agent account exists — the composer says so rather
+   configured. Null when nothing is configured — the composer says so rather
    than failing on send. */
 function currentChatInstance() {
-  const all = agentInstances();
+  const all = chatInstances();
   if (!all.length) return null;
   const picked = newChatInstance && all.find((i) => i.account === newChatInstance.account && i.triggerKey === newChatInstance.triggerKey);
   return picked || all[0];
@@ -1258,10 +1294,11 @@ function currentChatInstance() {
 /* The model a new chat will run on: the reader's pick if they made one and it
    is still offered, else the instance's own. Kept out of `newChatInstance` so
    switching instances moves the model with it rather than stranding a pick that
-   belonged to a different one. */
+   belonged to a different one. A Claude instance runs whatever its session
+   runs, so the picker is not shown for one and this returns nothing. */
 function currentChatModel() {
   const inst = currentChatInstance();
-  if (!inst) return '';
+  if (!inst || isClaudeInstance(inst)) return '';
   const fallback = triggerModel(inst.account, inst.triggerKey);
   if (!newChatModel) return fallback;
   return newChatModel.account === inst.account && newChatModel.triggerKey === inst.triggerKey
@@ -1382,7 +1419,7 @@ function railRowHtml(it, active) {
   const ok = !(it.status === 'error' || it.status === 'missed' || it.status === 'cancelled');
   const busy = isRunBusy(it);
   const stale = isRunStale(it);
-  const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status);
+  const statusLabel = statusText(it, stale);
   const statusClass = stale ? 'is-warn' : (busy ? 'is-busy' : (ok ? 'is-ok' : 'is-bad'));
   const spin = busy ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
   // The last thing this run actually did, not its opening summary.
@@ -1767,34 +1804,41 @@ function runTimingChip(it) {
    the pane's head/compose chrome so starting a chat and continuing one look and
    behave the same. */
 function newChatPaneHtml() {
-  const all = agentInstances();
+  const all = chatInstances();
   const inst = currentChatInstance();
+  const claude = isClaudeInstance(inst);
   const picker = all.length > 1
     ? `<select class="select hx__instance" id="chat-instance" aria-label="Which instance to run on">${all.map((i) =>
         `<option value="${esc(i.account)}|${esc(i.triggerKey)}" ${inst && i.account === inst.account && i.triggerKey === inst.triggerKey ? 'selected' : ''}>${esc(i.label)}</option>`).join('')}</select>`
     : '';
   // Pick the model for this chat, not only which instance runs it (issue #102).
   // It starts on the instance's own model, so not touching it changes nothing.
+  // A Claude instance runs its own session's model — there is nothing to pick.
   const chatModel = currentChatModel();
-  const modelPicker = inst
+  const modelPicker = (inst && !claude)
     ? `<select class="select hx__instance" id="chat-model" aria-label="Which model to run on">${modelOptionsHtml(chatModel, { auto: false, via: 'openrouter' })}</select>`
     : '';
-  const model = inst ? modelLabel(chatModel) : '';
-  const body = inst
+  const model = inst && !claude ? modelLabel(chatModel) : '';
+  const body = !inst
     ? `<div class="empty">
-        <h3>New chat</h3>
-        <p>Ask for anything ${esc(model)} can do with its tools — read your board and run history, research the web, fix code, or schedule work for later. Say <em>"then check again tomorrow morning"</em> and it will put a block on the Calendar.</p>
+        <h3>No instance yet</h3>
+        <p>Add an <strong>OpenRouter agent</strong> account — or fill in a Claude routine's Fire URL and token — in Settings, then come back. A chat runs on one of those instances.</p>
       </div>`
-    : `<div class="empty">
-        <h3>No agent instance yet</h3>
-        <p>Add an <strong>OpenRouter agent</strong> account in Settings, then come back — a chat runs on one of its instances.</p>
-      </div>`;
+    : claude
+      ? `<div class="empty">
+          <h3>New Claude routine turn</h3>
+          <p>This sends your message to <strong>${esc(accountLabel(inst.account))} · ${esc(triggerLabel(inst.account, inst.triggerKey) || 'instance')}</strong> as a turn in its Claude Code session — the same thing a scheduled routine does, right now. The session works with its own full tools and <em>reports back into Chat when it finishes</em>, so nothing streams here in the meantime.</p>
+        </div>`
+      : `<div class="empty">
+          <h3>New chat</h3>
+          <p>Ask for anything ${esc(model)} can do with its tools — read your board and run history, research the web, fix code, or schedule work for later. Say <em>"then check again tomorrow morning"</em> and it will put a block on the Calendar.</p>
+        </div>`;
   const compose = inst
     ? `<div class="hx__compose">
         <div class="hx__compose-inner">
-          <textarea class="textarea chat__input" id="chat-input" placeholder="What do you want done? (Enter to send)" ${runBusy ? 'disabled' : ''}>${esc(newChatDraft)}</textarea>
+          <textarea class="textarea chat__input" id="chat-input" placeholder="${claude ? 'What should this Claude routine do? (Enter to send)' : 'What do you want done? (Enter to send)'}" ${runBusy ? 'disabled' : ''}>${esc(newChatDraft)}</textarea>
           <div class="hx__compose-btns">
-            <button class="btn btn--primary" id="chat-send" ${runBusy ? 'disabled' : ''}>Send</button>
+            <button class="btn btn--primary" id="chat-send" ${runBusy ? 'disabled' : ''}>${claude ? 'Send to Claude' : 'Send'}</button>
             <button class="btn btn--ghost btn--sm" id="chat-save" type="button" title="Keep this prompt in the Library to run or schedule later">Save to Library</button>
           </div>
         </div>
@@ -1812,6 +1856,32 @@ function newChatPaneHtml() {
       </div>
     </div>
     ${compose}`;
+}
+
+/* The bottom of a routine-backed row: what happened, why there is nothing to
+   reply to, and — the part that was missing (issue #109) — a way to act on it.
+
+   The old note said only that the run "was never logged", which is true, is not
+   the reader's language, and leaves them stuck: their routine did not go off,
+   the screen agrees something is wrong, and the only move left is to go find
+   the routine somewhere else and fire it by hand. A fired routine that owes a
+   report and one whose time elapsed with nothing recorded are different
+   situations with different next steps, so they are said differently — and both
+   get **Run now**, which fires this exact routine and, for an agent instance,
+   opens the run it creates right here. */
+function noRunComposeHtml(it) {
+  const r = it.routineId ? getRoutine(it.routineId) : null;
+  const claude = r ? !isAgentKind(r.account) && accountKind(r.account) !== 'openrouter' : false;
+  const why = it.fired
+    ? `This routine was fired${it.time ? ` ${relative(it.time)}` : ''}, but nothing has been logged against it yet.${claude ? ' A Claude routine reports back when its session finishes, so this fills in once it does.' : ''}`
+    : `This routine's time came and went without anything being recorded — it looks like it never fired. Check that firing is on (Settings → Firing) and that its instance has a Fire URL and token.`;
+  const act = r
+    ? `<button class="btn btn--accent btn--sm" id="run-firenow" type="button">Run now</button>`
+    : '';
+  return `<div class="hx__compose"><div class="hx__note">
+      <span>${esc(why)} There is no conversation to continue${act ? ' — run it and one will appear here.' : '.'}</span>
+      ${act}
+    </div></div>`;
 }
 
 function runPaneHtml(it) {
@@ -1842,7 +1912,7 @@ function runPaneHtml(it) {
   const agent = isAgentRun(it);
   const showRetry = agent && !runBusy && (it.status === 'error' || it.status === 'cancelled' || stale);
   const showStop = agent && !runBusy && (busy || stale || it.status === 'running');
-  const statusLabel = stale ? 'May have stalled' : (FRIENDLY_STATUS[it.status] || it.status || 'ran');
+  const statusLabel = statusText(it, stale);
   const chipStatus = stale ? 'missed' : (it.status === 'cancelled' ? 'archived' : (it.status || 'ran')); // archived chip = muted "stopped"
   const spin = (busy || runBusy) ? '<span class="hist__spin" aria-hidden="true"></span>' : '';
   const timing = runTimingChip(it);
@@ -1854,7 +1924,7 @@ function runPaneHtml(it) {
           <button class="btn btn--primary" id="run-send" ${runBusy ? 'disabled' : ''}>Send</button>
         </div>
       </div>`
-    : `<div class="hx__compose"><div class="hx__note">This entry is a routine whose run was never logged, so there's no conversation to continue.</div></div>`;
+    : noRunComposeHtml(it);
   return `<div class="hx__head">
       <button type="button" class="hx__railbtn" id="hx-railbtn" aria-label="Show the run list">☰ Runs</button>
       <span class="chip chip--${esc(chipStatus)}">${spin}${esc(statusLabel)}</span>
@@ -1914,6 +1984,15 @@ function wireRunPane(it) {
   // One-click resume: same agentPost path as a normal reply (simple-CORS text/plain).
   $('#run-retry', main)?.addEventListener('click', () => continueRun(it, RETRY_PROMPT));
   $('#run-stop', main)?.addEventListener('click', () => stopRun(it));
+  // A routine that logged nothing: fire it from here rather than sending the
+  // reader off to find its card (issue #109).
+  $('#run-firenow', main)?.addEventListener('click', async (e) => {
+    const r = getRoutine(it.routineId); if (!r) return;
+    e.currentTarget.disabled = true;
+    await fireTrigger(r);
+    try { await loadAll(); } catch { /* the fire happened regardless */ }
+    refreshHistory();
+  });
 }
 
 /* Re-render the pane in place. Keeps the reader where they were unless they
@@ -2016,7 +2095,12 @@ async function startChat(raw) {
   const text = (raw || '').trim();
   if (!text || runBusy) return;
   const inst = currentChatInstance();
-  if (!inst) { toast('Add an OpenRouter agent account in Settings first.', 'error'); return; }
+  if (!inst) { toast('Add an OpenRouter agent account — or a Claude routine — in Settings first.', 'error'); return; }
+  // A Claude instance is a different path, not a missing one (issue #106): the
+  // fire hands the turn to a Claude Code session, which reports back into
+  // History on its own schedule. There is no run row to open yet, so say what
+  // happened and leave the reader in Chat rather than pretending to a thread.
+  if (isClaudeInstance(inst)) return startClaudeChat(text, inst);
   const { error } = await sessionForFire();
   if (error) { toast(error, 'error'); return; }
   const model = currentChatModel();
@@ -2047,6 +2131,33 @@ async function startChat(raw) {
   }
 }
 
+/* Send one turn to a Claude routine instance from Chat (issue #106).
+
+   The fire is the same POST a routine's Run now makes — `fireTriggerInner`
+   already resolves the account + trigger to a Fire URL and handles the token
+   refresh — so this hands it a routine-shaped object and nothing about the
+   trigger path is duplicated here. What is different is what comes back:
+   nothing. A Claude fire creates no run row (the session reports in when it
+   finishes), so there is no thread to open and the honest thing to do is say
+   so and keep the reader where they are. The draft is cleared only on a send
+   that got as far as the wire — `fireTriggerInner` toasts its own failures. */
+async function startClaudeChat(text, inst) {
+  const who = `${accountLabel(inst.account)} · ${triggerLabel(inst.account, inst.triggerKey) || 'instance'}`;
+  runBusy = true;
+  renderRunPane(NEW_CHAT_ID);
+  try {
+    await fireTrigger({ account: inst.account, triggerKey: inst.triggerKey, prompt: text, title: chatTitleFrom(text) });
+    newChatDraft = '';
+    toast(`Sent to ${who}. It reports back into Chat when the session finishes — nothing streams here in the meantime.`);
+  } catch (e) {
+    toast(`Could not reach ${who}: ${e.message}`, 'error');
+  } finally {
+    runBusy = false;
+    try { await loadAll(); } catch { /* the fire went out regardless */ }
+    renderRunPane(NEW_CHAT_ID, { focus: true });
+  }
+}
+
 /* Keep the prompt, not just the answer (issue #100). A message you are about to
    send is often the thing worth having again next week, and the only way to get
    it onto the shelf used to be re-typing it into the routine drawer. This saves
@@ -2062,7 +2173,7 @@ async function saveChatPrompt(raw) {
     title, prompt: text, status: 'library', scheduledAt: null,
     account: inst ? inst.account : (settings.account || DEFAULT_ACCOUNT),
     triggerKey: inst ? inst.triggerKey : null,
-    model: inst ? currentChatModel() : settings.model,
+    model: (inst && currentChatModel()) || settings.model,
     durationMin: DEFAULT_DURATION_MIN, recurrence: 'none', tz: localTz(),
   });
   if (made) { libraryFilter = 'saved'; paintCounts(); toast(`Saved “${title}” to your Library.`); }
@@ -2545,9 +2656,23 @@ function openDrawer(routine = null, opts = {}) {
         toCommand: c.toCommand !== false, toAbstrax: !!c.toAbstrax };
     } catch { /* not JSON yet */ }
   }
+  // Field order is When → What (issue #107). The drawer opens on the calendar
+  // most of the time, where the time is the thing the reader just chose by
+  // tapping a slot — so it goes first and the prompt sits directly underneath
+  // it, which is the order they are actually thought in. The prompt is also the
+  // tallest field: below the time row it has the rest of the drawer to grow
+  // into, instead of pushing the schedule off the screen.
   drawerBody.innerHTML = `
     <div class="field"><label class="label" for="f-title">Title</label>
       <input class="input" id="f-title" placeholder="e.g. Morning competitor scan" value="${esc(r.title)}" /></div>
+    <div class="field__row">
+      <div class="field"><label class="label" for="f-when">Fire at</label>
+        <input class="input" type="datetime-local" id="f-when" value="${whenVal}" /></div>
+      <div class="field"><label class="label" for="f-dur">Duration</label>
+        <select class="select" id="f-dur">${DURATIONS.map((d) => `<option value="${d}" ${(r.durationMin || DEFAULT_DURATION_MIN) === d ? 'selected' : ''}>${fmtDuration(d)}</option>`).join('')}</select></div>
+      <div class="field"><label class="label" for="f-recur">Repeat</label>
+        <select class="select" id="f-recur">${Object.entries(RECURRENCE).map(([k, v]) => `<option value="${k}" ${r.recurrence === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+    </div>
     <div class="field"><label class="label" for="f-prompt">Directions for Claude</label>
       <textarea class="textarea" id="f-prompt" placeholder="Describe the task. It runs in your Claude Code routine session with full tools.">${esc(r.prompt)}</textarea>
       <span class="hint">Sent to your routine as a session turn. Use {{date}} / {{datetime}} for the run time.</span></div>
@@ -2593,14 +2718,6 @@ function openDrawer(routine = null, opts = {}) {
         <select class="select" id="f-complexity">${COMPLEXITIES.map((c) => `<option value="${c.id}" ${(r.complexity || DEFAULT_COMPLEXITY) === c.id ? 'selected' : ''}>${c.label}</option>`).join('')}</select></div>
     </div>
     <span class="hint" id="f-model-hint"></span>
-    <div class="field__row">
-      <div class="field"><label class="label" for="f-when">Fire at</label>
-        <input class="input" type="datetime-local" id="f-when" value="${whenVal}" /></div>
-      <div class="field"><label class="label" for="f-dur">Duration</label>
-        <select class="select" id="f-dur">${DURATIONS.map((d) => `<option value="${d}" ${(r.durationMin || DEFAULT_DURATION_MIN) === d ? 'selected' : ''}>${fmtDuration(d)}</option>`).join('')}</select></div>
-      <div class="field"><label class="label" for="f-recur">Repeat</label>
-        <select class="select" id="f-recur">${Object.entries(RECURRENCE).map(([k, v]) => `<option value="${k}" ${r.recurrence === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
-    </div>
     <div class="field"><button class="btn btn--ghost btn--sm" id="f-test" type="button">Test live (optional, uses API)</button>
       <div class="run__body" id="f-test-out" style="display:none"></div></div>
     <div class="notice"><b>Run now</b> fires your routine immediately with this prompt. <b>Schedule</b> queues it for the time above (repeating if set). <b>Save to library</b> parks it.</div>`;
@@ -2615,8 +2732,15 @@ function openDrawer(routine = null, opts = {}) {
   ['#f-model', '#f-tasktype', '#f-complexity'].forEach((s) => $(s, drawerBody).addEventListener('change', refreshModelHint));
   $('#f-prompt', drawerBody).addEventListener('input', refreshModelHint); // live cost estimate tracks the prompt
   refreshDrawerKind();
+  drawerBusy = false; // a freshly opened drawer is never mid-submit
   drawerFoot.querySelectorAll('[data-do]').forEach((b) => b.addEventListener('click', () => submitDrawer(b.dataset.do)));
-  setTimeout(() => $(opts.forceSchedule ? '#f-when' : '#f-title', drawerBody)?.focus(), 50);
+  // Opened from a calendar slot, the time is already the one that was tapped
+  // and the prompt is the empty field — so land the cursor there rather than on
+  // the datetime input the reader has just finished answering (issue #107). A
+  // drawer that arrives with directions already in it (a Board note) has
+  // nothing to type, so the title is the sensible landing spot.
+  const land = opts.forceSchedule ? (r.prompt ? '#f-title' : '#f-prompt') : '#f-title';
+  setTimeout(() => $(land, drawerBody)?.focus(), 50);
   overlay.classList.add('is-open');
 }
 /* Swap the drawer between a Claude routine (directions + model), a Perplexity
@@ -2733,7 +2857,33 @@ function readDrawer() {
 }
 async function persist(base) { return editingId ? dbUpdate(editingId, Object.assign(getRoutine(editingId) || {}, base)) : dbCreate(base); }
 
+/* ---------- One click, one routine (issue #108) ----------
+   Every path out of this drawer awaits a round trip to Supabase before it
+   closes, and `editingId` is still null throughout the first one — so a second
+   click landing in that window ran the whole thing again and inserted a second
+   row. On a touchpad that is a stray double-tap; on a slow connection it is
+   simply a reader pressing Schedule again because nothing has visibly happened.
+
+   The flag is the fix and the disabled buttons are the reason it isn't
+   mysterious: a submit already in flight neither queues nor silently drops the
+   second press — the button it would have hit is visibly out of action until
+   the first finishes. `finally` releases it even when validation bounces the
+   submit straight back, so a rejected prompt does not wedge the drawer. */
+let drawerBusy = false;
 async function submitDrawer(action) {
+  if (drawerBusy) return;
+  drawerBusy = true;
+  const btns = [...drawerFoot.querySelectorAll('[data-do]')];
+  btns.forEach((b) => { b.disabled = true; });
+  try {
+    return await submitDrawerInner(action);
+  } finally {
+    drawerBusy = false;
+    btns.forEach((b) => { b.disabled = false; });
+  }
+}
+
+async function submitDrawerInner(action) {
   // Delete works on the existing routine regardless of the form contents, so it
   // runs before the read/validate below (no prompt required to remove a block).
   if (action === 'delete') {
