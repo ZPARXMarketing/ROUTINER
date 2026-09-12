@@ -490,42 +490,65 @@ balance via `/api/v1/key`, key-side so it never leaves Supabase):
 > - `RESPONDER_REASONING_EFFORT` — default `low`. Caps GLM hidden reasoning so
 >   `max_tokens` is left for the answer; body field `reasoning` overrides.
 
+## ⚠ If a routine fired you: report back when you finish. Every time.
+
+**This applies to every fired session, whatever you were asked to do** — a
+one-line fix, a whole feature, a research question, processing the board. There
+is no kind of routine that is exempt, and finishing the work is not finishing
+the run.
+
+Read that twice, because this instruction has failed before and the failure was
+invisible for two months. It used to live inside the planning section below,
+wedged between "The loop:" and that section's numbered steps — so a session
+fired with a specific task read the heading, was told *"just do it with your
+tools"*, correctly concluded the rest of the section was about planning, and
+never got here. The result: **15 fires, 0 reports, ever.** The endpoint was fine
+the whole time. The sessions were obedient, the instruction was mis-filed, and
+the human watching History saw a JSON handshake and no sign their routine had
+ever run. An instruction that can be read as not applying to you will be read
+that way, so it now has its own heading and says out loud that it covers you.
+
+POST a report to the `routiner-admin` edge function at the end of your run — it
+lands in the app's **History** tab (the single record of every run: each entry
+shows a plain-English recap and opens into the full exchange when clicked).
+`summary` is the only required field (a one-paragraph headline), but prefer a
+*detailed* report: pass any of the optional structured fields and the function
+composes them into a rich Markdown entry (URLs and `**bold**` render in
+History). If the session env has your `routineId` (the scheduler passes it in
+the fire body), include it so the run inherits the right owner + title:
+
+```bash
+ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
+curl -s "$ADMIN" -H "Content-Type: application/json" -d '{
+  "action": "report",
+  "routineId": "<id-or-omit>",
+  "status": "success",
+  "summary": "<one-paragraph headline of what you did>",
+  "details": "<optional: longer narrative / context / what you found>",
+  "steps":   ["what you did first", "then this", "then that"],
+  "artifacts": [ {"label":"PR #123","url":"https://github.com/.../pull/123"},
+                 "path/to/file/you/changed.ts" ],
+  "models":  ["z-ai/glm-4.7 for the first-pass draft ($0.004)"],
+  "followups": ["anything left for next time / open questions"]
+}' >/dev/null
+```
+
+`status` is `success | error | missed`. All fields except `summary` are
+optional — omit any you don't need. Omit `routineId` for ad-hoc runs.
+
+**Report even when it went badly.** A run that failed, got blocked, or ran out
+of road is exactly the one the human needs to see: send `status: "error"` and
+say what stopped you. Silence is indistinguishable from a routine that never
+fired, which is the single thing this report exists to prevent.
+
 ## If you're a routine session, or asked to "process the board" / "plan" / "schedule work"
 
 A routine fires by resuming a Claude Code session in this repo with the
 routine's prompt as a turn. If that prompt is a **specific task**, just do it
-with your tools. If it asks you to **process the board / plan / schedule**, use
-the **[`plan-routines`](.claude/skills/plan-routines/SKILL.md)** skill — it has
-the exact Supabase REST recipes. The loop:
-
-> **Report back when you finish — with detail.** So the human can see what a
-> fired routine actually did (not just that it fired), POST a report to the
-> `routiner-admin` edge function at the end of your run — it lands in the app's
-> **History** tab (the single record of every run: each entry shows a
-> plain-English recap and opens into the full exchange when clicked). `summary`
-> is the only required field (a one-paragraph headline), but prefer a *detailed*
-> report: pass any of the optional structured fields and the function composes
-> them into a rich Markdown entry (URLs and `**bold**` render in History). If the session env has your
-> `routineId` (the scheduler
-> passes it in the fire body), include it so the run inherits the right owner +
-> title:
-> ```bash
-> ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
-> curl -s "$ADMIN" -H "Content-Type: application/json" -d '{
->   "action": "report",
->   "routineId": "<id-or-omit>",
->   "status": "success",
->   "summary": "<one-paragraph headline of what you did>",
->   "details": "<optional: longer narrative / context / what you found>",
->   "steps":   ["what you did first", "then this", "then that"],
->   "artifacts": [ {"label":"PR #123","url":"https://github.com/.../pull/123"},
->                  "path/to/file/you/changed.ts" ],
->   "models":  ["z-ai/glm-4.7 for the first-pass draft ($0.004)"],
->   "followups": ["anything left for next time / open questions"]
-> }' >/dev/null
-> ```
-> `status` is `success | error | missed`. All fields except `summary` are
-> optional — omit any you don't need. Omit `routineId` for ad-hoc runs.
+with your tools (then report back, per the section above — that part is not
+optional for you). If it asks you to **process the board / plan / schedule**,
+use the **[`plan-routines`](.claude/skills/plan-routines/SKILL.md)** skill — it
+has the exact Supabase REST recipes. The loop:
 
 1. **Read the Board** (`routiner_notes`; statuses `active | brainstorm | planned
    | done | dismissed`). **Act only on `active` notes.** Never touch
@@ -919,7 +942,15 @@ triggers runs it truly in parallel.
   model, tools, a title from the message and the reader's timezone; *Save to
   Library* writes an unscheduled routine without sending or clearing the box;
   and the model picker defaults to the instance's model but sends the reader's
-  pick) — the only automated coverage the Chat pane has. The same workflow runs
+  pick) — the only automated coverage the Chat pane has. It also covers the four
+  fixes below it: a Claude instance is offered in the composer and sends to the
+  Claude trigger rather than the agent function, the drawer puts the prompt
+  under the date and time, two fast clicks on Schedule write one routine, and a
+  routine that logged nothing offers **Run now** instead of claiming it ran.
+  Note the one piece of setup that is easy to miss when adding to it: the master
+  fire switch defaults to **off** anywhere but the live host, so a localhost
+  test that does not seed `routiner.settings.v1` never reaches a fire path at
+  all — and reads as a broken fire rather than a paused one. The same workflow runs
   `scripts/test-models.mjs` first: pure logic, no browser, so a broken catalog
   fails in two seconds rather than after a Chromium download.
   - **supabase-js is vendored** at `js/vendor/supabase-js.js`, *not* imported
@@ -1032,6 +1063,65 @@ triggers runs it truly in parallel.
   the owner stored on that instance or renamed in `model_prefs` — a request body
   can put a model in neither place, so it never widens what a stranger may ask
   for. Pinned by `scripts/test-scheduler.mjs`.
+- **A picker that offers what the executor cannot run is the same lie as #102,
+  on the other side.** The agent branch of `refreshDrawerKind` has always
+  narrowed to `via: 'openrouter'`; the Claude branch handed over the whole
+  catalog. So you could pin a routine on a Claude account to DeepSeek — the
+  drawer offered it, the card and the calendar block displayed it, and
+  `claude-trigger.mjs` then dropped it at fire time (`/^claude-/` or null), the
+  session ran on its own model, and nothing anywhere said so. That is how one
+  live routine came to read "DeepSeek R1" while Claude did the work. Both sides
+  now narrow, from one branch, so they cannot drift.
+  **Narrowing alone would have been worse than the bug**, and this is the part
+  to keep: a routine already pinned across the line falls out of the list, and a
+  `<select>` whose value matches no option silently selects option zero — so
+  merely filtering would have rewritten existing routines to `auto` on the next
+  save, turning a cosmetic lie into data loss. `modelOptionsHtml` therefore
+  rescues *anything* it would not otherwise offer, and distinguishes the two
+  reasons: not in the catalog at all ("Not in the catalog") versus filtered out
+  by `via` ("Won't run on this account · needs an OpenRouter agent account").
+  The routine keeps what it was saved with and the drawer says why it cannot
+  run. Pinned at both levels — `scripts/test-models.mjs` on the HTML,
+  `scripts/test-boot.mjs` driving the real account `<select>`, because the
+  narrowing lives in the account-change path and the stale-list case only
+  reproduces through it.
+- **A capability nobody offers is a capability nobody has.** The New chat
+  composer listed OpenRouter agent instances only, so the Claude accounts read
+  as *removed* — still in Settings, still fireable from a routine card, but
+  absent from the one screen where you start a conversation (issue #106). What
+  made the omission defensible is also what made it wrong: a Claude fire hands
+  the turn to a Claude Code session that reports back later, so there is no live
+  thread to watch, and deciding on the reader's behalf that this was therefore
+  not worth offering is what deleted the feature. `chatInstances()` lists both
+  kinds and carries `kind`, so send picks the path — `startClaudeChat` reuses
+  `fireTrigger`, which already resolves the account to a Fire URL, rather than
+  duplicating the trigger logic. Two things follow from the difference and are
+  said out loud rather than hidden: the model picker is **not** shown for a
+  Claude instance (its session picks its own model, so a picker would be a lie),
+  and the confirmation says the session reports back into Chat and that nothing
+  streams in the meantime. An account with no trigger configured is not listed
+  at all — an instance that 401s on send is worse than an absent one.
+- **The drawer asks *when* before *what*.** It opens on a calendar slot most of
+  the time — the reader has just tapped a time — and then asked for the
+  paragraph first and the time underneath it (issue #107). Fire at / Duration /
+  Repeat now sit directly under the title with the prompt below them, which is
+  also the better shape: the prompt is the tallest field, so below the time row
+  it has the rest of the drawer to grow into instead of pushing the schedule off
+  screen. Focus follows the same logic — opened from a slot, the cursor lands in
+  the empty prompt, not on the datetime input just answered; a drawer that
+  arrives with directions already in it (a Board note) lands on the title.
+- **One click, one routine.** Every path out of the drawer awaits a Supabase
+  round trip before it closes, and `editingId` is null throughout the first one
+   — so a second click inside that window ran the whole submit again and
+  inserted a duplicate (issue #108). That is a stray double-tap on a touchpad,
+  or simply a reader pressing Schedule again because nothing had visibly
+  happened. `drawerBusy` drops the second submit and the foot buttons are
+  disabled while one is in flight, which is the part that keeps it from being
+  mysterious: the press is visibly refused rather than silently dropped.
+  `finally` releases both even when validation bounces the submit straight back,
+  so a rejected prompt cannot wedge the drawer. The test that pins it stubs a
+  **slow** insert on purpose — the bug lives entirely in that window, so a fast
+  stub reproduces nothing.
 - **The shell is exactly one viewport tall, and the Chat pane got stuck twice
   getting there.** Symptom both times, iPadOS only: the run list and transcript
   would not scroll, content just ran off the bottom of the window. Cause both
@@ -1142,6 +1232,21 @@ triggers runs it truly in parallel.
   thread you replied to later — that verb keeps elapsed time from claiming the
   model worked the whole span. Rows still sort by last activity, so a
   freshly-continued thread surfaces even though its stamp is older.
+- **A row that logged nothing must not claim it ran.** History synthesises a row
+  for a past one-off that never logged a run, and stamped every one of them
+  `status: 'ran'` with a note saying the run "was never logged, so there's no
+  conversation to continue" (issue #109). Both halves were wrong in the same
+  direction. The chip made a claim about a run that had not happened — so a
+  routine that silently never fired looked, at a glance, exactly like one that
+  had worked. And the note was a dead end: it described the data model, in the
+  data model's words, to a reader whose actual question was *is my routine
+  running?* and whose only remaining move was to go find the routine elsewhere
+  and fire it by hand. These rows now say which of two things happened — fired
+  and still owing a report, or `missed`, its time gone with nothing recorded —
+  and carry **Run now**, which fires that routine and, on an agent instance,
+  opens the run it creates right there. `missed` is deliberate rather than
+  cosmetic: it is the status the Chat tab's alert badge already watches, so a
+  routine that quietly never went off now surfaces on its own.
 - **Past calendar blocks rename in place.** A block whose time has passed is a
   record of something that happened, so it carries a pencil that swaps its title
   for an input right on the grid (`startBlockRename` — Enter saves, Escape
