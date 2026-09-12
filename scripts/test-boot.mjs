@@ -427,6 +427,42 @@ console.log('\nStalls recover instead of hanging');
   });
   check('the prompt sits underneath the date and time', whenFirst);
 
+  /* The picker must offer only what the chosen account can run. A Claude
+     account used to get the whole catalog, so a routine could be pinned to a
+     model claude-trigger.mjs drops at fire time — the card then named a model
+     that never ran. Driven through the real account <select>, because the
+     narrowing lives in refreshDrawerKind's account-change path. */
+  const modelValues = async (acct) => {
+    await page.selectOption('#f-account', acct);
+    await page.waitForTimeout(200);
+    return page.locator('#f-model option').evaluateAll((els) => els.map((e) => e.value));
+  };
+  const OR_SLUG = /^(deepseek|z-ai|moonshotai|openai|google|x-ai|meta-llama|mistralai|qwen|minimax)\//;
+  const claudeVals = await modelValues('sparks9679');
+  check('a Claude account offers no OpenRouter model', !claudeVals.some((v) => OR_SLUG.test(v)), claudeVals.join(', '));
+  check('…and still offers the Claude ones', claudeVals.includes('claude-sonnet-5'));
+  const agentVals = await modelValues('acc_kimi');
+  check('an agent account offers no Claude model', !agentVals.some((v) => /^claude-/.test(v)), agentVals.join(', '));
+  // Switching back must re-narrow rather than leave the agent list in place —
+  // the stale-list case is why this is driven through the real <select>.
+  check('…and switching back re-narrows', (await modelValues('sparks9679')).includes('claude-sonnet-5'));
+
+  /* The guard that makes the narrowing safe. Narrowing ALONE would be worse
+     than the bug it fixes: a routine pinned to the other executor's model falls
+     out of the list, the <select> lands on option zero, and the next save
+     rewrites the routine to something nobody chose. So the pin is rescued and
+     labelled. This is the exact shape of the "Dark tetrad" row — a DeepSeek
+     model sitting on a Claude account. */
+  await page.selectOption('#f-account', 'acc_kimi');
+  await page.waitForTimeout(200);
+  await page.selectOption('#f-model', 'deepseek/deepseek-r1');
+  await page.selectOption('#f-account', 'sparks9679');
+  await page.waitForTimeout(200);
+  check('a pin to the other executor survives the narrowing',
+    await page.inputValue('#f-model') === 'deepseek/deepseek-r1', await page.inputValue('#f-model'));
+  check('…and the drawer says why it will not run',
+    /Won.t run on this account/.test(await page.innerHTML('#f-model')));
+
   const before = routinePosts.length;
   await page.fill('#f-title', 'Twice-clicked routine');
   await page.fill('#f-prompt', 'Do the thing exactly once.');

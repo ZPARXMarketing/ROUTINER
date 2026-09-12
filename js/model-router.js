@@ -281,11 +281,37 @@ export function modelOptionsHtml(selected, { auto = true, via = 'all' } = {}) {
     const items = rows.map((m) => opt(m.slug, `${m.name} · ${TIER_LABEL[m.tier]} · ${rateLabel(m.slug)}`)).join('');
     return `<optgroup label="${escAttr(`${lab.name} · ${lab.origin}`)}">${items}</optgroup>`;
   }).join('');
-  // A model the catalog has never heard of — a legacy pin, or a slug typed
-  // straight into settings — still has to be selectable, or opening the drawer
-  // on that routine would silently re-point it at whatever sits first in the list.
-  const known = new Set([AUTO_MODEL.slug, OPENROUTER_AUTO.slug, ...catalog().map((m) => m.slug)]);
-  const orphan = sel && !known.has(sel) ? `<optgroup label="Not in the catalog">${opt(sel, `${sel} (kept as-is)`)}</optgroup>` : '';
+  // Whatever a routine is pinned to has to stay SELECTABLE, or opening the
+  // drawer on it silently re-points it at whatever sits first in the list — a
+  // <select> whose value matches no option just selects option zero, and the
+  // next save writes that instead. So rescue anything the filters above left
+  // out, and say which of the two reasons it was left out for, because they are
+  // different facts and only one of them is a mistake:
+  //   • not in the catalog at all — a legacy pin, or a slug typed into Settings
+  //   • in the catalog but filtered out by `via` — an OpenRouter model on a
+  //     Claude account (claude-trigger drops it at fire time), or the reverse.
+  //     Naming that is the whole point: the routine keeps what it was saved
+  //     with and the drawer says why it cannot run, instead of quietly
+  //     changing it and leaving the card naming a model that never ran.
+  const offered = new Set([
+    ...(auto ? [AUTO_MODEL.slug] : []),
+    ...(auto && via !== 'claude' ? [OPENROUTER_AUTO.slug] : []),
+    ...catalog().filter((m) => via === 'all' || m.via === via).map((m) => m.slug),
+  ]);
+  let orphan = '';
+  if (sel && !offered.has(sel)) {
+    const needs = (v) => (v === 'claude' ? 'a Claude account' : 'an OpenRouter agent account');
+    const row = modelBySlug(sel);
+    if (row) {
+      orphan = `<optgroup label="Won’t run on this account">${opt(sel, `${row.name} · needs ${needs(row.via)} · kept as-is`)}</optgroup>`;
+    } else if (sel === OPENROUTER_AUTO.slug) {
+      orphan = `<optgroup label="Won’t run on this account">${opt(sel, `${OPENROUTER_AUTO.name} · needs ${needs('openrouter')} · kept as-is`)}</optgroup>`;
+    } else if (sel === AUTO_MODEL.slug) {
+      orphan = `<optgroup label="Won’t run on this account">${opt(sel, `${AUTO_MODEL.name} · resolved by the instance · kept as-is`)}</optgroup>`;
+    } else {
+      orphan = `<optgroup label="Not in the catalog">${opt(sel, `${sel} (kept as-is)`)}</optgroup>`;
+    }
+  }
   return head.join('') + orphan + groups;
 }
 

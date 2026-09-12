@@ -122,6 +122,23 @@ const orphan = modelOptionsHtml('legacy/model-x');
 ok('an unknown pin is kept selectable', orphan.includes('value="legacy/model-x" selected'));
 ok('…and is labeled as outside the catalog', orphan.includes('Not in the catalog'));
 
+// A routine pinned to the OTHER executor's model — a DeepSeek pin on a Claude
+// account, which claude-trigger.mjs drops at fire time. Narrowing the picker is
+// the fix, but narrowing it *alone* would be worse than the bug: the pin falls
+// out of the list, the <select> lands on option zero, and the next save quietly
+// rewrites the routine. So it stays selectable and says why it cannot run.
+const crossed = modelOptionsHtml('deepseek/deepseek-r1', { via: 'claude' });
+ok('a Claude picker offers no OpenRouter model', !/value="deepseek\/deepseek-chat"/.test(crossed));
+ok('…but an existing pin to one survives', crossed.includes('value="deepseek/deepseek-r1" selected'));
+ok('…labelled with what it would need', /Won.t run on this account/.test(crossed) && crossed.includes('OpenRouter agent account'));
+// The mirror case, so the rescue is not Claude-specific.
+const crossedOr = modelOptionsHtml('claude-sonnet-5', { auto: false, via: 'openrouter' });
+ok('an agent picker keeps a Claude pin selectable', crossedOr.includes('value="claude-sonnet-5" selected'));
+ok('…and says it needs a Claude account', crossedOr.includes('a Claude account'));
+// Rescue only fires for something the picker genuinely dropped.
+ok('a model the picker does offer is not double-listed',
+  (modelOptionsHtml('claude-sonnet-5', { via: 'claude' }).match(/value="claude-sonnet-5"/g) || []).length === 1);
+
 // Escaping: these strings land straight in innerHTML.
 ok('a hostile slug cannot break out of the option', !modelOptionsHtml('"><script>x</script>').includes('<script>'));
 

@@ -490,42 +490,65 @@ balance via `/api/v1/key`, key-side so it never leaves Supabase):
 > - `RESPONDER_REASONING_EFFORT` — default `low`. Caps GLM hidden reasoning so
 >   `max_tokens` is left for the answer; body field `reasoning` overrides.
 
+## ⚠ If a routine fired you: report back when you finish. Every time.
+
+**This applies to every fired session, whatever you were asked to do** — a
+one-line fix, a whole feature, a research question, processing the board. There
+is no kind of routine that is exempt, and finishing the work is not finishing
+the run.
+
+Read that twice, because this instruction has failed before and the failure was
+invisible for two months. It used to live inside the planning section below,
+wedged between "The loop:" and that section's numbered steps — so a session
+fired with a specific task read the heading, was told *"just do it with your
+tools"*, correctly concluded the rest of the section was about planning, and
+never got here. The result: **15 fires, 0 reports, ever.** The endpoint was fine
+the whole time. The sessions were obedient, the instruction was mis-filed, and
+the human watching History saw a JSON handshake and no sign their routine had
+ever run. An instruction that can be read as not applying to you will be read
+that way, so it now has its own heading and says out loud that it covers you.
+
+POST a report to the `routiner-admin` edge function at the end of your run — it
+lands in the app's **History** tab (the single record of every run: each entry
+shows a plain-English recap and opens into the full exchange when clicked).
+`summary` is the only required field (a one-paragraph headline), but prefer a
+*detailed* report: pass any of the optional structured fields and the function
+composes them into a rich Markdown entry (URLs and `**bold**` render in
+History). If the session env has your `routineId` (the scheduler passes it in
+the fire body), include it so the run inherits the right owner + title:
+
+```bash
+ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
+curl -s "$ADMIN" -H "Content-Type: application/json" -d '{
+  "action": "report",
+  "routineId": "<id-or-omit>",
+  "status": "success",
+  "summary": "<one-paragraph headline of what you did>",
+  "details": "<optional: longer narrative / context / what you found>",
+  "steps":   ["what you did first", "then this", "then that"],
+  "artifacts": [ {"label":"PR #123","url":"https://github.com/.../pull/123"},
+                 "path/to/file/you/changed.ts" ],
+  "models":  ["z-ai/glm-4.7 for the first-pass draft ($0.004)"],
+  "followups": ["anything left for next time / open questions"]
+}' >/dev/null
+```
+
+`status` is `success | error | missed`. All fields except `summary` are
+optional — omit any you don't need. Omit `routineId` for ad-hoc runs.
+
+**Report even when it went badly.** A run that failed, got blocked, or ran out
+of road is exactly the one the human needs to see: send `status: "error"` and
+say what stopped you. Silence is indistinguishable from a routine that never
+fired, which is the single thing this report exists to prevent.
+
 ## If you're a routine session, or asked to "process the board" / "plan" / "schedule work"
 
 A routine fires by resuming a Claude Code session in this repo with the
 routine's prompt as a turn. If that prompt is a **specific task**, just do it
-with your tools. If it asks you to **process the board / plan / schedule**, use
-the **[`plan-routines`](.claude/skills/plan-routines/SKILL.md)** skill — it has
-the exact Supabase REST recipes. The loop:
-
-> **Report back when you finish — with detail.** So the human can see what a
-> fired routine actually did (not just that it fired), POST a report to the
-> `routiner-admin` edge function at the end of your run — it lands in the app's
-> **History** tab (the single record of every run: each entry shows a
-> plain-English recap and opens into the full exchange when clicked). `summary`
-> is the only required field (a one-paragraph headline), but prefer a *detailed*
-> report: pass any of the optional structured fields and the function composes
-> them into a rich Markdown entry (URLs and `**bold**` render in History). If the session env has your
-> `routineId` (the scheduler
-> passes it in the fire body), include it so the run inherits the right owner +
-> title:
-> ```bash
-> ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
-> curl -s "$ADMIN" -H "Content-Type: application/json" -d '{
->   "action": "report",
->   "routineId": "<id-or-omit>",
->   "status": "success",
->   "summary": "<one-paragraph headline of what you did>",
->   "details": "<optional: longer narrative / context / what you found>",
->   "steps":   ["what you did first", "then this", "then that"],
->   "artifacts": [ {"label":"PR #123","url":"https://github.com/.../pull/123"},
->                  "path/to/file/you/changed.ts" ],
->   "models":  ["z-ai/glm-4.7 for the first-pass draft ($0.004)"],
->   "followups": ["anything left for next time / open questions"]
-> }' >/dev/null
-> ```
-> `status` is `success | error | missed`. All fields except `summary` are
-> optional — omit any you don't need. Omit `routineId` for ad-hoc runs.
+with your tools (then report back, per the section above — that part is not
+optional for you). If it asks you to **process the board / plan / schedule**,
+use the **[`plan-routines`](.claude/skills/plan-routines/SKILL.md)** skill — it
+has the exact Supabase REST recipes. The loop:
 
 1. **Read the Board** (`routiner_notes`; statuses `active | brainstorm | planned
    | done | dismissed`). **Act only on `active` notes.** Never touch
@@ -1040,6 +1063,28 @@ triggers runs it truly in parallel.
   the owner stored on that instance or renamed in `model_prefs` — a request body
   can put a model in neither place, so it never widens what a stranger may ask
   for. Pinned by `scripts/test-scheduler.mjs`.
+- **A picker that offers what the executor cannot run is the same lie as #102,
+  on the other side.** The agent branch of `refreshDrawerKind` has always
+  narrowed to `via: 'openrouter'`; the Claude branch handed over the whole
+  catalog. So you could pin a routine on a Claude account to DeepSeek — the
+  drawer offered it, the card and the calendar block displayed it, and
+  `claude-trigger.mjs` then dropped it at fire time (`/^claude-/` or null), the
+  session ran on its own model, and nothing anywhere said so. That is how one
+  live routine came to read "DeepSeek R1" while Claude did the work. Both sides
+  now narrow, from one branch, so they cannot drift.
+  **Narrowing alone would have been worse than the bug**, and this is the part
+  to keep: a routine already pinned across the line falls out of the list, and a
+  `<select>` whose value matches no option silently selects option zero — so
+  merely filtering would have rewritten existing routines to `auto` on the next
+  save, turning a cosmetic lie into data loss. `modelOptionsHtml` therefore
+  rescues *anything* it would not otherwise offer, and distinguishes the two
+  reasons: not in the catalog at all ("Not in the catalog") versus filtered out
+  by `via` ("Won't run on this account · needs an OpenRouter agent account").
+  The routine keeps what it was saved with and the drawer says why it cannot
+  run. Pinned at both levels — `scripts/test-models.mjs` on the HTML,
+  `scripts/test-boot.mjs` driving the real account `<select>`, because the
+  narrowing lives in the account-change path and the stale-list case only
+  reproduces through it.
 - **A capability nobody offers is a capability nobody has.** The New chat
   composer listed OpenRouter agent instances only, so the Claude accounts read
   as *removed* — still in Settings, still fireable from a routine card, but

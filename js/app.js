@@ -2764,16 +2764,29 @@ function refreshDrawerKind() {
   // Only the enrichment account hides it (its model is the Perplexity select).
   hide('#f-model', isEnrich);
   hide('#f-test', nonClaude);
+  // The picker offers only what THIS account's executor can actually run.
+  // The agent side has always narrowed to `via: 'openrouter'`; the Claude side
+  // used to get the whole catalog, so you could pin a routine to DeepSeek on a
+  // Claude account — where `claude-trigger.mjs` drops any non-`claude-*` id at
+  // fire time, the session runs on its own model, and the card goes on naming
+  // the model that never ran. Same class of lie as issue #102, on the other
+  // executor. Both sides are narrowed now, from one place, so they cannot drift.
+  // A routine already pinned to the wrong side keeps its value: modelOptionsHtml
+  // rescues a slug it would not otherwise offer and labels it, rather than
+  // letting the <select> silently re-point to option zero.
   const modelSel = $('#f-model', drawerBody);
-  if (modelSel && isAgent) {
-    const tId = $('#f-trigger', drawerBody)?.value || null;
-    const cur = modelSel.dataset.kind === 'agent' ? modelSel.value : (modelSel.value && modelSel.value !== 'auto' ? modelSel.value : triggerModel(acc, tId));
-    modelSel.innerHTML = modelOptionsHtml(cur, { auto: false, via: 'openrouter' });
-    modelSel.dataset.kind = 'agent';
-  } else if (modelSel && modelSel.dataset.kind === 'agent') {
-    // Switched back to a Claude account: restore the full catalog.
-    modelSel.innerHTML = modelOptionsHtml(modelSel.value);
-    delete modelSel.dataset.kind;
+  if (modelSel && !isEnrich) {
+    const want = isAgent ? 'agent' : 'claude';
+    if (modelSel.dataset.kind !== want) {
+      const tId = $('#f-trigger', drawerBody)?.value || null;
+      const cur = isAgent
+        ? (modelSel.value && modelSel.value !== 'auto' ? modelSel.value : triggerModel(acc, tId))
+        : modelSel.value;
+      modelSel.innerHTML = isAgent
+        ? modelOptionsHtml(cur, { auto: false, via: 'openrouter' })
+        : modelOptionsHtml(cur, { via: 'claude' });
+      modelSel.dataset.kind = want;
+    }
   }
   const autoRow = $('#f-auto-row', drawerBody); if (autoRow && nonClaude) autoRow.style.display = 'none';
   const hint = $('#f-model-hint', drawerBody); if (hint) hint.style.display = nonClaude ? 'none' : '';
