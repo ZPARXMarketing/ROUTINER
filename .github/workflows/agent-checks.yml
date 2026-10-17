@@ -19,7 +19,7 @@ on:
       - 'scripts/**'
       - '.github/workflows/agent-checks.yml'
   push:
-    branches: [main]
+    branches: [routiner, main]
     paths:
       - 'supabase/functions/**'
       - 'scripts/**'

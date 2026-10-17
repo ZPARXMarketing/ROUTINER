@@ -156,9 +156,9 @@ Already configured! Just sign in and use.
 
 ### 2. Netlify (Hosting + Trigger)
 
-**Live at:** https://zroutiner.netlify.app (auto-deploys from `main`)
+**Live at:** https://routiner--zroutiner.netlify.app (the free `routiner` branch deploy; production https://zroutiner.netlify.app moves only when Jeremy asks)
 
-**Supabase edge functions** also auto-deploy from `main` when
+**Supabase edge functions** also auto-deploy from `routiner` when
 `supabase/functions/**` changes (GitHub Action *Deploy Edge Functions*). Add
 repo secret `SUPABASE_ACCESS_TOKEN` (and optional `SUPABASE_PROJECT_ID`) once —
 see CLAUDE.md.

@@ -23,7 +23,7 @@ on:
       - 'scripts/test-boot.mjs'
       - '.github/workflows/boot-checks.yml'
   push:
-    branches: [main]
+    branches: [routiner, main]
     paths:
       - 'index.html'
       - 'usage.html'

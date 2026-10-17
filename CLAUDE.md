@@ -9,6 +9,27 @@ routines carry it out on a schedule. Two surfaces matter:
 
 All live state is in **Supabase** (RLS per user), *not* in this repo's files.
 
+
+## Where work lands: the `routiner` branch (Jeremy, 2026-10-17)
+
+Netlify charges credits for every **production** deploy (`main`); branch
+deploys are free. The live app is the free branch deploy
+**routiner--zroutiner.netlify.app**; `main` (zroutiner.netlify.app) moves only
+when Jeremy asks.
+
+- **`routiner` is this repo's `main`** (and its GitHub default branch, so agent
+  PRs target it too). App changes go through a PR with base `routiner`;
+  docs-only pushes can go straight to it.
+- **Edge functions deploy from `routiner`** (the Deploy Edge Functions workflow).
+- **The scheduler fires Claude through `ROUTINER_TRIGGER_URL`**, which defaults
+  to production's `claude-trigger`. Production keeps serving its last deploy, so
+  that still works; set the edge secret to
+  `https://routiner--zroutiner.netlify.app/.netlify/functions/claude-trigger`
+  once the branch deploy has the same Netlify env vars.
+- The fire switch defaults **on** for both live hosts (`MAIN_HOSTS` in
+  `js/app.js`) and off anywhere else.
+- `netlify.toml`'s `ignore` skips builds whose diff is only docs or `.md`.
+
 ## Offloading cheap work to OpenRouter (optional, you decide)
 
 You are the orchestrator and you have the final say on everything that ships.
@@ -687,7 +708,7 @@ optional: it stores per-user model slug + color overrides. Without it the app
 keeps them in the browser instead of on the account — the feature works either
 way, it just stops following you between devices.
 
-Edge functions **auto-deploy from `main`** via
+Edge functions **auto-deploy from `routiner`** via
 [`.github/workflows/deploy-edge-functions.yml`](.github/workflows/deploy-edge-functions.yml)
 when `supabase/functions/**` changes (after a PR merges). Manual run:
 Actions → *Deploy Edge Functions* → Run workflow.
@@ -832,7 +853,7 @@ Keep `AGENT_ALLOW_MERGE` **off** for this routine's account until you've watched
 a few of its PRs. The CI gate makes that a smaller leap than it was, but a
 green check says the change did not break the tests — not that it was the right
 change. The loop is: it reads its own failures → proposes a fix → you
-review and merge → the edge function auto-deploys from `main` → the next run is
+review and merge → the edge function auto-deploys from `routiner` → the next run is
 measurably better. Review every PR; a model diagnosing its own logs is a genuine
 feedback loop, but it is not a substitute for judgment.
 

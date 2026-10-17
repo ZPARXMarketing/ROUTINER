@@ -1,5 +1,6 @@
-# Deploy Supabase Edge Functions when function code lands on main
-# (i.e. after a PR merges) or on manual dispatch.
+# Deploy Supabase Edge Functions when function code lands on `routiner` (this
+# repo's working branch, see CLAUDE.md; i.e. after a PR merges) or on manual
+# dispatch.
 #
 # Secrets (repo → Settings → Secrets and variables → Actions):
 #   SUPABASE_ACCESS_TOKEN  — personal access token from
@@ -16,7 +17,7 @@ name: Deploy Edge Functions
 
 on:
   push:
-    branches: [main]
+    branches: [routiner]
     paths:
       - "supabase/functions/**"
       - ".github/workflows/deploy-edge-functions.yml"

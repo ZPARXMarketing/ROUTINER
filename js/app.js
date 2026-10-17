@@ -31,7 +31,9 @@ import { nextOccurrence, nextOccurrences } from './schedule.js';
 const TRIGGER_FN = '/.netlify/functions/claude-trigger';
 /* The production site. Only this host defaults the master fire switch to live;
    preview/branch/dev deploys default to paused so they don't fire by accident. */
-const MAIN_HOST = 'zroutiner.netlify.app';
+// The live hosts: the free `routiner` branch deploy, and production (kept up,
+// moved only when Jeremy asks). Anywhere else the fire switch starts off.
+const MAIN_HOSTS = new Set(['routiner--zroutiner.netlify.app', 'zroutiner.netlify.app']);
 
 /* Dedicated storage key: this Supabase project is shared with other ZPARX apps
    (e.g. the admin dashboard). Two apps on the same browser origin using the
@@ -248,9 +250,9 @@ function loadSettings() {
     delete s.apiKey;
     // Master fire switch (per browser/deployment): default live only on the
     // main site, paused on preview/dev so they don't fire by accident.
-    if (typeof s.firing !== 'boolean') s.firing = (location.hostname === MAIN_HOST);
+    if (typeof s.firing !== 'boolean') s.firing = MAIN_HOSTS.has(location.hostname);
     return s;
-  } catch { return { model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', anthropicKey: '', openrouterKey: '', firing: (location.hostname === MAIN_HOST) }; }
+  } catch { return { model: DEFAULT_MODEL, account: DEFAULT_ACCOUNT, triggerUrl: '', anthropicKey: '', openrouterKey: '', firing: MAIN_HOSTS.has(location.hostname) }; }
 }
 function saveSettings() { localStorage.setItem(LS, JSON.stringify(settings)); }
 
