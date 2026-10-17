@@ -43,12 +43,17 @@ session has **no Supabase key** in its environment. So reads and writes go
 through a Supabase **edge function**, `routiner-admin`, which holds the
 service-role key inside Supabase (auto-injected; never exposed) and exposes only
 the three operations this skill needs. You call it with the **public**
-publishable key:
+publishable key **plus the shared secret** `$ROUTINER_ADMIN_SECRET` (an
+environment variable on the Claude environment; same value as the
+`ROUTINER_ADMIN_SECRET` edge secret). Without it every operation here answers
+401, because `schedule` fires prompts into Claude sessions and must not be open
+to anyone holding the URL:
 
 ```bash
 ADMIN="https://vonfdzttupyemtomsojy.supabase.co/functions/v1/routiner-admin"
 ANON="sb_publishable_60-OPzmfueDopyogbm20pg_linElDjT"   # public, safe to embed
-A=(-H "Authorization: Bearer $ANON" -H "apikey: $ANON" -H "Content-Type: application/json")
+A=(-H "Authorization: Bearer $ANON" -H "apikey: $ANON" -H "Content-Type: application/json" \
+   -H "x-routiner-secret: $ROUTINER_ADMIN_SECRET")
 ```
 
 Operations (all return JSON `{ ok: true, ... }` or `{ ok: false, error }`):
@@ -58,6 +63,10 @@ Operations (all return JSON `{ ok: true, ... }` or `{ ok: false, error }`):
 | `context` | `{"action":"context"}` | one read: `ownerUserId`, `activeNotes`, `scheduled` (both accounts), `accounts` (triggers) |
 | `schedule` | `{"action":"schedule","blocks":[…]}` | inserts routine blocks (status forced `scheduled`) |
 | `markNote` | `{"action":"markNote","id":"…","status":"planned"}` | sets a note to `planned`/`done`/`dismissed` |
+
+**If `$ROUTINER_ADMIN_SECRET` is empty** or a call answers 401/503, do not
+look for another route in: write the plan as the proposal below and say the
+secret is missing from this environment.
 
 **If `routiner-admin` is unreachable** (404 / `ok:false`), do not guess another
 auth path. Produce the plan as a markdown table (title · account · when · repeat

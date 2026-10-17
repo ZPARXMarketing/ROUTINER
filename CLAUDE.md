@@ -533,6 +533,11 @@ curl -s "$ADMIN" -H "Content-Type: application/json" -d '{
 }' >/dev/null
 ```
 
+`report` is the one `routiner-admin` action that needs no secret. `context`,
+`schedule` and `markNote` require `x-routiner-secret: $ROUTINER_ADMIN_SECRET`
+(the `ROUTINER_ADMIN_SECRET` edge secret; refused outright while it is unset),
+because `schedule` writes prompts the scheduler fires into Claude sessions.
+
 `status` is `success | error | missed`. All fields except `summary` are
 optional — omit any you don't need. Omit `routineId` for ad-hoc runs.
 
