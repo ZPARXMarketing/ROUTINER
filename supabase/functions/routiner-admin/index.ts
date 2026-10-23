@@ -19,25 +19,42 @@
 //                                        artifacts[], models[], followups[]) are composed
 //                                        into a richer Markdown summary — see composeReport.
 //
-// Auth: deployed with verify_jwt=false (like dynamic-responder); the public
-// publishable key gates it at the gateway. Writes are constrained to the
-// actions/fields below. Tighten with a shared token if you ever need to.
+// Auth: deployed with verify_jwt=false, so the gateway checks nothing. Every
+// action except `report` requires the ROUTINER_ADMIN_SECRET edge secret,
+// presented as `x-routiner-secret: <secret>`. `schedule` writes a prompt the
+// scheduler then fires into a Claude session with repo access, so an open
+// endpoint let anyone holding the URL queue work for Claude. Unset secret →
+// those actions are refused (fail closed), never opened. `report` stays open:
+// every fired session and lead-enrichment post to it, and it only writes a
+// History row.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const ADMIN_SECRET = (Deno.env.get("ROUTINER_ADMIN_SECRET") || "").trim();
+const GATED = new Set(["context", "schedule", "markNote"]);
 
 const cors = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
-  "access-control-allow-headers": "content-type, authorization, apikey",
+  "access-control-allow-headers": "content-type, authorization, apikey, x-routiner-secret",
 };
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...cors } });
 
 const H = () => ({ apikey: SERVICE_ROLE!, Authorization: `Bearer ${SERVICE_ROLE}`, "Content-Type": "application/json" });
 const rest = (path: string) => `${SUPABASE_URL}/rest/v1/${path}`;
+
+// Length-independent compare, so the response time says nothing about how much
+// of a guess was right.
+function sameSecret(given: string, want: string): boolean {
+  const a = new TextEncoder().encode(given);
+  const b = new TextEncoder().encode(want);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return diff === 0;
+}
 
 const RECURRENCES = new Set(["none", "daily", "weekdays", "weekly"]);
 const NOTE_STATUSES = new Set(["planned", "done", "dismissed"]);
@@ -143,6 +160,15 @@ Deno.serve(async (req: Request) => {
   let body: Record<string, unknown> = {};
   if (req.method === "POST") { try { body = await req.json(); } catch { /* ignore */ } }
   const action = String(body.action || new URL(req.url).searchParams.get("action") || "context");
+
+  if (GATED.has(action)) {
+    if (!ADMIN_SECRET) {
+      return json({ ok: false, error: `'${action}' is disabled: set the ROUTINER_ADMIN_SECRET edge secret, and give callers the same value as $ROUTINER_ADMIN_SECRET.` }, 503);
+    }
+    if (!sameSecret((req.headers.get("x-routiner-secret") || "").trim(), ADMIN_SECRET)) {
+      return json({ ok: false, error: `Unauthorized: '${action}' needs the x-routiner-secret header (the ROUTINER_ADMIN_SECRET value; plan-routines sends $ROUTINER_ADMIN_SECRET).` }, 401);
+    }
+  }
 
   try {
     if (action === "context") {
