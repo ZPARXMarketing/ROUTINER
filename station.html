@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>ZPARX Station — Routiner</title>
+  <meta name="description" content="You and your agents: what needs you, what's running, what shipped." />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png" />
+  <!-- Non-blocking webfonts, same reason as index.html: a slow font host must
+       never hold first paint. Legible's stack falls back to system-ui. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet" media="print" onload="this.media='all'" />
+  <link rel="stylesheet" href="css/legible-tokens.css" />
+  <link rel="stylesheet" href="css/station.css" />
+</head>
+<body>
+  <div class="st">
+    <nav class="st-nav" id="nav" aria-label="Workspace"></nav>
+    <main class="st-main" id="main"><p class="muted">Loading Station…</p></main>
+  </div>
+  <script type="module" src="js/station.js"></script>
+</body>
+</html>

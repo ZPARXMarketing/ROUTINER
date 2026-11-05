@@ -18,18 +18,22 @@ on:
     paths:
       - 'index.html'
       - 'usage.html'
+      - 'station.html'
       - 'js/**'
       - 'css/**'
       - 'scripts/test-boot.mjs'
+      - 'scripts/test-station.mjs'
       - '.github/workflows/boot-checks.yml'
   push:
     branches: [routiner, main]
     paths:
       - 'index.html'
       - 'usage.html'
+      - 'station.html'
       - 'js/**'
       - 'css/**'
       - 'scripts/test-boot.mjs'
+      - 'scripts/test-station.mjs'
   workflow_dispatch:
 
 permissions:
@@ -70,5 +74,18 @@ jobs:
           echo "$out"
           if grep -q '^SKIP:' <<<"$out"; then
             echo "::error::test-boot.mjs skipped — Playwright/Chromium did not install, so nothing was verified."
+            exit 1
+          fi
+
+      # Station (station.html): every view against one stubbed fixture, plus the
+      # rules it must keep: no invented numbers, no secret in the page, 44px
+      # targets, no sideways scroll at iPad widths. Same skip-is-failure rule.
+      - name: Station tests
+        run: |
+          set -euo pipefail
+          out=$(node scripts/test-station.mjs 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          if grep -q '^SKIP:' <<<"$out"; then
+            echo "::error::test-station.mjs skipped — Playwright/Chromium did not install, so nothing was verified."
             exit 1
           fi

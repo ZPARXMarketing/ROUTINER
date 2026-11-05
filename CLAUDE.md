@@ -1005,6 +1005,19 @@ triggers runs it truly in parallel.
     the module graph being what's broken) plus a placeholder in `#view`. If
     nothing has booted in 12s, or a script errors, it says so and offers Reload.
     `js/app.js` calls `window.__routinerBooted()` / `__routinerBootFailed()`.
+- **Station (`station.html`, `js/station.js`, `css/station.css`)** is a second
+  face on the same data: Needs you, Board, Calendar, a run view and the Agent
+  fleet, built from the *Project Station* design in the **Legible** look
+  (`css/legible-tokens.css`, vendored verbatim from jdash's generated tokens —
+  regenerate there, never hand-edit). Linked from the account menu. It writes
+  nothing new: its only actions are reply / retry (`continue`) / stop, sent to
+  `openrouter-agent` the same way `agentPost` does; everything else links back
+  to the planner. "Needs you" is built only from recorded state — `goal.phase
+  = 'blocked'`, `status = 'error'` or `'missed'` with no later success, and a
+  key under $1 — never from prose. Fire URLs and tokens are stripped the moment
+  `routiner_settings` is read, and the test asserts they never reach the DOM.
+  Per-agent spend shows "—" unless the usage list covers every call made today.
+  Covered by `node scripts/test-station.mjs` (in the Boot checks workflow).
 - **Shell:** one top rail (`.topbar`) carries the brand, the nav tabs and the
   actions (clock · budget chip · a **+** for a new routine · account menu); the body below it
   is the only scrolling region. The rail stays a single row down to 1140px —
