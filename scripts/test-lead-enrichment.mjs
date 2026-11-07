@@ -250,6 +250,21 @@ console.log("\nverificationVerdict — the fabrication gate");
     /does not resolve/.test(verificationVerdict({ gained: 0, confidence: "low", siteStatus: "dead", hasPhone: false, hasContact: false }).note));
 }
 
+console.log("\nparseLeads — survives blocks with no blank line, numbering and bold");
+{
+  const ctx = { niche: "dental practices", location: "Florence, AL", model: "perplexity/sonar-pro", foundAt: new Date().toISOString() };
+  const glued = parseLeads(
+    ["NAME: Singing River Dentistry", "PHONE: (256) 764-9955", "CONTACT: Daniel Petersen",
+      "NAME: Shoals Family Dental", "PHONE: (256) 767-1234", "CONTACT: NONE",
+      "NAME: Florence Smiles", "PHONE: NONE"].join("\n"), ctx);
+  eq("three glued blocks → three leads", glued.length, 3);
+  eq("second glued lead keeps its own phone", glued[1].phone_e164, "+12567671234");
+  const styled = parseLeads(
+    ["1. **NAME:** Alpha Dental", "**PHONE:** (256) 555-0101", "", "2. **NAME:** Beta Dental", "- PHONE: (256) 555-0102"].join("\n"), ctx);
+  eq("numbered + bold blocks → two leads", styled.length, 2);
+  eq("bold label still read", styled[0].business_name, "Alpha Dental");
+}
+
 console.log("\nparseLeads — still parses the block format (regression)");
 {
   const leads = parseLeads(
