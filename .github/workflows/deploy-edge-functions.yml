@@ -185,7 +185,7 @@ jobs:
               continue
             fi
             echo "::group::Deploy $fn"
-            args=(functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_ID")
+            args=(functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_ID" --yes)
             if needs_no_jwt "$fn"; then
               args+=(--no-verify-jwt)
             fi
