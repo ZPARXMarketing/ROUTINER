@@ -96,10 +96,11 @@ const json = (body: unknown, status = 200) =>
 const SB_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SB_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-function callerSecret(req: Request): string {
+function callerAllowed(req: Request, gate: string): boolean {
   const h = req.headers.get("authorization") || "";
   const bearer = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
-  return bearer || (req.headers.get("x-responder-secret") || "").trim();
+  const given = (req.headers.get("x-responder-secret") || "").trim();
+  return given === gate || bearer === gate || (SB_KEY !== "" && bearer === SB_KEY);
 }
 
 // ── Supabase REST helpers (service role, on the local zparx-dashboard project) ─
@@ -679,8 +680,11 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("", { status: 204, headers: cors });
   if (req.method !== "POST") return json({ ok: false, error: "Use POST." }, 405);
 
+  // The scheduler calls with the service-role key as its bearer, never the
+  // responder secret, so the gate must accept that key too — otherwise turning
+  // on RESPONDER_SECRET silently 401s every scheduled Lead Finder run.
   const gate = Deno.env.get("RESPONDER_SECRET");
-  if (gate && callerSecret(req) !== gate) return json({ ok: false, error: "Unauthorized." }, 401);
+  if (gate && !callerAllowed(req, gate)) return json({ ok: false, error: "Unauthorized." }, 401);
 
   const key = Deno.env.get("OPENROUTER_API_KEY");
   if (!key) return json({ ok: false, error: "OPENROUTER_API_KEY not set." }, 500);
