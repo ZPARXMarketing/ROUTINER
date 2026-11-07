@@ -121,11 +121,30 @@ export function scoreLead(l: Omit<EnrichedLead, "lead_score">): number {
  * format the prompt demands). A block with no usable NAME is dropped; a name
  * seen earlier in the same batch is skipped.
  */
+/** Undo the formatting drift that hides fields from `fieldFrom`. */
+export function normalizeResearch(text: string): string {
+  return text
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(/\*\*/g, "")                          // **NAME:** → NAME:
+        .replace(/^[ \t]*(?:[-*•]|\d+[.)])[ \t]+/, "")  // "- NAME:" / "1. NAME:" → "NAME:"
+    )
+    .join("\n");
+}
+
 export function parseLeads(
   text: string,
   ctx: { niche: string; location: string | null; model: string; foundAt: string },
 ): EnrichedLead[] {
-  const blocks = text.split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
+  // Blocks are meant to be blank-line separated, but sonar-pro sometimes drops
+  // the blank lines, numbers the blocks, or bolds the labels. Splitting only on
+  // blank lines then glued every business into one block and kept the first —
+  // one live run asked for 8 dental offices and "parsed" exactly 1. So strip
+  // list markers and bold first, and also start a new block at every NAME: line.
+  const blocks = normalizeResearch(text)
+    .split(/\n\s*\n|\n(?=[ \t]*NAME:)/i)
+    .map((b) => b.trim()).filter(Boolean);
   const out: EnrichedLead[] = [];
   const seen = new Set<string>();
 
