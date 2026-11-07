@@ -13,6 +13,11 @@
 //   GET/POST  action=context           → { ownerUserId, activeNotes, scheduled, accounts }
 //   POST      action=schedule  blocks[] → inserts routine rows (status forced 'scheduled')
 //   POST      action=markNote  id,status → sets a note to planned|done|dismissed
+//   POST      action=targets           → the lead-finder grid (lead_enrichment_targets),
+//                                        next-up first, with yield + whether it's scheduled
+//   POST      action=addTarget  niche,location,… → adds one grid cell (one niche, one city)
+//   POST      action=unschedule  routineId → moves a scheduled Lead Finder routine back
+//                                        to the Library (only account "openrouter")
 //   POST      action=report  routineId,summary,status? → logs a run row so a fired
 //                                        session can report back what it did (shows in History).
 //                                        Optional structured fields (details, steps[],
@@ -33,7 +38,10 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const ADMIN_SECRET = (Deno.env.get("ROUTINER_ADMIN_SECRET") || "").trim();
-const GATED = new Set(["context", "schedule", "markNote"]);
+const GATED = new Set(["context", "schedule", "markNote", "targets", "addTarget", "unschedule"]);
+// The Lead Finder lane: the only account `unschedule` may touch, so a planner
+// can take its own searches down without being able to stop Claude routines.
+const LEAD_ACCOUNT = "openrouter";
 
 const cors = {
   "access-control-allow-origin": "*",
@@ -229,6 +237,101 @@ Deno.serve(async (req: Request) => {
       return json({ ok: true, updated: data });
     }
 
+    if (action === "targets") {
+      // The grid, plus what each cell has yielded, so a planner can pick the
+      // next searches without SQL. A cell is "spent" once a run finds mostly
+      // duplicates; never-run cells come first, then the stalest productive ones.
+      const [tR, sR] = await Promise.all([
+        fetch(rest("lead_enrichment_targets?select=id,label,niche,location,target_vertical,count,enabled,last_run_at,last_result&order=label"), { headers: H() }),
+        fetch(rest(`routiner_routines?select=id,prompt,recurrence,scheduled_at&status=eq.scheduled&account=eq.${LEAD_ACCOUNT}`), { headers: H() }),
+      ]);
+      if (!tR.ok) return json({ ok: false, error: `targets read failed (HTTP ${tR.status})` }, 502);
+      // deno-lint-ignore no-explicit-any
+      const rows = (await tR.json()) as Record<string, any>[];
+      // deno-lint-ignore no-explicit-any
+      const sched = sR.ok ? ((await sR.json()) as Record<string, any>[]) : [];
+      const targets = rows.map((t) => {
+        const lr = (t.last_result ?? null) as Record<string, unknown> | null;
+        const inserted = Number(lr?.inserted ?? 0);
+        const skipped = Number(lr?.skipped ?? 0);
+        const found = inserted + skipped;
+        const state = !t.last_run_at ? "never_run"
+          : lr?.error ? "error"
+          : found > 0 && inserted / found < 0.25 ? "spent"
+          : "productive";
+        const routine = sched.find((r) => String(r.prompt || "").includes(String(t["id"])));
+        return {
+          id: t["id"], label: t.label, niche: t.niche, location: t.location, vertical: t.target_vertical,
+          count: t.count, last_run_at: t.last_run_at, last_inserted: lr ? inserted : null,
+          last_skipped: lr ? skipped : null, state,
+          scheduled: routine ? { routineId: routine["id"], recurrence: routine.recurrence, next: routine.scheduled_at } : null,
+        };
+      });
+      const rank: Record<string, number> = { never_run: 0, productive: 1, error: 2, spent: 3 };
+      targets.sort((a, b) =>
+        (rank[a.state] - rank[b.state]) ||
+        String(a.last_run_at ?? "").localeCompare(String(b.last_run_at ?? "")));
+      return json({ ok: true, targets });
+    }
+
+    if (action === "addTarget") {
+      const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+      const niche = str(body.niche);
+      const location = str(body.location);
+      if (!niche || !location) return json({ ok: false, error: "addTarget needs 'niche' and 'location' (one niche, one city)." }, 400);
+      const label = str(body.label) || `${niche} — ${location}`;
+      const dup = await fetch(
+        rest(`lead_enrichment_targets?select=id&niche=ilike.${encodeURIComponent(niche)}&location=ilike.${encodeURIComponent(location)}&limit=1`),
+        { headers: H() },
+      );
+      const existing = dup.ok ? await dup.json() : [];
+      if (existing?.[0]) return json({ ok: true, existed: true, id: existing[0]["id"] });
+      const countRaw = Number(body.count);
+      const titles = Array.isArray(body.dmTitles)
+        ? (body.dmTitles as unknown[]).filter((x) => typeof x === "string" && x.trim()).map((x) => (x as string).trim())
+        : ["Owner", "Practice Manager", "Office Manager"];
+      const r = await fetch(rest("lead_enrichment_targets"), {
+        method: "POST",
+        headers: { ...H(), Prefer: "return=representation" },
+        body: JSON.stringify({
+          label, niche, location,
+          target_vertical: str(body.vertical) || null,
+          // ≤ 10: asking sonar-pro for more pads the list with made-up businesses.
+          count: Number.isFinite(countRaw) && countRaw > 0 ? Math.min(Math.round(countRaw), 10) : 8,
+          dm_titles: titles,
+          model: "perplexity/sonar-pro",
+          recurrence: "weekly",
+          sync_abstrax: false,
+          // Left off so "run every enabled target" sweeps never pick it up by
+          // surprise; a routine fires it by targetId.
+          enabled: false,
+          notes: str(body.notes) || "Added by a planner via routiner-admin addTarget.",
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) return json({ ok: false, error: data?.message || `Insert failed (HTTP ${r.status})` }, 502);
+      return json({ ok: true, id: data?.[0]?.["id"], label });
+    }
+
+    if (action === "unschedule") {
+      const id = String(body.routineId || body["id"] || "").trim();
+      if (!id) return json({ ok: false, error: "Missing 'routineId'." }, 400);
+      const r = await fetch(
+        rest(`routiner_routines?id=eq.${encodeURIComponent(id)}&account=eq.${LEAD_ACCOUNT}&status=eq.scheduled`),
+        {
+          method: "PATCH",
+          headers: { ...H(), Prefer: "return=representation" },
+          body: JSON.stringify({ status: "library", scheduled_at: null }),
+        },
+      );
+      const data = await r.json();
+      if (!r.ok) return json({ ok: false, error: data?.message || `Update failed (HTTP ${r.status})` }, 502);
+      if (!Array.isArray(data) || !data.length) {
+        return json({ ok: false, error: `No scheduled Lead Finder routine with id ${id} (only account "${LEAD_ACCOUNT}" can be unscheduled here).` }, 404);
+      }
+      return json({ ok: true, unscheduled: { id: data[0]["id"], title: data[0].title } });
+    }
+
     if (action === "report") {
       // A fired session reports back what it did; we log it as a run row so it
       // surfaces in the app's History. Keyed by routineId (to inherit user_id +
@@ -274,7 +377,7 @@ Deno.serve(async (req: Request) => {
       return json({ ok: true, run: Array.isArray(data) ? data[0] : data });
     }
 
-    return json({ ok: false, error: `Unknown action '${action}'. Use context | schedule | markNote | report.` }, 400);
+    return json({ ok: false, error: `Unknown action '${action}'. Use context | schedule | markNote | targets | addTarget | unschedule | report.` }, 400);
   } catch (e) {
     return json({ ok: false, error: "routiner-admin failed: " + (e as Error).message }, 500);
   }
